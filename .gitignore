@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# SQLite transient write-ahead files (the .db itself is kept)
+*.db-shm
+*.db-wal
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# macOS
+.DS_Store

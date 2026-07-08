@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sleep Bandit</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🎲</span>
+      <div>
+        <h1>Sleep Bandit</h1>
+        <p class="tagline">Randomized n-of-1 experiments to maximize your HRV</p>
+      </div>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-view="grid">🗓 Tracker</button>
+      <button class="tab" data-view="reports">📊 Reports</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- TRACKER (spreadsheet) -->
+    <section id="view-grid" class="view">
+      <div class="toolbar">
+        <button class="primary" id="add-btn">+ Add intervention</button>
+        <span class="spacer"></span>
+        <a class="ghost" href="/api/export" target="_blank">Export</a>
+      </div>
+      <div class="grid-wrap">
+        <table class="grid" id="grid"></table>
+      </div>
+      <p class="hint">Each night the app chooses which interventions to run (and at what dose/option), weighted toward what's raised your HRV so far. Do the highlighted cells, tap each to check it off, and enter each morning's HRV in the bottom row.</p>
+    </section>
+
+    <!-- REPORTS -->
+    <section id="view-reports" class="view" hidden>
+      <div id="reports-body"><p class="empty">Loading…</p></div>
+    </section>
+  </main>
+
+  <!-- Add / edit intervention modal -->
+  <div class="modal-backdrop" id="modal-backdrop" hidden>
+    <div class="modal card">
+      <div class="card-head">
+        <h2 id="modal-title">Add intervention</h2>
+        <button class="ghost" id="modal-close">✕</button>
+      </div>
+      <form id="iv-form">
+        <label>Name
+          <input name="name" required placeholder="e.g. Magnesium glycinate">
+        </label>
+        <div class="row">
+          <label>Category
+            <select name="category" id="iv-category">
+              <option value="supplement">Supplement</option>
+              <option value="behavioral">Behavioral</option>
+            </select>
+          </label>
+          <label>Type
+            <select name="kind" id="iv-kind">
+              <option value="dose">Dose — an amount</option>
+              <option value="boolean">Yes / no — did it or not</option>
+              <option value="choice">Multiple choice — pick one option</option>
+            </select>
+          </label>
+        </div>
+        <div id="dose-fields">
+          <div class="row">
+            <label>Standard dose
+              <input name="default_dose" type="number" step="any" value="1" min="0">
+            </label>
+            <label>Unit
+              <input name="unit" placeholder="mg (blank = on/off)">
+            </label>
+          </div>
+          <div class="row">
+            <label>Unit dose — smallest step between doses
+              <input name="unit_dose" type="number" step="any" min="0" placeholder="e.g. 48">
+            </label>
+            <label>Count as (optional)
+              <input name="dose_noun" placeholder="pill">
+            </label>
+          </div>
+          <label class="check-label"><input type="checkbox" name="explore_doses" checked> Explore dosages (try doses around the standard)</label>
+          <p class="field-hint">The standard dose is the starting point; with exploring on, the app tries up and down in unit-dose steps. Turn it off to always use exactly the standard dose. If you name the unit (e.g. “pill”), doses show as counts — 144&nbsp;mg with a 48&nbsp;mg unit dose displays as “3 pills”.</p>
+        </div>
+        <div id="choice-fields" hidden>
+          <label>Options</label>
+          <div id="options-list"></div>
+          <div class="add-row">
+            <input id="new-option" type="text" placeholder="Add an option…" autocomplete="off">
+            <button type="button" class="ghost" id="add-option-btn">+ Add</button>
+          </div>
+          <p class="field-hint">Each night the app picks one option. Options keep their own history — renaming an option keeps its history; a removed option's past nights still count.</p>
+        </div>
+        <label>Note (optional)
+          <input name="note" placeholder="brand, timing, etc.">
+        </label>
+        <div class="modal-actions">
+          <button type="button" class="danger" id="iv-delete" hidden>Delete</button>
+          <span class="spacer"></span>
+          <button type="button" class="ghost" id="iv-cancel">Cancel</button>
+          <button type="submit" class="primary">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
