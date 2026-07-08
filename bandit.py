@@ -65,6 +65,14 @@ MEANINGFUL_EFFECT = 2.0
 READOUT_SAMPLES = 3000     # posterior samples behind the probability read-outs
 DOSE_ROUND = 6             # decimals used to key doses (avoids float-equality bugs)
 
+# Cold-start dose exploration. Until an intervention has this many compliant
+# "on" nights, we lean on its standard dose instead of exploring alternatives:
+# the chance of snapping an "on" night to the standard dose decays linearly from
+# 1.0 (no data) to 0.0 (WARMUP_ON_NIGHTS of data). So with little data the
+# standard dose is suggested well over half the time, and the engine only starts
+# varying the dose once there's enough evidence to justify it.
+WARMUP_ON_NIGHTS = 10
+
 
 def _d(x):
     return round(float(x), DOSE_ROUND)
@@ -243,15 +251,24 @@ def _effect(beta, entry, dose):
 # ---------------------------------------------------------------------------
 # Planning a night (Thompson) and read-outs (Monte Carlo).
 # ---------------------------------------------------------------------------
-def plan_night(post, cols, active_interventions):
+def plan_night(post, cols, active_interventions, n_on=None):
     """Draw ONE posterior sample (Thompson sampling); per intervention pick the
     arm with the highest sampled effect.
 
     Dose interventions include "off" (effect 0) as an option, so a dose that looks
     unhelpful gets skipped. Multiple-choice interventions must always land on one
     option, so "off" is NOT an option — we take the best option even if all look
-    weakly negative (their effects are relative to each other anyway)."""
+    weakly negative (their effects are relative to each other anyway).
+
+    n_on: optional {iv_id: compliant "on"-night count}. While an intervention is
+    below WARMUP_ON_NIGHTS we're in cold start: whenever the sampler decides to
+    take it, we snap the dose to its standard dose with a probability that decays
+    from 1.0 (no data) to 0.0 (warmed up). This keeps the standard dose the
+    suggestion the majority of the times the intervention is on, and only lets the
+    engine explore other doses once there's evidence to warrant it. The on/off
+    decision itself is untouched — only which dose we use once it's on."""
     beta, _ = sample_beta(post)
+    n_on = n_on or {}
     plan = {}
     for iv in active_interventions:
         entry = cols.get(iv["id"])
@@ -266,6 +283,17 @@ def plan_night(post, cols, active_interventions):
                 v = _effect(beta, entry, dose)
                 if best_val is None or v > best_val:
                     best_val, best_dose = v, dose
+
+        # Cold start: once we've decided to take a dose intervention, prefer its
+        # standard dose until it has enough on-nights to earn dose exploration.
+        if not is_choice and best_dose:
+            std = _d(iv.get("default_dose") or 0)
+            levels = {_d(x) for x in iv["dose_levels"] if x and float(x) > 0}
+            if std in levels:
+                p_default = 1.0 - n_on.get(iv["id"], 0) / WARMUP_ON_NIGHTS
+                if p_default > 0.0 and random.random() < p_default:
+                    best_dose = std
+
         plan[iv["id"]] = best_dose if best_dose is not None else 0.0
     return plan
 

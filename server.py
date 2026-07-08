@@ -80,9 +80,10 @@ def ensure_tonight(conn):
     if missing:
         all_nights = store.analysis_nights(conn)
         for iv in missing:
-            nights, _, _ = intervention_nights(iv["id"], all_nights, "hrv")
+            nights, n_on, _ = intervention_nights(iv["id"], all_nights, "hrv")
             model = bandit.fit_model([iv], nights)
-            plan = bandit.plan_night(model["post"], model["cols"], [iv])
+            plan = bandit.plan_night(model["post"], model["cols"], [iv],
+                                     n_on={iv["id"]: n_on})
             store.set_assignment(conn, d, iv["id"], plan.get(iv["id"], 0.0))
     return store.get_night(conn, d)
 
