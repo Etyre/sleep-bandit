@@ -81,6 +81,32 @@ DOSE_ROUND = 6             # decimals used to key doses (avoids float-equality b
 # this only governs which dose we use once an intervention is on.
 WARMUP_ON_NIGHTS = 64
 
+# Hill climbing. Past the cold-start ramp, at most this fraction of "on" nights probe
+# a dose one rung (see _dose_step) BEYOND the range tried so far -- upward while the
+# top dose is still near-best, downward while the smallest dose is still viable -- so
+# the search maps the dose-response curve and can walk toward an optimum far from the
+# standard, with no artificial ceiling. The rest of the on-nights exploit the chosen
+# dose. Gated by the same quadratic warm-up, so the chance of moving off the standard
+# dose stays under 1-in-10 for ~30 on-nights.
+#
+# Supplements (mass units) are dosed cautiously: they only ever climb ONE unit dose at
+# a time, for safety. Minute-based interventions (breathing, mats, ...) carry no such
+# risk, so they search "hotter" -- a higher probe rate and jumps of several rungs at
+# once -- to find a far-off optimum faster.
+MAX_EXPLORE = 0.35        # supplements: fraction of on-nights that probe (careful)
+TIME_EXPLORE = 0.60       # minute-based interventions: hotter search
+TIME_MAX_JUMP = 4         # minute-based: probe up to this many rungs from the best at once
+
+# Minimum viable dose: we recommend (and exploit) the SMALLEST dose whose estimated
+# effect is at least this fraction of the best measured dose's effect -- so a smaller
+# dose that reaches ~95% of the peak is preferred over a bigger one at the peak.
+MIN_VIABLE_FRAC = 0.95
+
+# A frontier dose must gather at least this many measurements before the climb judges
+# whether to extend past it -- otherwise a single noisy reading can wrongly halt the
+# climb (or push it onward). Bigger = more robust but slower to map the curve.
+MIN_PROBES = 5
+
 
 def _d(x):
     return round(float(x), DOSE_ROUND)
@@ -282,51 +308,149 @@ def _effect(beta, entry, dose):
 # ---------------------------------------------------------------------------
 # Planning a night (Thompson) and read-outs (Monte Carlo).
 # ---------------------------------------------------------------------------
-def plan_night(post, cols, active_interventions, n_on=None):
-    """Draw ONE posterior sample (Thompson sampling); per intervention pick the
-    arm with the highest sampled effect.
+def _best_dose(beta, entry, dose_levels):
+    """Among an intervention's candidate doses, the one with the highest sampled
+    effect (alpha + delta). Returns (dose, value) or (None, None) if it has none."""
+    best_dose, best_val = None, None
+    for x in dose_levels:
+        dose = _d(x)
+        if dose <= 0:
+            continue
+        v = _effect(beta, entry, dose)
+        if best_val is None or v > best_val:
+            best_val, best_dose = v, dose
+    return best_dose, best_val
 
-    Dose interventions include "off" (effect 0) as an option, so a dose that looks
-    unhelpful gets skipped. Multiple-choice interventions must always land on one
-    option, so "off" is NOT an option — we take the best option even if all look
-    weakly negative (their effects are relative to each other anyway).
 
-    n_on: optional {iv_id: compliant "on"-night count}. While an intervention is
-    below WARMUP_ON_NIGHTS we're in cold start: whenever the sampler decides to
-    take it, we snap the dose to its standard dose with probability p_default =
-    1 - (n_on / WARMUP_ON_NIGHTS)**2. The quadratic ramp keeps the off-standard
-    chance under 1-in-10 for the first 20 on-nights, then accelerates toward full
-    exploration by WARMUP_ON_NIGHTS. The on/off decision itself is untouched —
-    only which dose we use once it's on."""
+def _dose_step(iv):
+    """One rung of the dose grid, used for exploration/hill-climbing: the unit dose
+    if defined, else half the standard dose."""
+    u = float(iv.get("unit_dose") or 0)
+    if u > 0:
+        return u
+    s = float(iv.get("default_dose") or 0)
+    return 0.5 * s if s > 0 else 0.0
+
+
+def _time_based(iv):
+    """True for time-dosed interventions (minutes/seconds/hours) -- safe to explore
+    aggressively, unlike a supplement measured in mg/g."""
+    return (iv.get("unit") or "").strip().lower().startswith(("min", "sec", "hour"))
+
+
+def _min_viable_dose(effs):
+    """The SMALLEST dose whose effect is >= MIN_VIABLE_FRAC of the best dose's effect,
+    when the best clears baseline. effs is {dose: effect}. None if nothing helps."""
+    if not effs:
+        return None
+    best = max(effs.values())
+    if best <= 0:
+        return None
+    thr = MIN_VIABLE_FRAC * best
+    return min(d for d, e in effs.items() if e >= thr)
+
+
+def plan_night(post, cols, active_interventions, n_on=None, measured=None):
+    """Draw ONE posterior sample (Thompson sampling) and, per intervention, decide
+    tonight's arm in TWO independent stages:
+
+      1. Should we suggest it at all?  For a dose intervention this is decided ONLY
+         by the "does it help at all" effect alpha_i: we take it iff a sampled
+         alpha_i > 0. This keeps the on/off decision unbiased -- P(on) ~ P(it helps)
+         -- and independent of how many candidate doses it has.
+      2. If it's on, which dose?  We aim for the MINIMUM VIABLE dose and HILL CLIMB to
+         map the dose-response curve. Most on-nights we exploit the smallest dose whose
+         posterior-mean effect is within MIN_VIABLE_FRAC of the best dose measured so
+         far; with a warm-up-gated probability (MAX_EXPLORE * warm^2) we instead probe
+         one rung beyond the range tried -- upward while the top dose is still near-best
+         and downward while the smallest is still viable. So the frontier advances with
+         no ceiling until the curve's shape (peak and minimum-effective knee) is mapped.
+
+    Multiple-choice interventions skip stage 1 -- "off" is NOT an option and we take
+    the best option even if all look weakly negative.
+
+    measured: optional {iv_id: iterable of doses actually recorded} -- the points the
+    curve is built from; n_on: optional {iv_id: compliant on-night count} for the ramp."""
     beta, _ = sample_beta(post)
     n_on = n_on or {}
+    measured = measured or {}
     plan = {}
     for iv in active_interventions:
         entry = cols.get(iv["id"])
-        is_choice = iv.get("kind") == "choice"
-        best_dose = None if is_choice else 0.0   # choice must pick; dose may go off
-        best_val = None if is_choice else 0.0
-        if entry:
-            for x in iv["dose_levels"]:
-                dose = _d(x)
-                if dose <= 0:
-                    continue
-                v = _effect(beta, entry, dose)
-                if best_val is None or v > best_val:
-                    best_val, best_dose = v, dose
+        if not entry:
+            plan[iv["id"]] = 0.0
+            continue
 
-        # Cold start: once we've decided to take a dose intervention, prefer its
-        # standard dose until it has enough on-nights to earn dose exploration.
-        if not is_choice and best_dose:
-            std = _d(iv.get("default_dose") or 0)
-            levels = {_d(x) for x in iv["dose_levels"] if x and float(x) > 0}
-            if std in levels:
-                warm = min(1.0, n_on.get(iv["id"], 0) / WARMUP_ON_NIGHTS)
-                p_default = 1.0 - warm * warm     # quadratic ramp; see WARMUP_ON_NIGHTS
-                if p_default > 0.0 and random.random() < p_default:
-                    best_dose = std
+        if iv.get("kind") == "choice":
+            # always pick an option; there is no "off"
+            best_dose, _ = _best_dose(beta, entry, iv["dose_levels"])
+            plan[iv["id"]] = best_dose if best_dose is not None else 0.0
+            continue
 
-        plan[iv["id"]] = best_dose if best_dose is not None else 0.0
+        # Stage 1: on/off from the "does it help at all" effect alone (unbiased).
+        if beta[entry["on"]] <= 0.0:
+            plan[iv["id"]] = 0.0
+            continue
+
+        # Boolean interventions are a plain yes -- there's no dose to choose.
+        if iv.get("kind") == "boolean":
+            plan[iv["id"]] = 1.0
+            continue
+
+        # Stage 2: it's on -- choose the dose. Exploit the MINIMUM VIABLE dose, and with
+        # a warm-up-gated probability explore to map the curve.
+        std = _d(iv.get("default_dose") or 0)
+        step = _dose_step(iv)
+        counts = {}                                      # dose -> times measured
+        for x in measured.get(iv["id"], ()):
+            xd = _d(x)
+            if xd > 0:
+                counts[xd] = counts.get(xd, 0) + 1
+        seen = sorted(counts)
+        effs = {d: _effect(post["mN"], entry, d) for d in seen}   # posterior-mean curve
+        best = max(effs.values()) if effs else None
+
+        # exploit: minimum viable dose once there are >=2 measured doses; else standard
+        center = std
+        if len(seen) >= 2:
+            mv = _min_viable_dose(effs)
+            if mv is not None:
+                center = mv
+
+        dose = center
+        timed = _time_based(iv)
+        rate = TIME_EXPLORE if timed else MAX_EXPLORE
+        warm = min(1.0, n_on.get(iv["id"], 0) / WARMUP_ON_NIGHTS)
+        p_explore = rate * warm * warm
+        if step > 0 and p_explore > 0.0 and random.random() < p_explore:
+            if timed:
+                # Hot search: no safety limit on jump size, so leap several rungs from the
+                # best dose at once to map a wide range fast.
+                j = random.randint(1, TIME_MAX_JUMP) * random.choice((-1, 1))
+                probe = _d(center + j * step)
+                dose = probe if probe > 0 else _d(center + step)
+            else:
+                # Supplement: careful. Firm up an edge dose with a few readings, then
+                # climb exactly ONE unit dose past it -- up while still rising, down while
+                # still viable. Never jumps more than one rung (safety).
+                targets = []
+                if not seen:
+                    targets = [std - step, std + step]
+                else:
+                    thr = MIN_VIABLE_FRAC * best if (best is not None and best > 0) else None
+                    top, bot = seen[-1], seen[0]
+                    if counts[top] < MIN_PROBES:
+                        targets.append(top)                       # firm up the top first
+                    elif len(seen) < 2 or effs[top] > effs[seen[-2]]:
+                        targets.append(top + step)                # still rising -> climb
+                    if counts[bot] < MIN_PROBES:
+                        targets.append(bot)                       # firm up the bottom
+                    elif thr is None or effs[bot] >= thr:
+                        targets.append(bot - step)                # still viable -> reach down
+                targets = [_d(d) for d in targets if d > 0]
+                if targets:
+                    dose = random.choice(targets)
+        plan[iv["id"]] = dose if dose and dose > 0 else 0.0
     return plan
 
 
@@ -361,10 +485,12 @@ def readouts(interventions, betas, cols, observed=None):
                              "on_effect": 0.0, "recommended_dose": 0.0,
                              "recommended_p": 0.0, "p_off_best": 0.0, "doses": []}
             continue
-        levels = sorted(set(_d(x) for x in iv["dose_levels"] if x and float(x) > 0))
         if observed is not None:
-            seen = observed.get(iv["id"], set())
-            levels = [d for d in levels if d in seen]
+            # only doses actually measured -- and any dose the climb has reached,
+            # even if it was never in the original candidate list.
+            levels = sorted(_d(x) for x in observed.get(iv["id"], ()) if x and float(x) > 0)
+        else:
+            levels = sorted(set(_d(x) for x in iv["dose_levels"] if x and float(x) > 0))
 
         on_samples = [betas[s][entry["on"]] for s in range(S)]
         helps = sum(1 for a in on_samples if a > 0.0)
@@ -393,15 +519,13 @@ def readouts(interventions, betas, cols, observed=None):
                 "ci_high": _percentile(samples, 0.95),
             })
 
-        # Recommend the dose with the best *mean* effect, not the highest P(best):
-        # P(best) rewards a wide posterior, so a barely-tried dose could win on
-        # uncertainty alone. Fall back to "off" (0) if no dose beats skipping on
-        # average. recommended_p is reported as that dose's P(best) for display.
-        rec_dose, rec_mean = 0.0, 0.0
-        for row in dose_rows:
-            if row["mean_effect"] > rec_mean:
-                rec_mean, rec_dose = row["mean_effect"], row["dose"]
-        rec_p = best_counts[rec_dose] / S
+        # Recommend the MINIMUM VIABLE dose: the smallest dose whose mean effect is
+        # within MIN_VIABLE_FRAC of the best measured dose's -- so a smaller dose that
+        # reaches ~95% of the peak wins over a bigger one at the peak. Fall back to
+        # "off" (0) if no dose beats skipping on average. recommended_p is that dose's
+        # P(best), reported for display.
+        rec_dose = _min_viable_dose({row["dose"]: row["mean_effect"] for row in dose_rows}) or 0.0
+        rec_p = best_counts.get(rec_dose, 0) / S
 
         on_sorted = sorted(on_samples)
         out[iv["id"]] = {

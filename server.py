@@ -81,9 +81,12 @@ def ensure_tonight(conn):
         all_nights = store.analysis_nights(conn)
         for iv in missing:
             nights, n_on, _ = intervention_nights(iv["id"], all_nights, "hrv")
+            # doses actually recorded so far (with repeats) -- the points the dose-
+            # response curve and the hill-climb are built from.
+            seen = [n["taken"][iv["id"]] for n in nights if n["taken"].get(iv["id"], 0) > 0]
             model = bandit.fit_model([iv], nights)
             plan = bandit.plan_night(model["post"], model["cols"], [iv],
-                                     n_on={iv["id"]: n_on})
+                                     n_on={iv["id"]: n_on}, measured={iv["id"]: seen})
             store.set_assignment(conn, d, iv["id"], plan.get(iv["id"], 0.0))
     return store.get_night(conn, d)
 
