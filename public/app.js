@@ -31,6 +31,11 @@ const METRICS = [
 // need a real contrast before we show any recommendation: at least this many
 // nights on AND off (choice: this many option-nights total).
 const MIN_ON = 2, MIN_OFF = 2, MIN_CHOICE = 4;
+// crowning a *dose* as "recommended" is a higher bar than showing the read-out:
+// it needs enough on-nights AND at least two distinct doses actually tried, else
+// the "best dose" is just prior noise. (Dose exploration is deliberately slow, so
+// this crown stays hidden until real dose-contrast data accumulates.)
+const MIN_ON_DOSE_REC = 8;
 
 function groupByCategory(list) {
   const seen = [];
@@ -202,6 +207,12 @@ function enough(nOn, nOff, isChoice) {
   return isChoice ? nOn >= MIN_CHOICE : (nOn >= MIN_ON && nOff >= MIN_OFF);
 }
 
+// Higher bar, dose interventions only: crown a "recommended dose" only once there
+// are enough on-nights and at least two distinct doses have actually been tried.
+function enoughForDoseRec(r) {
+  return (r.n_on || 0) >= MIN_ON_DOSE_REC && (r.n_doses_seen || 0) >= 2;
+}
+
 function verdict(r) {
   // need a contrast of on AND off logged nights before claiming anything
   if ((r.n_on || 0) < MIN_ON || (r.n_off || 0) < MIN_OFF) return ["v-new", "🌱 gathering data"];
@@ -299,15 +310,18 @@ function reportCard(iv) {
             `<b>${pct(r.p_helps)}</b> chance it's a real positive effect` +
             `${r.p_meaningful >= 0.85 ? " (likely sizable)" : ""}. Based on ${dataNote}`));
         }
-        if (doses.length) {
-          const table = el("table", "dose-table");
-          table.innerHTML = "<tr><th>Dose</th><th>HRV effect</th><th>P(best)</th><th></th></tr>";
-          table.appendChild(doseRow({ dose: 0, mean_effect: 0, p_best: r.p_off_best || 0 }, "off (skip)", r.recommended_dose === 0, true));
-          for (const d of doses) {
-            const rec = Math.abs(d.dose - r.recommended_dose) < 1e-6 && r.recommended_dose > 0;
-            table.appendChild(doseRow(d, doseText(iv, d.dose), rec, false));
+        // Dose effects are secondary to "does it work": show them as a graph, and
+        // only crown a recommended dose once there's real contrast (enough on-nights
+        // AND 2+ distinct doses tried). r.doses is already in ascending-dose order.
+        if ((r.doses || []).length) {
+          const showRec = enoughForDoseRec(r);
+          card.appendChild(el("p", "chart-cap",
+            'Dose → HRV change over baseline · <span class="mk-dot">●</span> mean · <span class="mk-ci">│</span> 90% CI'));
+          card.appendChild(doseChart(iv, r.doses, r, showRec));
+          if (!showRec) {
+            card.appendChild(el("p", "iv-meta",
+              "No dose recommended yet — needs more on-nights across at least two different doses."));
           }
-          card.appendChild(table);
         }
       }
     }
@@ -349,6 +363,72 @@ function doseRow(d, label, rec, isOff) {
   bar.appendChild(span); barTd.appendChild(bar); tr.appendChild(barTd);
   tr.appendChild(el("td", "pbest", pct(d.p_best)));
   return tr;
+}
+
+// A dose axis tick ("3" pills / "3000" mg) and the unit caption under the axis.
+function doseTick(iv, dose) {
+  const u = iv.unit_dose || 0, noun = (iv.dose_noun || "").trim();
+  return numLabel(u > 0 && noun ? dose / u : dose);
+}
+function doseUnitCaption(iv) {
+  const u = iv.unit_dose || 0, noun = (iv.dose_noun || "").trim();
+  if (u > 0 && noun) return pluralize(noun, 2);
+  return iv.unit || "";
+}
+
+// Dose interventions get a graph, not a horse-race table: dose on x, mean HRV
+// change over baseline on y, with a 90% credible-interval whisker per dose (the
+// uncertainty matters — it's huge early). Dots are colored by sign, baseline at 0.
+function doseChart(iv, rows, r, showRec) {
+  const n = rows.length;
+  const W = Math.max(230, 54 + n * 72), H = 150;
+  const mL = 42, mR = 16, mT = 16, mB = 30;
+  const pL = mL, pR = W - mR, pT = mT, pB = H - mB, pH = pB - pT, pW = pR - pL;
+
+  let lo = 0, hi = 0;
+  for (const d of rows) { lo = Math.min(lo, d.ci_low); hi = Math.max(hi, d.ci_high); }
+  if (hi - lo < 1) { hi += 1; lo -= 1; }
+  const pad = (hi - lo) * 0.08; hi += pad; lo -= pad;
+  const py = (v) => pT + (hi - v) / (hi - lo) * pH;
+  const colW = pW / n, cx = (i) => pL + colW * (i + 0.5);
+  const y0 = py(0);
+  const topLbl = (hi >= 0 ? "+" : "") + Math.round(hi);
+  const botLbl = (lo >= 0 ? "+" : "") + Math.round(lo);
+
+  const parts = [];
+  // y extents + baseline
+  parts.push(`<text x="${pL - 6}" y="${pT + 4}" text-anchor="end" font-size="10" style="fill:var(--muted)">${topLbl}</text>`);
+  parts.push(`<text x="${pL - 6}" y="${pB}" text-anchor="end" font-size="10" style="fill:var(--muted)">${botLbl}</text>`);
+  parts.push(`<line x1="${pL}" y1="${y0}" x2="${pR}" y2="${y0}" stroke-width="1.5" stroke-dasharray="4 4" style="stroke:var(--line)"/>`);
+  parts.push(`<text x="${pL - 6}" y="${y0 + 3.5}" text-anchor="end" font-size="10" style="fill:var(--text)">0</text>`);
+
+  rows.forEach((d, i) => {
+    const x = cx(i), col = d.mean_effect >= 0 ? "var(--good)" : "var(--bad)";
+    const yTop = py(d.ci_high), yBot = py(d.ci_low), yM = py(d.mean_effect);
+    // whisker + caps
+    parts.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
+    parts.push(`<line x1="${x - 5}" y1="${yTop}" x2="${x + 5}" y2="${yTop}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
+    parts.push(`<line x1="${x - 5}" y1="${yBot}" x2="${x + 5}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
+    // recommended ring (only when the crown is earned)
+    if (showRec && Math.abs(d.dose - r.recommended_dose) < 1e-6 && r.recommended_dose > 0) {
+      parts.push(`<circle cx="${x}" cy="${yM}" r="8.5" fill="none" stroke-width="2" style="stroke:var(--accent-2)"/>`);
+    }
+    // mean dot with a surface ring, plus a native hover tooltip
+    parts.push(`<circle cx="${x}" cy="${yM}" r="5" stroke-width="2" style="fill:${col};stroke:var(--panel)">` +
+      `<title>${esc(doseText(iv, d.dose))}: ${signed(d.mean_effect)} HRV [${signed(d.ci_low)}, ${signed(d.ci_high)}]</title></circle>`);
+    // direct value label, flipped to the left on the last column so it never overflows
+    const left = i === n - 1 && n > 1;
+    parts.push(`<text x="${x + (left ? -9 : 9)}" y="${yM + 3.5}" text-anchor="${left ? "end" : "start"}" font-size="11" font-weight="600" style="fill:${col}">${signed(d.mean_effect)}</text>`);
+    // x tick
+    parts.push(`<text x="${x}" y="${pB + 15}" text-anchor="middle" font-size="10.5" style="fill:var(--muted)">${esc(String(doseTick(iv, d.dose)))}</text>`);
+  });
+
+  const cap = doseUnitCaption(iv);
+  if (cap) parts.push(`<text x="${(pL + pR) / 2}" y="${H - 2}" text-anchor="middle" font-size="9.5" style="fill:var(--muted)">${esc(cap)}</text>`);
+
+  const svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img" ` +
+    `aria-label="Dose versus HRV change over baseline for ${esc(iv.name)}">${parts.join("")}</svg>`;
+  return el("div", "dose-chart", svg);
 }
 
 // =====================================================================
