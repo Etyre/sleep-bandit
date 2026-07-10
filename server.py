@@ -126,6 +126,10 @@ def _readout(iv, all_nights, metric, negate):
     r = bandit.analyze([iv], nights)["readouts"].get(iv["id"], {}) if nights else {}
     r = dict(r)
     r["n_on"], r["n_off"] = n_on, n_off
+    # distinct non-zero doses actually tried -- you can't recommend a "best dose"
+    # among doses you've never compared, so the UI gates the recommendation on this.
+    r["n_doses_seen"] = len({round(n["taken"][iv["id"]], 6)
+                             for n in nights if n["taken"].get(iv["id"], 0) > 0})
     return r
 
 

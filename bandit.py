@@ -66,12 +66,15 @@ READOUT_SAMPLES = 3000     # posterior samples behind the probability read-outs
 DOSE_ROUND = 6             # decimals used to key doses (avoids float-equality bugs)
 
 # Cold-start dose exploration. Until an intervention has this many compliant
-# "on" nights, we lean on its standard dose instead of exploring alternatives:
-# the chance of snapping an "on" night to the standard dose decays linearly from
-# 1.0 (no data) to 0.0 (WARMUP_ON_NIGHTS of data). So with little data the
-# standard dose is suggested well over half the time, and the engine only starts
-# varying the dose once there's enough evidence to justify it.
-WARMUP_ON_NIGHTS = 10
+# "on" nights, we lean on its standard dose instead of exploring alternatives.
+# The chance of exploring an off-standard dose on an "on" night ramps up
+# *quadratically* -- p_explore = (n_on / WARMUP_ON_NIGHTS)**2 -- so it stays low
+# for a long time and only accelerates once there's real evidence. With
+# WARMUP_ON_NIGHTS = 64 the nightly chance of varying the dose is under 1-in-10
+# for the first 20 on-nights (~0.1% at 5 nights, ~2% at 10, ~9.8% at 20), then
+# climbs to full exploration by 64 on-nights. The on/off decision is untouched;
+# this only governs which dose we use once an intervention is on.
+WARMUP_ON_NIGHTS = 64
 
 
 def _d(x):
@@ -122,15 +125,33 @@ def spd_solve(L, b):
 # Column layout: col 0 = intercept; then per intervention an "on" column and one
 # deviation column per candidate dose.
 # ---------------------------------------------------------------------------
+def helmert_contrasts(k):
+    """A k x (k-1) matrix of *normalized* Helmert contrasts: its columns are an
+    orthonormal basis for the sum-to-zero subspace (each column has unit norm,
+    sums to zero, and is orthogonal to the others). Because C C^T = I - 11^T/k,
+    putting a diagonal prior of variance w on the contrast weights gives EVERY
+    dose the same marginal deviation variance w*(1 - 1/k) -- no dose is singled
+    out as a reference with inflated uncertainty (the old effect-coding bug that
+    let the highest dose win P(best) on variance alone)."""
+    C = [[0.0] * (k - 1) for _ in range(k)]
+    for j in range(1, k):                  # contrast j uses column j-1
+        norm = math.sqrt(j * (j + 1))
+        for i in range(j):
+            C[i][j - 1] = -1.0 / norm
+        C[j][j - 1] = j / norm
+    return C
+
+
 def build_columns(interventions, history_doses):
     """
     Returns (cols, p). Each intervention gets one "on" column plus, if it has 2+
-    candidate doses, sum-to-zero *effect-coded* deviation columns (one per dose
-    except a reference dose). Effect coding keeps the deviations orthogonal to
-    the "on" effect, so estimating dose-response doesn't inflate the uncertainty
-    of the "does it help at all" answer.
+    candidate doses, k-1 orthonormal-contrast deviation columns (see
+    helmert_contrasts). The contrasts are orthogonal to the "on" effect, so
+    estimating dose-response doesn't inflate the uncertainty of the "does it help
+    at all" answer, and they treat every dose symmetrically.
 
-      cols[id] = {"on": idx, "doses": [...], "ref": ref_dose, "dev": {dose: idx}}
+      cols[id] = {"on": idx, "doses": [...], "dev": [idx...],
+                  "contrast": {dose: [c_1..c_{k-1}]}}
 
     We include every candidate dose *and* every dose seen in history, so old data
     always has a home even if you edit an intervention's dose list later.
@@ -143,13 +164,15 @@ def build_columns(interventions, history_doses):
             if x and float(x) > 0:
                 levels.add(_d(x))
         doses = sorted(levels)
-        entry = {"on": idx, "doses": doses, "ref": None, "dev": {}}
+        entry = {"on": idx, "doses": doses, "dev": [], "contrast": {}}
         idx += 1
-        if len(doses) >= 2:
-            entry["ref"] = doses[-1]            # highest dose is the reference
-            for dose in doses[:-1]:
-                entry["dev"][dose] = idx
-                idx += 1
+        k = len(doses)
+        if k >= 2:
+            entry["dev"] = list(range(idx, idx + k - 1))
+            idx += k - 1
+            C = helmert_contrasts(k)
+            for i, dose in enumerate(doses):
+                entry["contrast"][dose] = C[i]
         cols[iv["id"]] = entry
     return cols, idx
 
@@ -169,22 +192,28 @@ def build_design(completed_nights, cols, p):
             if not entry:
                 continue
             row[entry["on"]] = 1.0                     # took it at all
-            if entry["ref"] is not None:
-                if dose == entry["ref"]:               # reference dose: all -1
-                    for c in entry["dev"].values():
-                        row[c] = -1.0
-                elif dose in entry["dev"]:             # this dose: +1
-                    row[entry["dev"][dose]] = 1.0
+            crow = entry["contrast"].get(dose)         # its orthonormal contrast
+            if crow:
+                for c, col in zip(crow, entry["dev"]):
+                    row[col] = c
         X.append(row)
         y.append(float(nt["hrv"]))
     return X, y
 
 
 def prior_variances(p, cols):
-    v = [DOSE_DEV_PRIOR_VAR] * p   # deviation columns keep this default
+    v = [DOSE_DEV_PRIOR_VAR] * p
     v[0] = INTERCEPT_PRIOR_VAR
     for entry in cols.values():
         v[entry["on"]] = ON_PRIOR_VAR
+        k = len(entry["doses"])
+        if k >= 2:
+            # Scale the contrast-weight prior so each dose keeps a marginal
+            # deviation variance of DOSE_DEV_PRIOR_VAR: marginal = w*(1 - 1/k),
+            # so w = DOSE_DEV_PRIOR_VAR * k/(k-1). Same shrinkage for every dose.
+            w = DOSE_DEV_PRIOR_VAR * k / (k - 1)
+            for col in entry["dev"]:
+                v[col] = w
     return v
 
 
@@ -235,16 +264,13 @@ def sample_beta(post):
 
 
 def _effect(beta, entry, dose):
-    """effect(i, d) = alpha_i + delta_{i,d} from a sampled beta vector, with the
-    reference dose's deviation implied by the sum-to-zero constraint."""
+    """effect(i, d) = alpha_i + delta_{i,d} from a sampled beta vector, where the
+    deviation is the orthonormal-contrast reconstruction (0 if the intervention
+    has fewer than two doses)."""
     e = beta[entry["on"]]
-    if entry["ref"] is None:
-        return e
-    dose = _d(dose)
-    if dose == entry["ref"]:
-        e -= sum(beta[c] for c in entry["dev"].values())
-    elif dose in entry["dev"]:
-        e += beta[entry["dev"][dose]]
+    crow = entry["contrast"].get(_d(dose))
+    if crow:
+        e += sum(c * beta[col] for c, col in zip(crow, entry["dev"]))
     return e
 
 
@@ -262,11 +288,11 @@ def plan_night(post, cols, active_interventions, n_on=None):
 
     n_on: optional {iv_id: compliant "on"-night count}. While an intervention is
     below WARMUP_ON_NIGHTS we're in cold start: whenever the sampler decides to
-    take it, we snap the dose to its standard dose with a probability that decays
-    from 1.0 (no data) to 0.0 (warmed up). This keeps the standard dose the
-    suggestion the majority of the times the intervention is on, and only lets the
-    engine explore other doses once there's evidence to warrant it. The on/off
-    decision itself is untouched — only which dose we use once it's on."""
+    take it, we snap the dose to its standard dose with probability p_default =
+    1 - (n_on / WARMUP_ON_NIGHTS)**2. The quadratic ramp keeps the off-standard
+    chance under 1-in-10 for the first 20 on-nights, then accelerates toward full
+    exploration by WARMUP_ON_NIGHTS. The on/off decision itself is untouched —
+    only which dose we use once it's on."""
     beta, _ = sample_beta(post)
     n_on = n_on or {}
     plan = {}
@@ -290,7 +316,8 @@ def plan_night(post, cols, active_interventions, n_on=None):
             std = _d(iv.get("default_dose") or 0)
             levels = {_d(x) for x in iv["dose_levels"] if x and float(x) > 0}
             if std in levels:
-                p_default = 1.0 - n_on.get(iv["id"], 0) / WARMUP_ON_NIGHTS
+                warm = min(1.0, n_on.get(iv["id"], 0) / WARMUP_ON_NIGHTS)
+                p_default = 1.0 - warm * warm     # quadratic ramp; see WARMUP_ON_NIGHTS
                 if p_default > 0.0 and random.random() < p_default:
                     best_dose = std
 
@@ -354,11 +381,15 @@ def readouts(interventions, betas, cols):
                 "ci_high": _percentile(samples, 0.95),
             })
 
-        rec_dose, rec_p = 0.0, best_counts[0.0] / S
-        for dose in levels:
-            p = best_counts[dose] / S
-            if p > rec_p:
-                rec_p, rec_dose = p, dose
+        # Recommend the dose with the best *mean* effect, not the highest P(best):
+        # P(best) rewards a wide posterior, so a barely-tried dose could win on
+        # uncertainty alone. Fall back to "off" (0) if no dose beats skipping on
+        # average. recommended_p is reported as that dose's P(best) for display.
+        rec_dose, rec_mean = 0.0, 0.0
+        for row in dose_rows:
+            if row["mean_effect"] > rec_mean:
+                rec_mean, rec_dose = row["mean_effect"], row["dose"]
+        rec_p = best_counts[rec_dose] / S
 
         on_sorted = sorted(on_samples)
         out[iv["id"]] = {
