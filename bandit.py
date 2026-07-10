@@ -63,6 +63,11 @@ SIGMA2_PRIOR_B = 288.0
 MEANINGFUL_EFFECT = 2.0
 
 READOUT_SAMPLES = 3000     # posterior samples behind the probability read-outs
+# The Reports read-outs are Monte-Carlo, so an unseeded run jitters a percent or
+# two on every page load. We seed the read-out draws with a fixed value so the
+# same data always yields the same reported numbers (planning stays random --
+# only analyze() is seeded, and it restores the global RNG state afterwards).
+READOUT_SEED = 1234567
 DOSE_ROUND = 6             # decimals used to key doses (avoids float-equality bugs)
 
 # Cold-start dose exploration. Until an intervention has this many compliant
@@ -335,13 +340,17 @@ def _percentile(sorted_vals, q):
     return sorted_vals[lo] * (hi - k) + sorted_vals[hi] * (k - lo)
 
 
-def readouts(interventions, betas, cols):
+def readouts(interventions, betas, cols, observed=None):
     """
     Per intervention:
       p_helps      = P(alpha_i > 0)                 -- any real benefit
       p_meaningful = P(alpha_i > MEANINGFUL_EFFECT) -- benefit worth acting on
       on_effect    = posterior mean/CI of alpha_i
       per dose     = mean/CI of (alpha+delta) and P(this dose is the best choice)
+
+    observed: optional {iv_id: set of doses actually measured}. When given, per-dose
+    rows (and the recommendation) are limited to doses that have real data -- the
+    Reports page never shows a datapoint for a dose that hasn't been measured yet.
     """
     S = len(betas)
     out = {}
@@ -353,6 +362,9 @@ def readouts(interventions, betas, cols):
                              "recommended_p": 0.0, "p_off_best": 0.0, "doses": []}
             continue
         levels = sorted(set(_d(x) for x in iv["dose_levels"] if x and float(x) > 0))
+        if observed is not None:
+            seen = observed.get(iv["id"], set())
+            levels = [d for d in levels if d in seen]
 
         on_samples = [betas[s][entry["on"]] for s in range(S)]
         helps = sum(1 for a in on_samples if a > 0.0)
@@ -424,8 +436,23 @@ def fit_model(interventions, completed_nights):
 def analyze(interventions, completed_nights):
     """Fit + the Monte-Carlo read-outs used by the Reports tab."""
     m = fit_model(interventions, completed_nights)
-    betas = [sample_beta(m["post"])[0] for _ in range(READOUT_SAMPLES)]
-    reads = readouts(interventions, betas, m["cols"])
+    # Seed the read-out draws so the reported numbers are stable across page loads;
+    # save/restore the global RNG so planning (Thompson sampling) stays random.
+    state = random.getstate()
+    random.seed(READOUT_SEED)
+    try:
+        betas = [sample_beta(m["post"])[0] for _ in range(READOUT_SAMPLES)]
+    finally:
+        random.setstate(state)
+    # Which doses have actually been measured? (only these get a datapoint.)
+    observed = {}
+    for nt in completed_nights:
+        if nt.get("hrv") is None:
+            continue
+        for iid, dose in nt.get("taken", {}).items():
+            if dose and float(dose) > 0:
+                observed.setdefault(int(iid), set()).add(_d(dose))
+    reads = readouts(interventions, betas, m["cols"], observed)
     return {"post": m["post"], "cols": m["cols"], "readouts": reads, "n": m["n"]}
 
 
