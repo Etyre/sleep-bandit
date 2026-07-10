@@ -72,6 +72,9 @@ def connect():
         conn.execute("ALTER TABLE interventions ADD COLUMN dose_noun TEXT NOT NULL DEFAULT ''")
     if "explore_doses" not in cols:
         conn.execute("ALTER TABLE interventions ADD COLUMN explore_doses INTEGER NOT NULL DEFAULT 1")
+    if "archived" not in cols:
+        # soft-delete flag: archived interventions are hidden but their data is kept
+        conn.execute("ALTER TABLE interventions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
     ncols = {r["name"] for r in conn.execute("PRAGMA table_info(nights)")}
     if "lrhr" not in ncols:
         conn.execute("ALTER TABLE nights ADD COLUMN lrhr REAL")
@@ -101,9 +104,10 @@ def _iv_to_dict(row):
 
 
 def list_interventions(conn, active_only=False):
-    q = "SELECT * FROM interventions"
+    # archived (soft-deleted) interventions never show; their data stays in the DB.
+    q = "SELECT * FROM interventions WHERE archived = 0"
     if active_only:
-        q += " WHERE active = 1"
+        q += " AND active = 1"
     q += " ORDER BY active DESC, name COLLATE NOCASE"
     return [_iv_to_dict(r) for r in conn.execute(q)]
 
@@ -261,8 +265,11 @@ def update_intervention(conn, iid, **fields):
 
 
 def delete_intervention(conn, iid):
-    conn.execute("DELETE FROM assignments WHERE intervention_id=?", (iid,))
-    conn.execute("DELETE FROM interventions WHERE id=?", (iid,))
+    """Soft delete: hide the intervention from the tracker and reports but KEEP every
+    assignment and outcome it ever recorded, so an accidental delete loses no data.
+    Also deactivate it so it stops being suggested. (The row and its history remain
+    in the DB and can be un-archived by clearing `archived`.)"""
+    conn.execute("UPDATE interventions SET archived=1, active=0 WHERE id=?", (iid,))
     conn.commit()
 
 

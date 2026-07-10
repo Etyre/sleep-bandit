@@ -66,6 +66,12 @@ function doseText(iv, amount) {
   return iv.unit ? `${numLabel(amount)} ${esc(iv.unit)}` : "on";
 }
 
+// Reports page shows doses in the supplement's native unit (mg/g/mcg/minutes),
+// never as a pill count -- the Tracker keeps pills, but results read in mass.
+function doseAmount(iv, amount) {
+  return iv.unit ? `${numLabel(amount)} ${esc(iv.unit)}` : "on";
+}
+
 // options are {id, label}; look one up by its stable id
 function optLabel(iv, id) {
   const o = (iv.options || []).find((x) => x.id === Math.round(id));
@@ -265,7 +271,7 @@ function reportCard(iv) {
   top.appendChild(el("span", "iv-meta",
     isChoice ? `${(iv.options || []).length} options`
     : iv.kind === "boolean" ? "yes / no"
-    : `standard ${doseText(iv, iv.default_dose)}`));
+    : `standard ${doseAmount(iv, iv.default_dose)}`));
   card.appendChild(top);
 
   const lObs = (iv.readout_lrhr?.n_on || 0) + (iv.readout_lrhr?.n_off || 0);
@@ -277,6 +283,7 @@ function reportCard(iv) {
     return card;
   }
 
+  let lrhrHandled = false;
   if (nObs > 0) {
     const dataNote = `${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off.`;
     // Not enough of a contrast yet -> no recommendation, just say so.
@@ -285,50 +292,85 @@ function reportCard(iv) {
         : `at least ${MIN_ON} on and ${MIN_OFF} off`;
       card.appendChild(el("p", "iv-meta",
         `📈 <b>HRV</b>: gathering data — ${dataNote} Needs ${need} before it can compare.`));
-    } else {
+    } else if (isChoice) {
       const doses = (r.doses || []).slice().sort((a, b) => b.p_best - a.p_best);
-      if (isChoice) {
-        const best = optLabel(iv, r.recommended_dose);
-        card.appendChild(el("p", "iv-meta",
-          (best ? `📈 Best for HRV: <b>${esc(best)}</b> — effects relative to your average night. ` : "📈 ") +
-          `Based on ${dataNote}`));
-        if (doses.length) {
-          const table = el("table", "dose-table");
-          table.innerHTML = "<tr><th>Option</th><th>HRV effect</th><th>P(best)</th><th></th></tr>";
-          for (const d of doses) {
-            const rec = Math.round(d.dose) === Math.round(r.recommended_dose) && r.recommended_dose > 0;
-            table.appendChild(doseRow(d, esc(optLabel(iv, d.dose) || "(removed)"), rec, false));
-          }
-          card.appendChild(table);
+      const best = optLabel(iv, r.recommended_dose);
+      card.appendChild(el("p", "iv-meta",
+        (best ? `📈 Best for HRV: <b>${esc(best)}</b> — effects relative to your average night. ` : "📈 ") +
+        `Based on ${dataNote}`));
+      if (doses.length) {
+        const table = el("table", "dose-table");
+        table.innerHTML = "<tr><th>Option</th><th>HRV effect</th><th>P(best)</th><th></th></tr>";
+        for (const d of doses) {
+          const rec = Math.round(d.dose) === Math.round(r.recommended_dose) && r.recommended_dose > 0;
+          table.appendChild(doseRow(d, esc(optLabel(iv, d.dose) || "(removed)"), rec, false));
         }
-      } else {
-        if (r.on_effect != null) {
-          const cls = r.on_effect >= 0 ? "pos" : "neg";
-          card.appendChild(el("p", "iv-meta",
-            `📈 <b>HRV</b>: <span class="effect ${cls}">${signed(r.on_effect)}</span> ` +
-            `<span class="ci">[${signed(r.on_ci_low)}, ${signed(r.on_ci_high)}]</span> on average — ` +
-            `<b>${pct(r.p_helps)}</b> chance it's a real positive effect` +
-            `${r.p_meaningful >= 0.85 ? " (likely sizable)" : ""}. Based on ${dataNote}`));
-        }
-        // Dose effects are secondary to "does it work": show them as a graph, and
-        // only crown a recommended dose once there's real contrast (enough on-nights
-        // AND 2+ distinct doses tried). r.doses is already in ascending-dose order.
-        if ((r.doses || []).length) {
-          const showRec = enoughForDoseRec(r);
-          card.appendChild(el("p", "chart-cap",
-            'Dose → HRV change over baseline · <span class="mk-dot">●</span> mean · <span class="mk-ci">│</span> 90% CI'));
-          card.appendChild(doseChart(iv, r.doses, r, showRec));
-          if (!showRec) {
-            card.appendChild(el("p", "iv-meta",
-              "No dose recommended yet — needs more on-nights across at least two different doses."));
-          }
+        card.appendChild(table);
+      }
+    } else {
+      // Dose intervention with enough data: big "does it work" numbers (HRV +
+      // resting HR) on the left, the dose graph on the right, ~equal width. The
+      // headline effect is what matters; dose response is the secondary detail.
+      const body = el("div", "iv-2col");
+      const left = el("div", "iv-metrics");
+      left.appendChild(hrvMetric(r, dataNote));
+      left.appendChild(rhrMetric(iv));
+      lrhrHandled = true;
+      body.appendChild(left);
+
+      const right = el("div", "iv-graph");
+      if ((r.doses || []).length) {
+        const showRec = enoughForDoseRec(r);
+        right.appendChild(el("p", "chart-cap",
+          'Dose → HRV change over baseline · <span class="mk-dot">●</span> mean · <span class="mk-ci">│</span> 90% CI'));
+        right.appendChild(doseChart(iv, r.doses, r, showRec));
+        if (!showRec) {
+          right.appendChild(el("p", "iv-meta",
+            "No dose recommended yet — needs more on-nights across at least two different doses."));
         }
       }
+      body.appendChild(right);
+      card.appendChild(body);
     }
   }
 
-  appendLrhr(card, iv);
+  if (!lrhrHandled) appendLrhr(card, iv);
   return card;
+}
+
+// Big "does HRV improve?" hero number for a dose intervention (left column).
+function hrvMetric(r, dataNote) {
+  const cls = r.on_effect >= 0 ? "pos" : "neg";
+  const sizable = r.p_meaningful >= 0.85 ? ' · <span class="metric-flag">likely sizable</span>' : "";
+  const b = el("div", "metric-big");
+  b.appendChild(el("div", "metric-label", '📈 HRV <span class="metric-hint">higher is better</span>'));
+  b.appendChild(el("div", "metric-val " + cls, signed(r.on_effect)));
+  b.appendChild(el("div", "metric-sub",
+    `<span class="ci">[${signed(r.on_ci_low)}, ${signed(r.on_ci_high)}]</span> on average · ` +
+    `<b>${pct(r.p_helps)}</b> chance of a real benefit${sizable}`));
+  b.appendChild(el("div", "metric-note", `Based on ${dataNote}`));
+  return b;
+}
+
+// Big resting-HR hero number (left column). LRHR fit is on -LRHR, so flip back to
+// bpm; a negative change (lower resting HR) is good -> green.
+function rhrMetric(iv) {
+  const rl = iv.readout_lrhr || {};
+  const nOn = rl.n_on || 0, nOff = rl.n_off || 0;
+  const b = el("div", "metric-big");
+  b.appendChild(el("div", "metric-label", '🫀 Resting HR <span class="metric-hint">lower is better</span>'));
+  if (nOn + nOff === 0 || !enough(nOn, nOff, iv.kind === "choice") || rl.on_effect == null) {
+    b.appendChild(el("div", "metric-val muted", "—"));
+    b.appendChild(el("div", "metric-sub", `gathering data — ${nOn} on, ${nOff} off`));
+    return b;
+  }
+  const effBpm = -rl.on_effect;
+  const cls = effBpm <= 0 ? "pos" : "neg";
+  b.appendChild(el("div", "metric-val " + cls, `${signed(effBpm)}<span class="metric-unit"> bpm</span>`));
+  b.appendChild(el("div", "metric-sub",
+    `<span class="ci">[${signed(-rl.on_ci_high)}, ${signed(-rl.on_ci_low)}]</span> on average · ` +
+    `<b>${pct(rl.p_helps)}</b> chance it lowers`));
+  return b;
 }
 
 // Resting-HR line (LRHR fit is on -LRHR, so flip the sign back to bpm; negative = lower = good)
@@ -365,14 +407,11 @@ function doseRow(d, label, rec, isOff) {
   return tr;
 }
 
-// A dose axis tick ("3" pills / "3000" mg) and the unit caption under the axis.
+// Dose axis tick + unit caption, in the native unit (mg/g/…), never pills.
 function doseTick(iv, dose) {
-  const u = iv.unit_dose || 0, noun = (iv.dose_noun || "").trim();
-  return numLabel(u > 0 && noun ? dose / u : dose);
+  return numLabel(dose);
 }
 function doseUnitCaption(iv) {
-  const u = iv.unit_dose || 0, noun = (iv.dose_noun || "").trim();
-  if (u > 0 && noun) return pluralize(noun, 2);
   return iv.unit || "";
 }
 
@@ -415,7 +454,7 @@ function doseChart(iv, rows, r, showRec) {
     }
     // mean dot with a surface ring, plus a native hover tooltip
     parts.push(`<circle cx="${x}" cy="${yM}" r="5" stroke-width="2" style="fill:${col};stroke:var(--panel)">` +
-      `<title>${esc(doseText(iv, d.dose))}: ${signed(d.mean_effect)} HRV [${signed(d.ci_low)}, ${signed(d.ci_high)}]</title></circle>`);
+      `<title>${doseAmount(iv, d.dose)}: ${signed(d.mean_effect)} HRV [${signed(d.ci_low)}, ${signed(d.ci_high)}]</title></circle>`);
     // direct value label, flipped to the left on the last column so it never overflows
     const left = i === n - 1 && n > 1;
     parts.push(`<text x="${x + (left ? -9 : 9)}" y="${yM + 3.5}" text-anchor="${left ? "end" : "start"}" font-size="11" font-weight="600" style="fill:${col}">${signed(d.mean_effect)}</text>`);
@@ -528,13 +567,27 @@ function openModal(iv) {
   const del = $("#iv-delete");
   del.hidden = !iv;
   if (iv) { del.textContent = "Delete"; del.onclick = () => deleteIv(iv); }
+  const pause = $("#iv-pause");
+  pause.hidden = !iv;
+  if (iv) { pause.textContent = iv.active ? "Pause" : "Resume"; pause.onclick = () => togglePause(iv); }
   $("#modal-backdrop").hidden = false;
   f.name.focus();
 }
 function closeModal() { $("#modal-backdrop").hidden = true; editingId = null; }
 
+// Pause/resume: paused interventions stop being suggested on future nights (a night
+// that's already planned is left unchanged) and keep all their data; pass dose_levels
+// back so the update doesn't regenerate them.
+async function togglePause(iv) {
+  STATE = await api(`/api/interventions/${iv.id}`, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active: !iv.active, dose_levels: iv.dose_levels }),
+  });
+  closeModal(); renderGrid();
+}
+
 async function deleteIv(iv) {
-  if (!confirm(`Delete “${iv.name}” and its history?`)) return;
+  if (!confirm(`Remove “${iv.name}” from your tracker?\n\nIts recorded data is kept — nothing is deleted, and it stops being suggested.`)) return;
   await api(`/api/interventions/${iv.id}`, { method: "DELETE" });
   closeModal(); loadGrid();
 }

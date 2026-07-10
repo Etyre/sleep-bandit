@@ -161,11 +161,29 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .bar > span { position: absolute; left: 0; top: 0; bottom: 0; background: linear-gradient(90deg, var(--accent), var(--accent-2)); border-radius: 5px; }
 .pbest { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; }
 .rec-tag { color: var(--accent-2); font-weight: 700; font-size: 11px; }
-.chart-cap { color: var(--muted); font-size: 11.5px; margin: 12px 2px 2px; }
+.chart-cap { color: var(--muted); font-size: 11.5px; margin: 0 2px 2px; }
 .chart-cap .mk-dot { color: var(--good); font-weight: 700; }
 .chart-cap .mk-ci { color: var(--muted); font-weight: 700; }
 .dose-chart { margin: 2px 0 2px; }
 .dose-chart svg { overflow: visible; }
+
+/* dose card: big does-it-work numbers (left) beside the dose graph (right) */
+.iv-2col { display: flex; gap: 24px; align-items: flex-start; margin-top: 12px; }
+.iv-metrics { flex: 1 1 46%; min-width: 190px; display: flex; flex-direction: column; gap: 16px; }
+.iv-graph { flex: 1 1 54%; min-width: 240px; }
+@media (max-width: 620px) { .iv-2col { flex-direction: column; gap: 16px; } }
+
+.metric-label { color: var(--muted); font-size: 12px; font-weight: 600; }
+.metric-hint { color: var(--muted); font-weight: 400; opacity: .65; font-size: 11px; }
+.metric-val { font-size: 42px; font-weight: 700; line-height: 1.04; margin: 3px 0 2px; font-variant-numeric: tabular-nums; }
+.metric-val.pos { color: var(--good); }
+.metric-val.neg { color: var(--bad); }
+.metric-val.muted { color: var(--muted); font-weight: 600; }
+.metric-unit { font-size: 18px; font-weight: 600; color: var(--muted); }
+.metric-sub { color: var(--muted); font-size: 12.5px; line-height: 1.35; }
+.metric-sub b { color: var(--text); }
+.metric-note { color: var(--muted); font-size: 11.5px; opacity: .8; margin-top: 3px; }
+.metric-flag { color: var(--accent-2); font-weight: 600; }
 
 /* ---- modal ---- */
 .modal-backdrop { position: fixed; inset: 0; background: rgba(6,8,18,.66); display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 50; }

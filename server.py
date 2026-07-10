@@ -265,6 +265,8 @@ class Handler(BaseHTTPRequestHandler):
                 if "dose_levels" in body:
                     fields["dose_levels"] = _clean_levels(body["dose_levels"])
                 store.update_intervention(conn, iid, **fields)
+                # Pausing only stops FUTURE suggestions; a night that's already been
+                # planned is never changed, so we don't touch existing assignments.
                 ensure_tonight(conn)
                 return self._send_json(state_payload(conn))
         finally:
