@@ -293,6 +293,15 @@ function reportCard(iv) {
       card.appendChild(el("p", "iv-meta",
         `📈 <b>HRV</b>: gathering data — ${dataNote} Needs ${need} before it can compare.`));
     } else if (isChoice) {
+      // If it tests skipping, lead with the average effect of doing ANY option vs
+      // nothing (needs control nights). The resting-HR counterpart is added by appendLrhr.
+      if (iv.test_skip && (r.n_off || 0) >= MIN_OFF && r.on_effect != null) {
+        const cls = r.on_effect >= 0 ? "pos" : "neg";
+        card.appendChild(el("p", "iv-meta",
+          `📈 <b>HRV — any option vs skipping</b>: <span class="effect ${cls}">${signed(r.on_effect)}</span> ` +
+          `<span class="ci">[${signed(r.on_ci_low)}, ${signed(r.on_ci_high)}]</span> on average — ` +
+          `<b>${pct(r.p_helps)}</b> chance it helps at all.`));
+      }
       const doses = (r.doses || []).slice().sort((a, b) => b.p_best - a.p_best);
       const best = optLabel(iv, r.recommended_dose);
       card.appendChild(el("p", "iv-meta",
@@ -376,17 +385,23 @@ function rhrMetric(iv) {
 // Resting-HR line (LRHR fit is on -LRHR, so flip the sign back to bpm; negative = lower = good)
 function appendLrhr(card, iv) {
   const rl = iv.readout_lrhr || {};
+  const isChoice = iv.kind === "choice";
+  // For a choice, the resting-HR effect is "any option vs skipping" -- only meaningful
+  // when it's testing the skip option and has some control nights.
+  if (isChoice && !iv.test_skip) return;
   const nOn = rl.n_on || 0, nOff = rl.n_off || 0;
   if (nOn + nOff === 0) return;
-  if (!enough(nOn, nOff, iv.kind === "choice") || rl.on_effect == null) {
+  const ready = isChoice ? (nOn >= MIN_ON && nOff >= MIN_OFF) : enough(nOn, nOff, false);
+  if (!ready || rl.on_effect == null) {
     card.appendChild(el("p", "iv-meta",
       `🫀 <b>Resting HR</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off.`));
     return;
   }
   const effBpm = -rl.on_effect;
   const cls = effBpm <= 0 ? "pos" : "neg";  // lower resting HR is good -> green
+  const label = isChoice ? "Resting HR — any option vs skipping" : "Resting HR";
   card.appendChild(el("p", "iv-meta",
-    `🫀 <b>Resting HR</b>: <span class="effect ${cls}">${signed(effBpm)}</span> bpm ` +
+    `🫀 <b>${label}</b>: <span class="effect ${cls}">${signed(effBpm)}</span> bpm ` +
     `<span class="ci">[${signed(-rl.on_ci_high)}, ${signed(-rl.on_ci_low)}]</span> on average ` +
     `(lower is better) — <b>${pct(rl.p_helps)}</b> chance it lowers your resting HR.`));
 }
@@ -559,6 +574,7 @@ function openModal(iv) {
   f.unit_dose.value = iv && iv.unit_dose ? iv.unit_dose : "";
   f.dose_noun.value = iv ? (iv.dose_noun || "") : "";
   f.explore_doses.checked = iv ? iv.explore_doses !== false : true;
+  f.test_skip.checked = iv ? !!iv.test_skip : false;
   f.note.value = iv ? iv.note : "";
   modalOptions = iv && iv.kind === "choice" ? (iv.options || []).map((o) => ({ id: o.id, label: o.label })) : [];
   $("#new-option").value = "";
@@ -599,6 +615,7 @@ $("#iv-form").addEventListener("submit", async (e) => {
   const payload = { name: f.name.value.trim(), kind, category: f.category.value, note: f.note.value.trim() };
   if (kind === "choice") {
     payload.options = modalOptions;
+    payload.test_skip = f.test_skip.checked;
   } else if (kind === "dose") {
     payload.unit = f.unit.value.trim();
     payload.default_dose = parseFloat(f.default_dose.value) || 1;

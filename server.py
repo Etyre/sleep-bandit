@@ -13,7 +13,7 @@ is a plain coin flip per the current design.
 
 import json
 import os
-from datetime import date
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -25,9 +25,18 @@ PORT = 8777
 PUBLIC_DIR = os.path.join(os.path.dirname(__file__), "public")
 GRID_NIGHTS = 21          # how many night-columns to show (newest first)
 
+# A "night" rolls over at 4 AM, not midnight. A routine done in the small hours
+# (any time before 4 AM) belongs to the PREVIOUS evening's night -- that's how the
+# user files it ("last night" stays last night whether the routine was done before
+# or after midnight). So the current night's date is (now - 4h)'s calendar date.
+NIGHT_ROLLOVER_HOUR = 4
+
 
 def today_str():
-    return date.today().isoformat()
+    """The date of the CURRENT night. Rolls over at NIGHT_ROLLOVER_HOUR (4 AM), so
+    e.g. 1:30 AM on the 12th still reads as the night of the 11th, and only at
+    4:00 AM does it advance to the 12th."""
+    return (datetime.now() - timedelta(hours=NIGHT_ROLLOVER_HOUR)).date().isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +246,7 @@ class Handler(BaseHTTPRequestHandler):
                     category=body.get("category", "supplement"),
                     dose_noun=body.get("dose_noun", ""),
                     explore_doses=body.get("explore_doses", True),
+                    test_skip=body.get("test_skip", False),
                 )
                 ensure_tonight(conn)
                 return self._send_json(state_payload(conn), 201)
@@ -263,7 +273,7 @@ class Handler(BaseHTTPRequestHandler):
                 iid = int(path.rsplit("/", 1)[-1])
                 fields = {k: body[k] for k in
                           ("name", "unit", "default_dose", "unit_dose", "dose_noun", "note",
-                           "active", "kind", "options", "category", "explore_doses")
+                           "active", "kind", "options", "category", "explore_doses", "test_skip")
                           if k in body}
                 if "dose_levels" in body:
                     fields["dose_levels"] = _clean_levels(body["dose_levels"])

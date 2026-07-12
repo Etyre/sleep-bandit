@@ -45,11 +45,38 @@ CREATE TABLE IF NOT EXISTS assignments (
     taken_dose      REAL,                      -- what you actually did; NULL until recorded
     PRIMARY KEY (night_date, intervention_id)
 );
+CREATE TABLE IF NOT EXISTS audit_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT NOT NULL,             -- EXACT local wall-clock time of the write (ms)
+    op              TEXT NOT NULL,             -- what happened: assign, assign_blocked, set_taken, ...
+    night_date      TEXT,                      -- the night it touched (NULL for intervention-level ops)
+    intervention_id INTEGER,                   -- the intervention it touched (NULL if n/a)
+    detail          TEXT NOT NULL DEFAULT ''   -- JSON: before/after values and context
+);
 """
 
 
 def _now():
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _now_exact():
+    """Exact wall-clock timestamp (millisecond precision) for the audit log."""
+    return datetime.now().isoformat(timespec="milliseconds")
+
+
+def _audit(conn, op, night_date=None, intervention_id=None, **detail):
+    """Append one row to the immutable audit log recording the exact date+time of a
+    database write. Never commits on its own -- it rides the caller's transaction, so
+    the log entry and the change it describes commit together (or not at all). The
+    audit_log is append-only: nothing in the app ever updates or deletes from it, so
+    it's the durable trail for reconstructing what changed and when."""
+    conn.execute(
+        "INSERT INTO audit_log (ts, op, night_date, intervention_id, detail) VALUES (?,?,?,?,?)",
+        (_now_exact(), op,
+         (str(night_date) if night_date is not None else None),
+         (int(intervention_id) if intervention_id is not None else None),
+         json.dumps(detail, default=str) if detail else ""))
 
 
 def connect():
@@ -75,6 +102,10 @@ def connect():
     if "archived" not in cols:
         # soft-delete flag: archived interventions are hidden but their data is kept
         conn.execute("ALTER TABLE interventions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+    if "test_skip" not in cols:
+        # choice interventions only: also test the "skip" (null) option, giving control
+        # nights so the average effect of doing ANY option vs nothing is measurable
+        conn.execute("ALTER TABLE interventions ADD COLUMN test_skip INTEGER NOT NULL DEFAULT 0")
     ncols = {r["name"] for r in conn.execute("PRAGMA table_info(nights)")}
     if "lrhr" not in ncols:
         conn.execute("ALTER TABLE nights ADD COLUMN lrhr REAL")
@@ -100,6 +131,7 @@ def _iv_to_dict(row):
         "kind": row["kind"],
         "options": _read_options(row["options"]),
         "category": row["category"],
+        "test_skip": bool(row["test_skip"]),
     }
 
 
@@ -175,7 +207,8 @@ def _norm_category(category):
 
 def create_intervention(conn, name, unit="", default_dose=1.0, unit_dose=0.0,
                         dose_levels=None, note="", kind="dose", options=None,
-                        category="supplement", dose_noun="", explore_doses=True):
+                        category="supplement", dose_noun="", explore_doses=True,
+                        test_skip=False):
     kind = kind if kind in ("choice", "boolean") else "dose"
     explore_doses = bool(explore_doses)
     category = _norm_category(category)
@@ -192,14 +225,17 @@ def create_intervention(conn, name, unit="", default_dose=1.0, unit_dose=0.0,
         options = []
         if not dose_levels:
             dose_levels = dose_levels_from(default_dose, unit_dose, explore_doses)
+    ts = 1 if (kind == "choice" and test_skip) else 0
     cur = conn.execute(
         "INSERT INTO interventions (name, unit, default_dose, unit_dose, dose_noun, explore_doses, "
-        "dose_levels, active, note, kind, options, category, created_at) "
-        "VALUES (?,?,?,?,?,?,?,1,?,?,?,?,?)",
+        "dose_levels, active, note, kind, options, category, test_skip, created_at) "
+        "VALUES (?,?,?,?,?,?,?,1,?,?,?,?,?,?)",
         (name.strip(), unit.strip(), float(default_dose), float(unit_dose or 0),
          (dose_noun or "").strip(), 1 if explore_doses else 0, json.dumps(dose_levels),
-         note.strip(), kind, json.dumps(options), category, _now()),
+         note.strip(), kind, json.dumps(options), category, ts, _now()),
     )
+    _audit(conn, "create_intervention", intervention_id=cur.lastrowid,
+           name=name.strip(), kind=kind, category=category)
     conn.commit()
     return get_intervention(conn, cur.lastrowid)
 
@@ -233,6 +269,8 @@ def update_intervention(conn, iid, **fields):
         setcol("unit", "")
         setcol("default_dose", 1.0)
         setcol("dose_noun", "")
+        ts = fields["test_skip"] if fields.get("test_skip") is not None else iv.get("test_skip")
+        setcol("test_skip", 1 if ts else 0)
     elif kind == "boolean":
         setcol("options", "[]")
         setcol("dose_levels", json.dumps([1]))
@@ -240,7 +278,9 @@ def update_intervention(conn, iid, **fields):
         setcol("default_dose", 1.0)
         setcol("unit_dose", 0.0)
         setcol("dose_noun", "")
+        setcol("test_skip", 0)
     else:
+        setcol("test_skip", 0)
         setcol("options", "[]")
         std = float(fields["default_dose"]) if fields.get("default_dose") is not None else iv["default_dose"]
         udose = float(fields["unit_dose"]) if fields.get("unit_dose") is not None else (iv.get("unit_dose") or 0)
@@ -260,6 +300,8 @@ def update_intervention(conn, iid, **fields):
 
     vals.append(iid)
     conn.execute(f"UPDATE interventions SET {', '.join(cols)} WHERE id=?", vals)
+    _audit(conn, "update_intervention", intervention_id=iid,
+           changed=[c.split("=")[0] for c in cols])
     conn.commit()
     return get_intervention(conn, iid)
 
@@ -270,6 +312,7 @@ def delete_intervention(conn, iid):
     Also deactivate it so it stops being suggested. (The row and its history remain
     in the DB and can be un-archived by clearing `archived`.)"""
     conn.execute("UPDATE interventions SET archived=1, active=0 WHERE id=?", (iid,))
+    _audit(conn, "delete_intervention", intervention_id=iid)
     conn.commit()
 
 
@@ -294,22 +337,58 @@ def ensure_night(conn, d):
         conn.execute(
             "INSERT INTO nights (date, status, created_at) VALUES (?, 'planned', ?)",
             (d, _now()))
+        _audit(conn, "create_night", d)
         conn.commit()
     return get_night(conn, d)
 
 
 def set_assignment(conn, d, iid, assigned_dose):
-    # Checkmark starts UNchecked (taken_dose NULL); you tick cells as you do them.
-    conn.execute(
+    """Record the plan for one cell. INSERT-ONLY and FROZEN: once a
+    (night, intervention) assignment exists it can never be rewritten here.
+
+    This is the core integrity guarantee of the experiment: the moment a night's
+    dose/option is assigned, that is the historical record of what was prescribed,
+    and it must not change afterwards -- not by a later planning run, an engine
+    change, a server restart, or a reload. Planning may only *fill in* a cell that
+    doesn't exist yet (ON CONFLICT DO NOTHING); to deliberately correct a mistaken
+    record, use force_assignment (never called during normal planning).
+
+    Checkmark starts UNchecked (taken_dose NULL); you tick cells as you do them.
+    """
+    cur = conn.execute(
         "INSERT INTO assignments (night_date, intervention_id, assigned_dose) "
-        "VALUES (?,?,?) ON CONFLICT(night_date, intervention_id) "
-        "DO UPDATE SET assigned_dose=excluded.assigned_dose",
+        "VALUES (?,?,?) ON CONFLICT(night_date, intervention_id) DO NOTHING",
         (d, iid, float(assigned_dose)))
+    if cur.rowcount:                       # a brand-new cell was created
+        _audit(conn, "assign", d, iid, assigned_dose=float(assigned_dose))
+    else:                                  # the cell already existed -> freeze protected it
+        _audit(conn, "assign_blocked", d, iid, attempted_dose=float(assigned_dose))
+    conn.commit()
+
+
+def force_assignment(conn, d, iid, assigned_dose, taken_dose=None):
+    """Deliberately overwrite an assignment (and optionally its taken_dose). This is
+    the ONLY sanctioned way to change an already-recorded plan -- used for manual
+    corrections, never by the planner. Kept separate from set_assignment so ordinary
+    planning can't reach it."""
+    conn.execute(
+        "INSERT INTO assignments (night_date, intervention_id, assigned_dose, taken_dose) "
+        "VALUES (?,?,?,?) ON CONFLICT(night_date, intervention_id) "
+        "DO UPDATE SET assigned_dose=excluded.assigned_dose, taken_dose=excluded.taken_dose",
+        (d, iid, float(assigned_dose), taken_dose))
+    _audit(conn, "force_assign", d, iid, assigned_dose=float(assigned_dose), taken_dose=taken_dose)
     conn.commit()
 
 
 def clear_assignments(conn, d):
+    """DANGER: deletes a night's plan outright, discarding the frozen record. Not used
+    anywhere in the app's normal flow -- kept only for tooling. Never call this on a
+    night you intend to re-plan; deleting then re-inserting defeats the freeze in
+    set_assignment and would silently rewrite history."""
+    removed = [dict(r) for r in conn.execute(
+        "SELECT intervention_id, assigned_dose, taken_dose FROM assignments WHERE night_date=?", (d,))]
     conn.execute("DELETE FROM assignments WHERE night_date=?", (d,))
+    _audit(conn, "clear_assignments", d, removed=removed)
     conn.commit()
 
 
@@ -327,6 +406,7 @@ def record_night(conn, d, hrv, taken, note=""):
         conn.execute(
             "UPDATE assignments SET taken_dose=? WHERE night_date=? AND "
             "intervention_id=?", (float(dose), d, int(iid)))
+    _audit(conn, "record_night", d, hrv=float(hrv), taken={int(k): v for k, v in taken.items()})
     conn.commit()
     return get_night(conn, d)
 
@@ -335,13 +415,16 @@ def set_taken(conn, d, iid, done):
     """Tick/untick the 'did it' checkmark for one cell. Done => took the assigned
     dose; not done => 0."""
     row = conn.execute(
-        "SELECT assigned_dose FROM assignments WHERE night_date=? AND intervention_id=?",
+        "SELECT assigned_dose, taken_dose FROM assignments WHERE night_date=? AND intervention_id=?",
         (d, iid)).fetchone()
     if not row:
         return
+    new_taken = row["assigned_dose"] if done else 0.0
     conn.execute(
         "UPDATE assignments SET taken_dose=? WHERE night_date=? AND intervention_id=?",
-        (row["assigned_dose"] if done else 0.0, d, iid))
+        (new_taken, d, iid))
+    _audit(conn, "set_taken", d, iid, done=bool(done),
+           taken_before=row["taken_dose"], taken_after=new_taken)
     conn.commit()
 
 
@@ -353,13 +436,15 @@ def set_metric(conn, d, metric, value):
     if metric not in METRICS:
         return
     ensure_night(conn, d)
-    if value is None or value == "":
+    cleared = value is None or value == ""
+    if cleared:
         conn.execute(f"UPDATE nights SET {metric}=NULL WHERE date=?", (d,))
     else:
         conn.execute(f"UPDATE nights SET {metric}=? WHERE date=?", (float(value), d))
     # keep 'completed' tied to having the primary metric (HRV)
     conn.execute("UPDATE nights SET status=CASE WHEN hrv IS NOT NULL THEN 'completed' "
                  "ELSE 'planned' END WHERE date=?", (d,))
+    _audit(conn, "set_metric", d, metric=metric, value=(None if cleared else float(value)))
     conn.commit()
 
 

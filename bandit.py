@@ -81,21 +81,20 @@ DOSE_ROUND = 6             # decimals used to key doses (avoids float-equality b
 # this only governs which dose we use once an intervention is on.
 WARMUP_ON_NIGHTS = 64
 
-# Hill climbing. Past the cold-start ramp, at most this fraction of "on" nights probe
-# a dose one rung (see _dose_step) BEYOND the range tried so far -- upward while the
-# top dose is still near-best, downward while the smallest dose is still viable -- so
-# the search maps the dose-response curve and can walk toward an optimum far from the
-# standard, with no artificial ceiling. The rest of the on-nights exploit the chosen
-# dose. Gated by the same quadratic warm-up, so the chance of moving off the standard
-# dose stays under 1-in-10 for ~30 on-nights.
+# Dose selection once an intervention is "on". We keep the STANDARD dose most nights
+# while data is thin and only optimize the dose as evidence accumulates: the chance of
+# deviating from the standard at all ramps up with the warm-up -- QUADRATICALLY for
+# supplements (p = (n_on/WARMUP)^2, so under 1-in-10 for the first ~20 on-nights) and
+# faster, LINEARLY, for time-based interventions, which are safe to explore harder.
+# This single gate covers BOTH exploiting a non-standard best dose AND probing -- so
+# nothing moves off the standard dose more than the ramp allows.
 #
-# Supplements (mass units) are dosed cautiously: they only ever climb ONE unit dose at
-# a time, for safety. Minute-based interventions (breathing, mats, ...) carry no such
-# risk, so they search "hotter" -- a higher probe rate and jumps of several rungs at
-# once -- to find a far-off optimum faster.
-MAX_EXPLORE = 0.35        # supplements: fraction of on-nights that probe (careful)
-TIME_EXPLORE = 0.60       # minute-based interventions: hotter search
-TIME_MAX_JUMP = 4         # minute-based: probe up to this many rungs from the best at once
+# When we do deviate, this fraction of those nights are exploratory probes (mapping the
+# dose-response curve) and the rest exploit the best (minimum viable) dose so far.
+# Supplements probe ONE unit dose at a time, for safety; time-based ones jump several
+# rungs (TIME_MAX_JUMP) at once to find a far-off optimum faster.
+PROBE_SHARE = 0.4
+TIME_MAX_JUMP = 4
 
 # Minimum viable dose: we recommend (and exploit) the SMALLEST dose whose estimated
 # effect is at least this fraction of the best measured dose's effect -- so a smaller
@@ -350,6 +349,28 @@ def _min_viable_dose(effs):
     return min(d for d, e in effs.items() if e >= thr)
 
 
+def _supp_probe(seen, counts, effs, best, std, step):
+    """A supplement's one-rung exploration probe: firm up an edge dose with a few
+    readings (MIN_PROBES), then step exactly ONE unit dose past it -- up while the top is
+    still rising, down while the bottom is still viable. Never jumps more than one rung."""
+    if not seen:
+        targets = [std - step, std + step]
+    else:
+        thr = MIN_VIABLE_FRAC * best if (best is not None and best > 0) else None
+        top, bot = seen[-1], seen[0]
+        targets = []
+        if counts[top] < MIN_PROBES:
+            targets.append(top)                       # firm up the top first
+        elif len(seen) < 2 or effs[top] > effs[seen[-2]]:
+            targets.append(top + step)                # still rising -> climb
+        if counts[bot] < MIN_PROBES:
+            targets.append(bot)                       # firm up the bottom
+        elif thr is None or effs[bot] >= thr:
+            targets.append(bot - step)                # still viable -> reach down
+    targets = [_d(d) for d in targets if d > 0]
+    return random.choice(targets) if targets else std
+
+
 def plan_night(post, cols, active_interventions, n_on=None, measured=None):
     """Draw ONE posterior sample (Thompson sampling) and, per intervention, decide
     tonight's arm in TWO independent stages:
@@ -358,13 +379,13 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
          by the "does it help at all" effect alpha_i: we take it iff a sampled
          alpha_i > 0. This keeps the on/off decision unbiased -- P(on) ~ P(it helps)
          -- and independent of how many candidate doses it has.
-      2. If it's on, which dose?  We aim for the MINIMUM VIABLE dose and HILL CLIMB to
-         map the dose-response curve. Most on-nights we exploit the smallest dose whose
-         posterior-mean effect is within MIN_VIABLE_FRAC of the best dose measured so
-         far; with a warm-up-gated probability (MAX_EXPLORE * warm^2) we instead probe
-         one rung beyond the range tried -- upward while the top dose is still near-best
-         and downward while the smallest is still viable. So the frontier advances with
-         no ceiling until the curve's shape (peak and minimum-effective knee) is mapped.
+      2. If it's on, which dose?  Keep the STANDARD dose most nights while data is thin;
+         the chance of deviating ramps with the warm-up (quadratic for supplements ->
+         under 1-in-10 for the first ~20 on-nights, faster for time-based). When it does
+         deviate it either exploits the MINIMUM VIABLE dose (smallest within
+         MIN_VIABLE_FRAC of the best measured effect) or, PROBE_SHARE of the time, probes
+         to map the curve -- supplements one unit dose at a time, time-based in bigger
+         jumps -- so the search can reach an optimum far from the standard.
 
     Multiple-choice interventions skip stage 1 -- "off" is NOT an option and we take
     the best option even if all look weakly negative.
@@ -382,7 +403,13 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
             continue
 
         if iv.get("kind") == "choice":
-            # always pick an option; there is no "off"
+            # By default a choice always lands on some option. If it also tests the
+            # "skip" option, run stage 1 first: skip when a sampled alpha <= 0, which
+            # sprinkles in control nights so the average effect of doing ANY option vs
+            # nothing becomes measurable.
+            if iv.get("test_skip") and beta[entry["on"]] <= 0.0:
+                plan[iv["id"]] = 0.0
+                continue
             best_dose, _ = _best_dose(beta, entry, iv["dose_levels"])
             plan[iv["id"]] = best_dose if best_dose is not None else 0.0
             continue
@@ -397,10 +424,20 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
             plan[iv["id"]] = 1.0
             continue
 
-        # Stage 2: it's on -- choose the dose. Exploit the MINIMUM VIABLE dose, and with
-        # a warm-up-gated probability explore to map the curve.
+        # Stage 2: it's on -- choose the dose. Stay on the STANDARD dose most nights while
+        # data is thin; the chance of deviating ramps with the warm-up (quadratic for
+        # supplements -> <1-in-10 for the first ~20 on-nights, faster for time-based).
+        # This gate covers BOTH exploiting a non-standard dose AND probing.
         std = _d(iv.get("default_dose") or 0)
         step = _dose_step(iv)
+        timed = _time_based(iv)
+        warm = min(1.0, n_on.get(iv["id"], 0) / WARMUP_ON_NIGHTS)
+        p_deviate = warm if timed else warm * warm
+        if step <= 0 or random.random() >= p_deviate:
+            plan[iv["id"]] = std
+            continue
+
+        # Deviating tonight: reconstruct the measured dose-response curve.
         counts = {}                                      # dose -> times measured
         for x in measured.get(iv["id"], ()):
             xd = _d(x)
@@ -410,46 +447,22 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
         effs = {d: _effect(post["mN"], entry, d) for d in seen}   # posterior-mean curve
         best = max(effs.values()) if effs else None
 
-        # exploit: minimum viable dose once there are >=2 measured doses; else standard
+        # exploit target: minimum viable dose once there are >=2 measured doses
         center = std
         if len(seen) >= 2:
             mv = _min_viable_dose(effs)
             if mv is not None:
                 center = mv
 
-        dose = center
-        timed = _time_based(iv)
-        rate = TIME_EXPLORE if timed else MAX_EXPLORE
-        warm = min(1.0, n_on.get(iv["id"], 0) / WARMUP_ON_NIGHTS)
-        p_explore = rate * warm * warm
-        if step > 0 and p_explore > 0.0 and random.random() < p_explore:
+        if random.random() < PROBE_SHARE:                # explore: map the curve
             if timed:
-                # Hot search: no safety limit on jump size, so leap several rungs from the
-                # best dose at once to map a wide range fast.
                 j = random.randint(1, TIME_MAX_JUMP) * random.choice((-1, 1))
                 probe = _d(center + j * step)
                 dose = probe if probe > 0 else _d(center + step)
             else:
-                # Supplement: careful. Firm up an edge dose with a few readings, then
-                # climb exactly ONE unit dose past it -- up while still rising, down while
-                # still viable. Never jumps more than one rung (safety).
-                targets = []
-                if not seen:
-                    targets = [std - step, std + step]
-                else:
-                    thr = MIN_VIABLE_FRAC * best if (best is not None and best > 0) else None
-                    top, bot = seen[-1], seen[0]
-                    if counts[top] < MIN_PROBES:
-                        targets.append(top)                       # firm up the top first
-                    elif len(seen) < 2 or effs[top] > effs[seen[-2]]:
-                        targets.append(top + step)                # still rising -> climb
-                    if counts[bot] < MIN_PROBES:
-                        targets.append(bot)                       # firm up the bottom
-                    elif thr is None or effs[bot] >= thr:
-                        targets.append(bot - step)                # still viable -> reach down
-                targets = [_d(d) for d in targets if d > 0]
-                if targets:
-                    dose = random.choice(targets)
+                dose = _supp_probe(seen, counts, effs, best, std, step)
+        else:
+            dose = center                                # exploit the best dose so far
         plan[iv["id"]] = dose if dose and dose > 0 else 0.0
     return plan
 
