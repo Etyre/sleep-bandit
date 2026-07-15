@@ -166,11 +166,21 @@ function renderGrid() {
     }
     body += `</tr>`;
   }
+  // per-night free-text notes (one editable cell per column)
+  body += `<tr class="metric-row notes-row"><th class="rowlab metric-lab">Notes` +
+    `<span class="rmeta">per night</span></th>`;
+  for (const n of nights) {
+    body += `<td class="notecell${n.is_today ? " col-today" : ""}">` +
+      `<textarea rows="2" data-date="${n.date}" placeholder="—">${esc(n.note || "")}</textarea></td>`;
+  }
+  body += `</tr>`;
+
   body += `</tbody>`;
   table.innerHTML = head + body;
 
   $$(".cell.active", table).forEach((td) => td.addEventListener("click", () => toggleCell(td)));
   $$(".hrvcell input", table).forEach((inp) => inp.addEventListener("change", () => saveMetric(inp)));
+  $$(".notecell textarea", table).forEach((t) => t.addEventListener("change", () => saveNote(t)));
 
   // Tonight is the right-most column, so start scrolled all the way over to it.
   const wrap = table.closest(".grid-wrap");
@@ -201,6 +211,16 @@ async function saveMetric(inp) {
     if (night) night[metric] = num;
   } catch (e) {
     alert("Could not save: " + e.message);
+  }
+}
+
+async function saveNote(t) {
+  const night = STATE.nights.find((n) => n.date === t.dataset.date);
+  try {
+    await post("/api/note", { date: t.dataset.date, note: t.value });
+    if (night) night.note = t.value.trim();
+  } catch (e) {
+    alert("Could not save note: " + e.message);
   }
 }
 
@@ -262,7 +282,9 @@ function reportCard(iv) {
 
   const top = el("div", "iv-top");
   top.appendChild(el("span", "iv-name", esc(iv.name)));
-  if (isChoice) {
+  if (isChoice && !iv.test_skip) {
+    // A plain choice (no skip baseline) can't say "helps vs nothing", so it only
+    // flags gathering-data; a skip-testing choice earns a real verdict like a dose.
     if (nOn < 4) top.appendChild(el("span", "verdict v-new", "🌱 gathering data"));
   } else {
     const [vc, vt] = verdict(r);
@@ -286,22 +308,37 @@ function reportCard(iv) {
   let lrhrHandled = false;
   if (nObs > 0) {
     const dataNote = `${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off.`;
-    // Not enough of a contrast yet -> no recommendation, just say so.
-    if (!enough(nOn, nOff, isChoice)) {
-      const need = isChoice ? `at least ${MIN_CHOICE} option-nights`
+    // The hero "any option vs skipping" numbers need an on/off contrast, exactly like
+    // a dose intervention; a plain choice (no skip) just needs enough option-nights.
+    const skipChoice = isChoice && iv.test_skip;
+    const ready = skipChoice ? (nOn >= MIN_ON && nOff >= MIN_OFF) : enough(nOn, nOff, isChoice);
+    if (!ready) {
+      const need = skipChoice ? `at least ${MIN_ON} on and ${MIN_OFF} off`
+        : isChoice ? `at least ${MIN_CHOICE} option-nights`
         : `at least ${MIN_ON} on and ${MIN_OFF} off`;
       card.appendChild(el("p", "iv-meta",
         `📈 <b>HRV</b>: gathering data — ${dataNote} Needs ${need} before it can compare.`));
-    } else if (isChoice) {
-      // If it tests skipping, lead with the average effect of doing ANY option vs
-      // nothing (needs control nights). The resting-HR counterpart is added by appendLrhr.
-      if (iv.test_skip && (r.n_off || 0) >= MIN_OFF && r.on_effect != null) {
-        const cls = r.on_effect >= 0 ? "pos" : "neg";
-        card.appendChild(el("p", "iv-meta",
-          `📈 <b>HRV — any option vs skipping</b>: <span class="effect ${cls}">${signed(r.on_effect)}</span> ` +
-          `<span class="ci">[${signed(r.on_ci_low)}, ${signed(r.on_ci_high)}]</span> on average — ` +
-          `<b>${pct(r.p_helps)}</b> chance it helps at all.`));
+    } else if (skipChoice) {
+      // Skip-testing choice: SAME hero layout as a dose intervention. The big numbers
+      // are the average effect of doing ANY option vs skipping (HRV + resting HR); the
+      // side chart is a bar graph comparing each option against skipping.
+      const body = el("div", "iv-2col");
+      const left = el("div", "iv-metrics");
+      left.appendChild(hrvMetric(r, dataNote));
+      left.appendChild(rhrMetric(iv));
+      lrhrHandled = true;
+      body.appendChild(left);
+
+      const right = el("div", "iv-graph");
+      if ((r.doses || []).length) {
+        right.appendChild(el("p", "chart-cap",
+          'Option → HRV change vs skipping · <span class="mk-dot">●</span> mean · <span class="mk-ci">│</span> 90% CI'));
+        right.appendChild(optionChart(iv, r.doses, r));
       }
+      body.appendChild(right);
+      card.appendChild(body);
+    } else if (isChoice) {
+      // Plain multiple-choice (no skip option): horse-race table of the options.
       const doses = (r.doses || []).slice().sort((a, b) => b.p_best - a.p_best);
       const best = optLabel(iv, r.recommended_dose);
       card.appendChild(el("p", "iv-meta",
@@ -368,7 +405,9 @@ function rhrMetric(iv) {
   const nOn = rl.n_on || 0, nOff = rl.n_off || 0;
   const b = el("div", "metric-big");
   b.appendChild(el("div", "metric-label", '🫀 Resting HR <span class="metric-hint">lower is better</span>'));
-  if (nOn + nOff === 0 || !enough(nOn, nOff, iv.kind === "choice") || rl.on_effect == null) {
+  // The hero number is an on-vs-off (choice: any-option-vs-skip) aggregate, so it
+  // needs BOTH arms -- enough on AND enough off nights -- for either kind.
+  if (nOn + nOff === 0 || !(nOn >= MIN_ON && nOff >= MIN_OFF) || rl.on_effect == null) {
     b.appendChild(el("div", "metric-val muted", "—"));
     b.appendChild(el("div", "metric-sub", `gathering data — ${nOn} on, ${nOff} off`));
     return b;
@@ -482,6 +521,64 @@ function doseChart(iv, rows, r, showRec) {
 
   const svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img" ` +
     `aria-label="Dose versus HRV change over baseline for ${esc(iv.name)}">${parts.join("")}</svg>`;
+  return el("div", "dose-chart", svg);
+}
+
+// Bar graph comparing a choice's options on HRV change vs skipping (the baseline).
+// One bar per option (mean effect, colored by sign) with a 90% CI whisker; the
+// most-likely-best option's label is highlighted. This is the choice counterpart
+// of doseChart, shown beside the big "any option vs skipping" hero numbers.
+function optionChart(iv, rows, r) {
+  const n = rows.length;
+  const W = Math.max(230, 54 + n * 84), H = 152;
+  const mL = 42, mR = 16, mT = 16, mB = 32;
+  const pL = mL, pR = W - mR, pT = mT, pB = H - mB, pH = pB - pT, pW = pR - pL;
+
+  let lo = 0, hi = 0;
+  for (const d of rows) { lo = Math.min(lo, d.ci_low); hi = Math.max(hi, d.ci_high); }
+  if (hi - lo < 1) { hi += 1; lo -= 1; }
+  const pad = (hi - lo) * 0.08; hi += pad; lo -= pad;
+  const py = (v) => pT + (hi - v) / (hi - lo) * pH;
+  const colW = pW / n, cx = (i) => pL + colW * (i + 0.5);
+  const y0 = py(0);
+
+  // the option most likely to be the best choice gets its dot ringed + label highlighted
+  let bestId = null, bestP = -1;
+  for (const d of rows) { if (d.p_best > bestP) { bestP = d.p_best; bestId = d.dose; } }
+
+  const parts = [];
+  parts.push(`<text x="${pL - 6}" y="${pT + 4}" text-anchor="end" font-size="10" style="fill:var(--muted)">${(hi >= 0 ? "+" : "") + Math.round(hi)}</text>`);
+  parts.push(`<text x="${pL - 6}" y="${pB}" text-anchor="end" font-size="10" style="fill:var(--muted)">${(lo >= 0 ? "+" : "") + Math.round(lo)}</text>`);
+  parts.push(`<line x1="${pL}" y1="${y0}" x2="${pR}" y2="${y0}" stroke-width="1.5" stroke-dasharray="4 4" style="stroke:var(--line)"/>`);
+  parts.push(`<text x="${pL - 6}" y="${y0 + 3.5}" text-anchor="end" font-size="10" style="fill:var(--text)">0</text>`);
+
+  rows.forEach((d, i) => {
+    const x = cx(i), col = d.mean_effect >= 0 ? "var(--good)" : "var(--bad)";
+    const yTop = py(d.ci_high), yBot = py(d.ci_low), yM = py(d.mean_effect);
+    // 90% CI whisker with caps (identical mark to doseChart)
+    parts.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
+    parts.push(`<line x1="${x - 5}" y1="${yTop}" x2="${x + 5}" y2="${yTop}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
+    parts.push(`<line x1="${x - 5}" y1="${yBot}" x2="${x + 5}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
+    // ring the most-likely-best option (parity with doseChart's recommended ring)
+    if (d.dose === bestId && bestP > 0) {
+      parts.push(`<circle cx="${x}" cy="${yM}" r="8.5" fill="none" stroke-width="2" style="stroke:var(--accent-2)"/>`);
+    }
+    // mean dot with a surface ring + hover tooltip
+    parts.push(`<circle cx="${x}" cy="${yM}" r="5" stroke-width="2" style="fill:${col};stroke:var(--panel)">` +
+      `<title>${esc(optLabel(iv, d.dose) || "(removed)")}: ${signed(d.mean_effect)} HRV [${signed(d.ci_low)}, ${signed(d.ci_high)}], P(best)=${pct(d.p_best)}</title></circle>`);
+    // value label beside the dot, flipped left on the last column so it never overflows
+    const left = i === n - 1 && n > 1;
+    parts.push(`<text x="${x + (left ? -9 : 9)}" y="${yM + 3.5}" text-anchor="${left ? "end" : "start"}" font-size="11" font-weight="600" style="fill:${col}">${signed(d.mean_effect)}</text>`);
+    // option label tick (truncated, full text on hover); best option highlighted
+    const raw = optLabel(iv, d.dose) || "(removed)";
+    const isBest = d.dose === bestId;
+    const short = raw.length > 11 ? raw.slice(0, 10) + "…" : raw;
+    parts.push(`<text x="${x}" y="${pB + 14}" text-anchor="middle" font-size="10" ` +
+      `style="fill:${isBest ? "var(--accent-2)" : "var(--muted)"};font-weight:${isBest ? "700" : "400"}">${esc(short)}<title>${esc(raw)}</title></text>`);
+  });
+
+  const svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img" ` +
+    `aria-label="Per-option HRV change vs skipping for ${esc(iv.name)}">${parts.join("")}</svg>`;
   return el("div", "dose-chart", svg);
 }
 

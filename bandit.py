@@ -76,7 +76,7 @@ DOSE_ROUND = 6             # decimals used to key doses (avoids float-equality b
 # *quadratically* -- p_explore = (n_on / WARMUP_ON_NIGHTS)**2 -- so it stays low
 # for a long time and only accelerates once there's real evidence. With
 # WARMUP_ON_NIGHTS = 64 the nightly chance of varying the dose is under 1-in-10
-# for the first 20 on-nights (~0.1% at 5 nights, ~2% at 10, ~9.8% at 20), then
+# for the first 20 on-nights (~0.6% at 5 nights, ~2.4% at 10, ~9.8% at 20), then
 # climbs to full exploration by 64 on-nights. The on/off decision is untouched;
 # this only governs which dose we use once an intervention is on.
 WARMUP_ON_NIGHTS = 64

@@ -448,6 +448,17 @@ def set_metric(conn, d, metric, value):
     conn.commit()
 
 
+def set_note(conn, d, note):
+    """Set the free-text note for a night (the night is created if it doesn't exist).
+    The full note text is captured in the audit log so an accidental overwrite is
+    recoverable, same as every other write."""
+    ensure_night(conn, d)
+    note = (note or "").strip()
+    conn.execute("UPDATE nights SET note=? WHERE date=?", (note, d))
+    _audit(conn, "set_note", d, note=note)
+    conn.commit()
+
+
 def completed_nights(conn):
     """All recorded nights, shaped for the bandit engine."""
     rows = conn.execute(

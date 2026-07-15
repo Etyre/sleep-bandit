@@ -116,6 +116,7 @@ def state_payload(conn):
             "hrv": n["hrv"],
             "lrhr": n["lrhr"],
             "status": n["status"],
+            "note": n["note"],
             "is_today": n["date"] == d_today,
         })
         cmap = {}
@@ -259,6 +260,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/metric":
                 store.set_metric(conn, body["date"], body.get("metric", "hrv"),
                                  body.get("value"))
+                return self._send_json(state_payload(conn))
+
+            if path == "/api/note":
+                store.set_note(conn, body["date"], body.get("note", ""))
                 return self._send_json(state_payload(conn))
         finally:
             conn.close()

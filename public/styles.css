@@ -110,6 +110,20 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .hrvcell input:focus { outline: none; border-color: var(--accent-2); background: #10132a; }
 .hrvcell input::placeholder { color: #4a5170; font-weight: 400; }
 
+/* per-night notes row */
+.notecell { padding: 3px; text-align: center; background: rgba(124,156,255,.03); vertical-align: top; }
+.notecell textarea {
+  width: 100%; box-sizing: border-box; min-width: 130px; min-height: 34px;
+  font: inherit; font-size: 12px; line-height: 1.35;
+  color: var(--text); background: transparent; border: 1px solid transparent;
+  border-radius: 7px; padding: 5px 6px; resize: vertical; overflow: hidden;
+}
+.notecell textarea:hover { border-color: var(--line); }
+.notecell textarea:focus {
+  outline: none; border-color: var(--accent-2); background: #10132a; overflow: auto;
+}
+.notecell textarea::placeholder { color: #4a5170; }
+
 /* intervention cells */
 .cell { text-align: center; padding: 6px 4px; height: 46px; vertical-align: middle; }
 .cell.off { color: #454c6b; }
