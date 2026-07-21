@@ -98,6 +98,10 @@
           <label class="check-label"><input type="checkbox" name="test_skip"> Also test skipping (do none of these some nights)</label>
           <p class="field-hint">Occasionally suggests a “skip” control night, so the report can show the average effect of doing <em>any</em> of these options versus nothing — on both HRV and resting HR.</p>
         </div>
+        <label>Prior probability it helps — % (scheduling only, not counted in results)
+          <input name="prior_helps" type="number" min="1" max="80" step="1" value="50" inputmode="numeric">
+        </label>
+        <p class="field-hint">Your belief, before your own data, that this helps your HRV. <b>50% = no prior.</b> Higher makes the scheduler try it more often early — this is exactly the chance it's scheduled before any nights are logged. Capped at <b>80%</b> so it still gets enough OFF nights to actually measure. It never changes the measured efficacy numbers and fades as real nights accumulate.</p>
         <label>Note (optional)
           <input name="note" placeholder="brand, timing, etc.">
         </label>

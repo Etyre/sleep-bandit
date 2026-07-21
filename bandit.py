@@ -112,6 +112,103 @@ def _d(x):
 
 
 # ---------------------------------------------------------------------------
+# User prior: converting a PRIOR PROBABILITY that an intervention helps into the
+# prior MEAN on its "does it help" effect alpha.
+#
+# Integrating sigma^2 out of the NIG prior, alpha is marginally Student-t:
+#   alpha ~ t_nu(mean, scale),  nu = 2*a0,  scale = sqrt((b0/a0) * ON_PRIOR_VAR).
+# So P(alpha > 0) = F_nu(mean / scale); to hit a target probability p we invert:
+#   mean = scale * F_nu^{-1}(p).
+# Because the posterior with NO data is exactly this prior, an intervention with no
+# logged nights schedules at precisely the p the user typed -- then it moves with data.
+# ---------------------------------------------------------------------------
+_PRIOR_T_DOF = 2.0 * SIGMA2_PRIOR_A
+_PRIOR_T_SCALE = math.sqrt((SIGMA2_PRIOR_B / SIGMA2_PRIOR_A) * ON_PRIOR_VAR)
+
+
+def _betacf(a, b, x):
+    """Continued fraction for the incomplete beta (Lentz's method)."""
+    FPMIN, EPS = 1e-300, 3e-14
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < FPMIN:
+        d = FPMIN
+    d = 1.0 / d
+    h = d
+    for m in range(1, 300):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < FPMIN:
+            d = FPMIN
+        c = 1.0 + aa / c
+        if abs(c) < FPMIN:
+            c = FPMIN
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < EPS:
+            break
+    return h
+
+
+def _betai(a, b, x):
+    """Regularized incomplete beta I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    lbeta = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+    bt = math.exp(lbeta + a * math.log(x) + b * math.log(1.0 - x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return bt * _betacf(a, b, x) / a
+    return 1.0 - bt * _betacf(b, a, 1.0 - x) / b
+
+
+def _student_t_cdf(t, nu):
+    """P(T <= t) for a standard Student-t with nu degrees of freedom."""
+    x = nu / (nu + t * t)
+    ib = _betai(nu / 2.0, 0.5, x)          # I_x(nu/2, 1/2)
+    return 1.0 - 0.5 * ib if t >= 0.0 else 0.5 * ib
+
+
+def _student_t_ppf(p, nu):
+    """Quantile (inverse CDF) of a standard Student-t, by bisection on the monotone CDF."""
+    lo, hi = -1.0e6, 1.0e6
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if _student_t_cdf(mid, nu) < p:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def prior_mean_for_prob(p):
+    """Prior mean on alpha giving a target prior P(alpha>0)=p. Returns 0 (no prior) for
+    an unset (0), neutral (0.5), or out-of-range value; clamps away from 0/1 to stay
+    finite. p in (0.5,1) -> positive mean (believed helpful); p in (0,0.5) -> negative."""
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return 0.0
+    if p <= 0.0 or p >= 1.0 or abs(p - 0.5) < 1e-9:
+        return 0.0
+    p = min(max(p, 1e-3), 1.0 - 1e-3)
+    return _PRIOR_T_SCALE * _student_t_ppf(p, _PRIOR_T_DOF)
+
+
+# ---------------------------------------------------------------------------
 # Small linear-algebra helpers (matrices are tiny: p ~ 1 + 2*number of arms).
 # ---------------------------------------------------------------------------
 def cholesky(A):
@@ -250,7 +347,11 @@ def prior_variances(p, cols):
 # ---------------------------------------------------------------------------
 # Posterior fit (closed form) and sampling.
 # ---------------------------------------------------------------------------
-def fit(X, y, p, V0_diag):
+def fit(X, y, p, V0_diag, m0=None):
+    """Conjugate Normal-Inverse-Gamma posterior. m0 is the prior MEAN vector (default
+    zeros -> the uninformative centered-on-zero prior). A non-zero m0 shifts the
+    posterior mean toward the prior and adds the m0^T Lambda0 m0 term to bN; it does
+    NOT change the precision A (so the covariance and sampling are unaffected)."""
     n = len(X)
     A = [[0.0] * p for _ in range(p)]
     for k in range(p):
@@ -272,11 +373,18 @@ def fit(X, y, p, V0_diag):
             A[b][a] = A[a][b]
 
     L = cholesky(A)
-    mN = spd_solve(L, XtY)  # prior mean is 0
+    # posterior mean solves A mN = X^T y + Lambda0 m0  (Lambda0 = diag(1/V0))
+    if m0 is None:
+        rhs, m0Lam0m0 = XtY, 0.0
+    else:
+        lam0m0 = [m0[k] / V0_diag[k] for k in range(p)]
+        rhs = [XtY[k] + lam0m0[k] for k in range(p)]
+        m0Lam0m0 = sum(m0[k] * lam0m0[k] for k in range(p))
+    mN = spd_solve(L, rhs)
     yty = sum(yi * yi for yi in y)
-    mAm = sum(XtY[i] * mN[i] for i in range(p))
+    mAm = sum(rhs[i] * mN[i] for i in range(p))   # mN^T A mN = mN . rhs
     aN = SIGMA2_PRIOR_A + n / 2.0
-    bN = SIGMA2_PRIOR_B + 0.5 * (yty - mAm)
+    bN = SIGMA2_PRIOR_B + 0.5 * (yty + m0Lam0m0 - mAm)
     if bN < 1e-9:
         bN = 1e-9
     return {"L": L, "mN": mN, "aN": aN, "bN": bN, "p": p, "n": n}
@@ -555,8 +663,12 @@ def readouts(interventions, betas, cols, observed=None):
     return out
 
 
-def fit_model(interventions, completed_nights):
-    """Fit the posterior only (no read-out sampling) -- enough for planning."""
+def fit_model(interventions, completed_nights, priors=None):
+    """Fit the posterior only (no read-out sampling) -- enough for planning.
+
+    priors: optional {iv_id: prior_mean} giving a NON-zero prior mean on that
+    intervention's "does it help" effect (used for scheduling, so a believed-helpful
+    intervention is chosen more often early). Omit for the uninformative default."""
     history = {}
     for nt in completed_nights:
         for iid, dose in nt.get("taken", {}).items():
@@ -566,13 +678,21 @@ def fit_model(interventions, completed_nights):
     cols, p = build_columns(interventions, history)
     X, y = build_design(completed_nights, cols, p)
     V0 = prior_variances(p, cols)
-    post = fit(X, y, p, V0)
+    m0 = None
+    if priors:
+        m0 = [0.0] * p
+        for iv in interventions:
+            pm = priors.get(iv["id"])
+            if pm:
+                m0[cols[iv["id"]]["on"]] = float(pm)   # prior mean on the "on" effect
+    post = fit(X, y, p, V0, m0)
     return {"post": post, "cols": cols, "n": post["n"]}
 
 
-def analyze(interventions, completed_nights):
-    """Fit + the Monte-Carlo read-outs used by the Reports tab."""
-    m = fit_model(interventions, completed_nights)
+def analyze(interventions, completed_nights, priors=None):
+    """Fit + the Monte-Carlo read-outs used by the Reports tab. priors is passed through
+    to fit_model (used for the scheduling probability; efficacy read-outs pass none)."""
+    m = fit_model(interventions, completed_nights, priors)
     # Seed the read-out draws so the reported numbers are stable across page loads;
     # save/restore the global RNG so planning (Thompson sampling) stays random.
     state = random.getstate()

@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS nights (
     lrhr       REAL,                           -- lowest resting heart rate (lower is better)
     status     TEXT NOT NULL DEFAULT 'planned',-- 'planned' | 'completed'
     note       TEXT NOT NULL DEFAULT '',
+    excl_behavioral INTEGER NOT NULL DEFAULT 0, -- drop this night from BEHAVIORAL analysis
+    excl_supplement INTEGER NOT NULL DEFAULT 0, -- drop this night from SUPPLEMENT analysis
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS assignments (
@@ -106,9 +108,24 @@ def connect():
         # choice interventions only: also test the "skip" (null) option, giving control
         # nights so the average effect of doing ANY option vs nothing is measurable
         conn.execute("ALTER TABLE interventions ADD COLUMN test_skip INTEGER NOT NULL DEFAULT 0")
+    if "prior_helps" not in cols:
+        # optional per-intervention PRIOR PROBABILITY that the intervention helps, in
+        # [0,1]. 0 = unset and 0.5 = neutral both mean "no prior" (the default). It is
+        # used for SCHEDULING only (converted to a prior mean on the effect via
+        # bandit.prior_mean_for_prob); it never enters the efficacy numbers and washes
+        # out as real nights accumulate.
+        conn.execute("ALTER TABLE interventions ADD COLUMN prior_helps REAL NOT NULL DEFAULT 0")
     ncols = {r["name"] for r in conn.execute("PRAGMA table_info(nights)")}
     if "lrhr" not in ncols:
         conn.execute("ALTER TABLE nights ADD COLUMN lrhr REAL")
+    if "excl_behavioral" not in ncols:
+        # per-night, per-category data exclusion: when set, that night's outcome is
+        # dropped from the analysis (and planning) of interventions in that category.
+        # The assignment record itself is never touched -- exclusion is a separate,
+        # reversible, audit-logged flag.
+        conn.execute("ALTER TABLE nights ADD COLUMN excl_behavioral INTEGER NOT NULL DEFAULT 0")
+    if "excl_supplement" not in ncols:
+        conn.execute("ALTER TABLE nights ADD COLUMN excl_supplement INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 
@@ -132,6 +149,7 @@ def _iv_to_dict(row):
         "options": _read_options(row["options"]),
         "category": row["category"],
         "test_skip": bool(row["test_skip"]),
+        "prior_helps": row["prior_helps"],
     }
 
 
@@ -205,10 +223,23 @@ def _norm_category(category):
     return "behavioral" if category == "behavioral" else "supplement"
 
 
+# Prior probability that an intervention helps is capped: beyond this the scheduler
+# would keep it on so often that discovery (needing OFF nights for contrast) stalls.
+PRIOR_HELPS_MAX = 0.80
+
+
+def _clamp_prior(p):
+    """Normalize a stored prior probability to [0, PRIOR_HELPS_MAX]. 0 = unset/neutral."""
+    try:
+        return min(PRIOR_HELPS_MAX, max(0.0, float(p or 0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def create_intervention(conn, name, unit="", default_dose=1.0, unit_dose=0.0,
                         dose_levels=None, note="", kind="dose", options=None,
                         category="supplement", dose_noun="", explore_doses=True,
-                        test_skip=False):
+                        test_skip=False, prior_helps=0.0):
     kind = kind if kind in ("choice", "boolean") else "dose"
     explore_doses = bool(explore_doses)
     category = _norm_category(category)
@@ -228,11 +259,11 @@ def create_intervention(conn, name, unit="", default_dose=1.0, unit_dose=0.0,
     ts = 1 if (kind == "choice" and test_skip) else 0
     cur = conn.execute(
         "INSERT INTO interventions (name, unit, default_dose, unit_dose, dose_noun, explore_doses, "
-        "dose_levels, active, note, kind, options, category, test_skip, created_at) "
-        "VALUES (?,?,?,?,?,?,?,1,?,?,?,?,?,?)",
+        "dose_levels, active, note, kind, options, category, test_skip, prior_helps, created_at) "
+        "VALUES (?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)",
         (name.strip(), unit.strip(), float(default_dose), float(unit_dose or 0),
          (dose_noun or "").strip(), 1 if explore_doses else 0, json.dumps(dose_levels),
-         note.strip(), kind, json.dumps(options), category, ts, _now()),
+         note.strip(), kind, json.dumps(options), category, ts, _clamp_prior(prior_helps), _now()),
     )
     _audit(conn, "create_intervention", intervention_id=cur.lastrowid,
            name=name.strip(), kind=kind, category=category)
@@ -258,6 +289,8 @@ def update_intervention(conn, iid, **fields):
         setcol("active", 1 if fields["active"] else 0)
     if fields.get("category") is not None:
         setcol("category", _norm_category(fields["category"]))
+    if fields.get("prior_helps") is not None:
+        setcol("prior_helps", _clamp_prior(fields["prior_helps"]))
 
     kind = fields.get("kind", iv["kind"])
     kind = kind if kind in ("choice", "boolean") else "dose"
@@ -459,6 +492,18 @@ def set_note(conn, d, note):
     conn.commit()
 
 
+def set_exclusion(conn, d, category, excluded):
+    """Exclude (or re-include) a night's outcome from ONE category's analysis. This never
+    touches an assignment -- it's a reversible, audit-logged flag that only changes which
+    nights the engine counts for interventions in that category."""
+    category = _norm_category(category)
+    col = "excl_behavioral" if category == "behavioral" else "excl_supplement"
+    ensure_night(conn, d)
+    conn.execute(f"UPDATE nights SET {col}=? WHERE date=?", (1 if excluded else 0, d))
+    _audit(conn, "set_exclusion", d, category=category, excluded=bool(excluded))
+    conn.commit()
+
+
 def completed_nights(conn):
     """All recorded nights, shaped for the bandit engine."""
     rows = conn.execute(
@@ -481,8 +526,8 @@ def analysis_nights(conn):
     can apply the compliance rule: on-assigned counts only if the box was checked;
     off-assigned always counts as a control."""
     rows = conn.execute(
-        "SELECT date, hrv, lrhr FROM nights WHERE hrv IS NOT NULL OR lrhr IS NOT NULL "
-        "ORDER BY date").fetchall()
+        "SELECT date, hrv, lrhr, excl_behavioral, excl_supplement FROM nights "
+        "WHERE hrv IS NOT NULL OR lrhr IS NOT NULL ORDER BY date").fetchall()
     out = []
     for r in rows:
         assigns = {}
@@ -490,13 +535,16 @@ def analysis_nights(conn):
                 "SELECT intervention_id, assigned_dose, taken_dose FROM assignments "
                 "WHERE night_date=?", (r["date"],)):
             assigns[a["intervention_id"]] = {"assigned": a["assigned_dose"], "taken": a["taken_dose"]}
-        out.append({"date": r["date"], "hrv": r["hrv"], "lrhr": r["lrhr"], "assigns": assigns})
+        out.append({"date": r["date"], "hrv": r["hrv"], "lrhr": r["lrhr"],
+                    "excl_behavioral": bool(r["excl_behavioral"]),
+                    "excl_supplement": bool(r["excl_supplement"]), "assigns": assigns})
     return out
 
 
 def recent_nights(conn, limit=30):
     rows = conn.execute(
-        "SELECT date, hrv, lrhr, status, note FROM nights ORDER BY date DESC LIMIT ?",
+        "SELECT date, hrv, lrhr, status, note, excl_behavioral, excl_supplement "
+        "FROM nights ORDER BY date DESC LIMIT ?",
         (limit,)).fetchall()
     out = []
     for r in rows:

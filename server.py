@@ -42,7 +42,7 @@ def today_str():
 # ---------------------------------------------------------------------------
 # Planning (Bayesian bandit / Thompson sampling)
 # ---------------------------------------------------------------------------
-def intervention_nights(iv_id, all_nights, metric, negate=False):
+def intervention_nights(iv_id, all_nights, metric, negate=False, category=None):
     """Nights that count for this intervention on the given metric, shaped for the
     bandit ({'hrv': y, 'taken': {iv_id: dose}}).
 
@@ -50,9 +50,14 @@ def intervention_nights(iv_id, all_nights, metric, negate=False):
     only if the checkbox was ticked; an un-ticked ON night is DROPPED (not a control).
     A night it was assigned OFF is always a control (we assume you skipped it).
     Returns (nights, n_on, n_off). For LRHR pass negate=True (lower is better ->
-    negate so the engine's higher-is-better logic still applies)."""
+    negate so the engine's higher-is-better logic still applies).
+
+    category: when given ('behavioral'|'supplement'), nights the user flagged as
+    excluded for that category are dropped entirely (neither on nor off)."""
     nights, n_on, n_off = [], 0, 0
     for n in all_nights:
+        if category and n.get("excl_" + category):   # user excluded this night's data
+            continue
         val = n.get(metric)
         if val is None:
             continue
@@ -89,11 +94,16 @@ def ensure_tonight(conn):
     if missing:
         all_nights = store.analysis_nights(conn)
         for iv in missing:
-            nights, n_on, _ = intervention_nights(iv["id"], all_nights, "hrv")
+            nights, n_on, _ = intervention_nights(iv["id"], all_nights, "hrv",
+                                                  category=iv.get("category"))
             # doses actually recorded so far (with repeats) -- the points the dose-
             # response curve and the hill-climb are built from.
             seen = [n["taken"][iv["id"]] for n in nights if n["taken"].get(iv["id"], 0) > 0]
-            model = bandit.fit_model([iv], nights)
+            # Scheduling uses the intervention's prior (if any): a believed-helpful
+            # intervention is more likely to be assigned ON while data is thin. The
+            # stored prior is a PROBABILITY; convert it to a prior mean on the effect.
+            pm = bandit.prior_mean_for_prob(iv.get("prior_helps") or 0)
+            model = bandit.fit_model([iv], nights, priors=({iv["id"]: pm} if pm else None))
             plan = bandit.plan_night(model["post"], model["cols"], [iv],
                                      n_on={iv["id"]: n_on}, measured={iv["id"]: seen})
             store.set_assignment(conn, d, iv["id"], plan.get(iv["id"], 0.0))
@@ -117,6 +127,8 @@ def state_payload(conn):
             "lrhr": n["lrhr"],
             "status": n["status"],
             "note": n["note"],
+            "excl_behavioral": bool(n["excl_behavioral"]),
+            "excl_supplement": bool(n["excl_supplement"]),
             "is_today": n["date"] == d_today,
         })
         cmap = {}
@@ -135,7 +147,8 @@ def state_payload(conn):
 def _readout(iv, all_nights, metric, negate):
     """Fit this one intervention on its compliant nights for one metric and return
     its read-out (with on/off night counts). Empty dict if it has no valid nights."""
-    nights, n_on, n_off = intervention_nights(iv["id"], all_nights, metric, negate)
+    nights, n_on, n_off = intervention_nights(iv["id"], all_nights, metric, negate,
+                                              category=iv.get("category"))
     r = bandit.analyze([iv], nights)["readouts"].get(iv["id"], {}) if nights else {}
     r = dict(r)
     r["n_on"], r["n_off"] = n_on, n_off
@@ -146,9 +159,27 @@ def _readout(iv, all_nights, metric, negate):
     return r
 
 
+def _p_scheduled(iv, all_nights):
+    """Probability tonight's planner assigns this intervention ON. The on/off draw takes
+    it iff a sampled 'does it help' effect > 0, so this is P(alpha > 0) under the
+    PRIOR-INCLUSIVE posterior on the HRV nights (scheduling uses the prior). With no
+    prior it equals the measured P(helps); with a prior it starts higher and asymptotes
+    to the measured value as nights accumulate. A choice with no 'skip' arm is always
+    scheduled. Kept SEPARATE from the efficacy read-outs, which stay prior-free."""
+    if iv.get("kind") == "choice" and not iv.get("test_skip"):
+        return 1.0
+    nights, _, _ = intervention_nights(iv["id"], all_nights, "hrv", category=iv.get("category"))
+    pm = bandit.prior_mean_for_prob(iv.get("prior_helps") or 0)
+    res = bandit.analyze([iv], nights, priors=({iv["id"]: pm} if pm else None))
+    return res["readouts"].get(iv["id"], {}).get("p_helps")
+
+
 def reports_payload(conn):
     """Per-intervention efficacy read-outs for BOTH metrics (HRV: higher better;
-    LRHR: lower better). Each intervention is fit on its own compliant nights."""
+    LRHR: lower better). Each intervention is fit on its own compliant nights.
+
+    Efficacy read-outs are PRIOR-FREE (purely measured). Separately, p_scheduled is the
+    prior-INCLUSIVE probability the planner schedules the intervention tonight."""
     ivs = store.list_interventions(conn)
     all_nights = store.analysis_nights(conn)
     n_hrv = sum(1 for n in all_nights if n["hrv"] is not None)
@@ -158,6 +189,7 @@ def reports_payload(conn):
             **iv,
             "readout": _readout(iv, all_nights, "hrv", negate=False),
             "readout_lrhr": _readout(iv, all_nights, "lrhr", negate=True),
+            "p_scheduled": _p_scheduled(iv, all_nights),
         })
     return {"n_completed": n_hrv, "interventions": out}
 
@@ -248,6 +280,7 @@ class Handler(BaseHTTPRequestHandler):
                     dose_noun=body.get("dose_noun", ""),
                     explore_doses=body.get("explore_doses", True),
                     test_skip=body.get("test_skip", False),
+                    prior_helps=body.get("prior_helps", 0) or 0,
                 )
                 ensure_tonight(conn)
                 return self._send_json(state_payload(conn), 201)
@@ -265,6 +298,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/note":
                 store.set_note(conn, body["date"], body.get("note", ""))
                 return self._send_json(state_payload(conn))
+
+            if path == "/api/exclude":
+                store.set_exclusion(conn, body["date"], body.get("category", ""),
+                                    bool(body.get("excluded")))
+                return self._send_json(state_payload(conn))
         finally:
             conn.close()
         self.send_error(404)
@@ -278,7 +316,8 @@ class Handler(BaseHTTPRequestHandler):
                 iid = int(path.rsplit("/", 1)[-1])
                 fields = {k: body[k] for k in
                           ("name", "unit", "default_dose", "unit_dose", "dose_noun", "note",
-                           "active", "kind", "options", "category", "explore_doses", "test_skip")
+                           "active", "kind", "options", "category", "explore_doses", "test_skip",
+                           "prior_helps")
                           if k in body}
                 if "dose_levels" in body:
                     fields["dose_levels"] = _clean_levels(body["dose_levels"])

@@ -96,6 +96,26 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 }
 .group-row .group-fill { background: #10132a; }
 
+/* per-night, per-category exclude toggle (sits in the category header row) */
+.group-row .group-fill.exclcell { text-align: center; padding: 4px 3px; }
+.excl-btn {
+  font: inherit; font-size: 10px; font-weight: 600; letter-spacing: .02em;
+  color: var(--muted); background: transparent; border: 1px solid var(--line);
+  border-radius: 6px; padding: 2px 9px; cursor: pointer; opacity: .5; transition: all .12s;
+}
+.excl-btn:hover { opacity: 1; border-color: var(--muted); color: var(--text); }
+.excl-btn.on {
+  opacity: 1; color: var(--bad); border-color: var(--bad); background: rgba(255,110,110,.12);
+}
+/* a cell whose night is excluded for its category: dimmed, struck through */
+.cell.excluded { opacity: .32; }
+.cell.active.excluded .dose { text-decoration: line-through; }
+
+/* reports: scheduling-probability line (distinct from the prior-free efficacy numbers) */
+.iv-sched { font-size: 12.5px; color: var(--muted); margin: 2px 0 8px; }
+.iv-sched b { color: var(--accent); font-weight: 700; }
+.iv-sched.muted b { color: var(--muted); }
+
 /* outcome metric rows (HRV, resting HR) */
 .outcomes-row th.group-lab { color: var(--warn); }
 .metric-row .rowlab { color: var(--accent-2); }

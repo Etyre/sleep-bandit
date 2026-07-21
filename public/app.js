@@ -22,6 +22,12 @@ let STATE = null;
 const CATEGORY_ORDER = ["supplement", "behavioral"];
 const CATEGORY_LABEL = { supplement: "Supplements", behavioral: "Behavioral" };
 
+// "prior belief it helps" is stored as a PROBABILITY in [0,1] (0 or 0.5 = neutral / no
+// prior). It's used for scheduling only, never in the efficacy numbers. The UI edits it
+// as a whole-number percent.
+const priorPct = (frac) => Math.round((Number(frac) || 0) * 100);
+const hasPrior = (frac) => { const p = Number(frac) || 0; return p > 0 && Math.abs(p - 0.5) > 1e-9; };
+
 // outcome metrics shown as rows under the interventions (HRV is the target)
 const METRICS = [
   { key: "hrv", label: "HRV", hint: "higher is better" },
@@ -129,8 +135,20 @@ function renderGrid() {
   for (const [cat, listRaw] of groupByCategory(interventions)) {
     const list = listRaw.slice().sort((a, b) =>
       a.active === b.active ? a.name.localeCompare(b.name) : (a.active ? -1 : 1));
-    body += `<tr class="group-row"><th class="rowlab group-lab">${CATEGORY_LABEL[cat]}</th>` +
-      `<td class="group-fill" colspan="${nights.length}"></td></tr>`;
+    // category header row: each night gets a toggle to exclude that night's data for
+    // this category (its outcome stops counting toward these interventions' results).
+    const exKey = cat === "behavioral" ? "excl_behavioral" : "excl_supplement";
+    const catWord = CATEGORY_LABEL[cat].toLowerCase();
+    body += `<tr class="group-row"><th class="rowlab group-lab">${CATEGORY_LABEL[cat]}</th>`;
+    for (const n of nights) {
+      const ex = !!n[exKey];
+      body += `<td class="group-fill exclcell${n.is_today ? " col-today" : ""}">` +
+        `<button class="excl-btn${ex ? " on" : ""}" data-date="${n.date}" data-cat="${cat}" ` +
+        `title="${ex ? `${catWord} data excluded from this night's results — click to include`
+                     : `Exclude this night's ${catWord} data from results`}">` +
+        `${ex ? "excluded" : "exclude"}</button></td>`;
+    }
+    body += `</tr>`;
     for (const iv of list) {
       const meta = ivMeta(iv) + (iv.active ? "" : " · paused");
       body += `<tr class="${iv.active ? "" : "paused"}" data-iv-id="${iv.id}">` +
@@ -138,13 +156,14 @@ function renderGrid() {
       for (const n of nights) {
         const c = (cells[n.date] || {})[iv.id];
         const todayCls = n.is_today ? " col-today" : "";
-        if (!c) { body += `<td class="cell na${todayCls}"></td>`; continue; }
+        const exCls = n[exKey] ? " excluded" : "";   // dim: this night doesn't count here
+        if (!c) { body += `<td class="cell na${todayCls}${exCls}"></td>`; continue; }
         const label = cellLabel(iv, c.assigned_dose);
         if (label != null) {
-          body += `<td class="cell active${c.done ? " done" : ""}${todayCls}" data-date="${n.date}" data-iv="${iv.id}">` +
+          body += `<td class="cell active${c.done ? " done" : ""}${todayCls}${exCls}" data-date="${n.date}" data-iv="${iv.id}">` +
             `<span class="dose">${label}</span><span class="check">✓</span></td>`;
         } else {
-          body += `<td class="cell off${todayCls}">–</td>`;
+          body += `<td class="cell off${todayCls}${exCls}">–</td>`;
         }
       }
       body += `</tr>`;
@@ -181,10 +200,27 @@ function renderGrid() {
   $$(".cell.active", table).forEach((td) => td.addEventListener("click", () => toggleCell(td)));
   $$(".hrvcell input", table).forEach((inp) => inp.addEventListener("change", () => saveMetric(inp)));
   $$(".notecell textarea", table).forEach((t) => t.addEventListener("change", () => saveNote(t)));
+  $$(".excl-btn", table).forEach((b) => b.addEventListener("click", () => toggleExclusion(b)));
 
-  // Tonight is the right-most column, so start scrolled all the way over to it.
+  // Tonight is the right-most column, so start scrolled all the way over to it --
+  // but only on a fresh load; a re-render (e.g. after a toggle) keeps your place.
   const wrap = table.closest(".grid-wrap");
-  if (wrap) wrap.scrollLeft = wrap.scrollWidth;
+  if (wrap) wrap.scrollLeft = GRID_SCROLL == null ? wrap.scrollWidth : GRID_SCROLL;
+}
+
+let GRID_SCROLL = null;  // remembered horizontal scroll, so re-renders don't jump to Tonight
+
+async function toggleExclusion(btn) {
+  const date = btn.dataset.date, cat = btn.dataset.cat;
+  const excluded = !btn.classList.contains("on");
+  const wrap = $(".grid-wrap");
+  GRID_SCROLL = wrap ? wrap.scrollLeft : null;   // stay where we are across the re-render
+  try {
+    STATE = await post("/api/exclude", { date, category: cat, excluded });
+    renderGrid();
+  } catch (e) {
+    alert("Could not update exclusion: " + e.message);
+  }
 }
 
 async function toggleCell(td) {
@@ -295,6 +331,18 @@ function reportCard(iv) {
     : iv.kind === "boolean" ? "yes / no"
     : `standard ${doseAmount(iv, iv.default_dose)}`));
   card.appendChild(top);
+
+  // Scheduling probability: how often the planner will put this on. Includes the prior
+  // (unlike the efficacy numbers below) and converges to the measured chance over time.
+  if (!iv.active) {
+    card.appendChild(el("p", "iv-sched muted", "🗓 Paused — not currently scheduled."));
+  } else if (iv.p_scheduled != null) {
+    card.appendChild(el("p", "iv-sched",
+      `🗓 <b>Scheduling tonight: ${pct(iv.p_scheduled)}</b>` +
+      (hasPrior(iv.prior_helps)
+        ? ` — takes into account your prior (${priorPct(iv.prior_helps)}% it helps), which fades as nights accumulate.`
+        : " — the chance a night puts this on.")));
+  }
 
   const lObs = (iv.readout_lrhr?.n_on || 0) + (iv.readout_lrhr?.n_off || 0);
 
@@ -672,6 +720,7 @@ function openModal(iv) {
   f.dose_noun.value = iv ? (iv.dose_noun || "") : "";
   f.explore_doses.checked = iv ? iv.explore_doses !== false : true;
   f.test_skip.checked = iv ? !!iv.test_skip : false;
+  f.prior_helps.value = String(iv && iv.prior_helps ? priorPct(iv.prior_helps) : 50);
   f.note.value = iv ? iv.note : "";
   modalOptions = iv && iv.kind === "choice" ? (iv.options || []).map((o) => ({ id: o.id, label: o.label })) : [];
   $("#new-option").value = "";
@@ -709,7 +758,9 @@ $("#iv-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target;
   const kind = ["choice", "boolean"].includes(f.kind.value) ? f.kind.value : "dose";
-  const payload = { name: f.name.value.trim(), kind, category: f.category.value, note: f.note.value.trim() };
+  const prPct = Math.min(80, Math.max(1, parseFloat(f.prior_helps.value) || 50));  // capped at 80%
+  const payload = { name: f.name.value.trim(), kind, category: f.category.value, note: f.note.value.trim(),
+                    prior_helps: prPct / 100 };
   if (kind === "choice") {
     payload.options = modalOptions;
     payload.test_skip = f.test_skip.checked;
