@@ -14,6 +14,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 const signed = (x) => (x >= 0 ? "+" : "") + Number(x).toFixed(1);
 const pct = (p) => Math.round(p * 100) + "%";
 const numLabel = (d) => (Number.isInteger(d) ? d : +d.toFixed(3));
+const avg1 = (x) => Number(x).toFixed(1);   // raw metric averages, one decimal
 const shortDate = (iso) => { const [y, m, d] = iso.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric" }); };
 const weekday = (iso) => { const [y, m, d] = iso.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "short" }); };
 
@@ -26,7 +27,6 @@ const CATEGORY_LABEL = { supplement: "Supplements", behavioral: "Behavioral" };
 // prior). It's used for scheduling only, never in the efficacy numbers. The UI edits it
 // as a whole-number percent.
 const priorPct = (frac) => Math.round((Number(frac) || 0) * 100);
-const hasPrior = (frac) => { const p = Number(frac) || 0; return p > 0 && Math.abs(p - 0.5) > 1e-9; };
 
 // outcome metrics shown as rows under the interventions (HRV is the target)
 const METRICS = [
@@ -179,9 +179,18 @@ function renderGrid() {
     body += `<tr class="metric-row"><th class="rowlab metric-lab">${m.label}` +
       `<span class="rmeta">${m.hint}</span></th>`;
     for (const n of nights) {
-      body += `<td class="hrvcell${n.is_today ? " col-today" : ""}">` +
+      // source marker: hand-entered values get a small pencil (Oura-synced is the
+      // norm, so the exception is what's flagged); tooltips say it either way
+      const manual = n[m.key] != null && n[m.key + "_src"] !== "oura";
+      const title = n[m.key] == null ? "" :
+        ` title="${manual ? "entered by hand" : "synced from Oura"}"`;
+      // Oura values are measured to one decimal, so a trailing .0 is significant --
+      // show it. Hand-typed values display exactly as typed.
+      const val = n[m.key] == null ? "" :
+        (manual ? n[m.key] : Number(n[m.key]).toFixed(1));
+      body += `<td class="hrvcell${n.is_today ? " col-today" : ""}${manual ? " manual" : ""}">` +
         `<input type="number" step="any" min="0" data-date="${n.date}" data-metric="${m.key}" ` +
-        `value="${n[m.key] == null ? "" : n[m.key]}" placeholder="—"></td>`;
+        `value="${val}" placeholder="—"${title}></td>`;
     }
     body += `</tr>`;
   }
@@ -244,7 +253,11 @@ async function saveMetric(inp) {
   const night = STATE.nights.find((n) => n.date === inp.dataset.date);
   try {
     await post("/api/metric", { date: inp.dataset.date, metric, value: num });
-    if (night) night[metric] = num;
+    if (night) { night[metric] = num; night[metric + "_src"] = num == null ? null : "manual"; }
+    // reflect the source marker without a full re-render (which would drop focus)
+    const td = inp.closest("td");
+    td.classList.toggle("manual", num != null);
+    inp.title = num == null ? "" : "entered by hand";
   } catch (e) {
     alert("Could not save: " + e.message);
   }
@@ -337,11 +350,7 @@ function reportCard(iv) {
   if (!iv.active) {
     card.appendChild(el("p", "iv-sched muted", "🗓 Paused — not currently scheduled."));
   } else if (iv.p_scheduled != null) {
-    card.appendChild(el("p", "iv-sched",
-      `🗓 <b>Scheduling tonight: ${pct(iv.p_scheduled)}</b>` +
-      (hasPrior(iv.prior_helps)
-        ? ` — takes into account your prior (${priorPct(iv.prior_helps)}% it helps), which fades as nights accumulate.`
-        : " — the chance a night puts this on.")));
+    card.appendChild(el("p", "iv-sched", `🗓 <b>Scheduling tomorrow night: ${pct(iv.p_scheduled)}</b>`));
   }
 
   const lObs = (iv.readout_lrhr?.n_on || 0) + (iv.readout_lrhr?.n_off || 0);
@@ -387,17 +396,21 @@ function reportCard(iv) {
       card.appendChild(body);
     } else if (isChoice) {
       // Plain multiple-choice (no skip option): horse-race table of the options.
+      // Always on, so there's no baseline to measure an effect against — show each
+      // option's raw average HRV and resting HR instead.
       const doses = (r.doses || []).slice().sort((a, b) => b.p_best - a.p_best);
+      const lrByOpt = new Map((iv.readout_lrhr?.doses || []).map((d) => [Math.round(d.dose), d]));
       const best = optLabel(iv, r.recommended_dose);
       card.appendChild(el("p", "iv-meta",
-        (best ? `📈 Best for HRV: <b>${esc(best)}</b> — effects relative to your average night. ` : "📈 ") +
+        (best ? `📈 Best for HRV: <b>${esc(best)}</b> — each option's average across its nights. ` : "📈 ") +
         `Based on ${dataNote}`));
       if (doses.length) {
         const table = el("table", "dose-table");
-        table.innerHTML = "<tr><th>Option</th><th>HRV effect</th><th>P(best)</th><th></th></tr>";
+        table.innerHTML = "<tr><th>Option</th><th>Avg HRV</th><th>Avg resting HR</th><th>P(best)</th><th></th></tr>";
         for (const d of doses) {
           const rec = Math.round(d.dose) === Math.round(r.recommended_dose) && r.recommended_dose > 0;
-          table.appendChild(doseRow(d, esc(optLabel(iv, d.dose) || "(removed)"), rec, false));
+          table.appendChild(choiceRow(d, lrByOpt.get(Math.round(d.dose)),
+            esc(optLabel(iv, d.dose) || "(removed)"), rec));
         }
         card.appendChild(table);
       }
@@ -442,6 +455,9 @@ function hrvMetric(r, dataNote) {
   b.appendChild(el("div", "metric-sub",
     `<span class="ci">[${signed(r.on_ci_low)}, ${signed(r.on_ci_high)}]</span> on average · ` +
     `<b>${pct(r.p_helps)}</b> chance of a real benefit${sizable}`));
+  if (r.on_mean != null && r.off_mean != null)
+    b.appendChild(el("div", "metric-avgs",
+      `Avg HRV <b>${avg1(r.on_mean)}</b> on nights · <b>${avg1(r.off_mean)}</b> off`));
   b.appendChild(el("div", "metric-note", `Based on ${dataNote}`));
   return b;
 }
@@ -466,6 +482,9 @@ function rhrMetric(iv) {
   b.appendChild(el("div", "metric-sub",
     `<span class="ci">[${signed(-rl.on_ci_high)}, ${signed(-rl.on_ci_low)}]</span> on average · ` +
     `<b>${pct(rl.p_helps)}</b> chance it lowers`));
+  if (rl.on_mean != null && rl.off_mean != null)
+    b.appendChild(el("div", "metric-avgs",
+      `Avg resting HR <b>${avg1(rl.on_mean)}</b> on nights · <b>${avg1(rl.off_mean)}</b> off`));
   return b;
 }
 
@@ -487,10 +506,29 @@ function appendLrhr(card, iv) {
   const effBpm = -rl.on_effect;
   const cls = effBpm <= 0 ? "pos" : "neg";  // lower resting HR is good -> green
   const label = isChoice ? "Resting HR — any option vs skipping" : "Resting HR";
+  const avgs = (rl.on_mean != null && rl.off_mean != null)
+    ? ` Avg <b>${avg1(rl.on_mean)}</b> on / <b>${avg1(rl.off_mean)}</b> off bpm.` : "";
   card.appendChild(el("p", "iv-meta",
     `🫀 <b>${label}</b>: <span class="effect ${cls}">${signed(effBpm)}</span> bpm ` +
     `<span class="ci">[${signed(-rl.on_ci_high)}, ${signed(-rl.on_ci_low)}]</span> on average ` +
-    `(lower is better) — <b>${pct(rl.p_helps)}</b> chance it lowers your resting HR.`));
+    `(lower is better) — <b>${pct(rl.p_helps)}</b> chance it lowers your resting HR.` + avgs));
+}
+
+// Row for an always-on choice: raw per-option averages (HRV, resting HR in bpm)
+// plus the chance it's the best option. `lr` is the matching readout_lrhr dose row.
+function choiceRow(d, lr, label, rec) {
+  const tr = el("tr", rec ? "rec" : "");
+  tr.appendChild(el("td", null, label + (rec ? ' <span class="rec-tag">◀ recommended</span>' : "")));
+  const nNote = (n) => ` <span class="ci">(${n} night${n === 1 ? "" : "s"})</span>`;
+  tr.appendChild(el("td", null, d.raw_mean != null
+    ? `<b>${avg1(d.raw_mean)}</b>${nNote(d.n_nights)}` : '<span class="ci">—</span>'));
+  tr.appendChild(el("td", null, lr && lr.raw_mean != null
+    ? `<b>${avg1(lr.raw_mean)}</b> bpm${nNote(lr.n_nights)}` : '<span class="ci">—</span>'));
+  const barTd = el("td");
+  const bar = el("div", "bar"); const span = el("span"); span.style.width = Math.round(d.p_best * 100) + "%";
+  bar.appendChild(span); barTd.appendChild(bar); tr.appendChild(barTd);
+  tr.appendChild(el("td", "pbest", pct(d.p_best)));
+  return tr;
 }
 
 function doseRow(d, label, rec, isOff) {
@@ -791,6 +829,118 @@ $("#grid").addEventListener("click", (e) => {
   if (iv) openModal(iv);
 });
 
+// =====================================================================
+// OURA SYNC
+// =====================================================================
+let OURA = null;   // last /api/oura/status payload
+
+function ouraResultText(r) {
+  if (!r) return "";
+  if (r.error) return ` — <span class="oura-err">${esc(r.error)}</span>`;
+  const parts = [];
+  if (r.filled) parts.push(`${r.filled} filled`);
+  if (r.updated) parts.push(`${r.updated} updated`);
+  return " — " + (parts.length ? parts.join(", ") : "everything already up to date");
+}
+
+function renderOuraUI() {
+  const btn = $("#oura-btn");
+  btn.innerHTML = OURA && OURA.connected ? "💍 Oura ✓" : "💍 Oura";
+  const st = $("#oura-status");
+  if (!OURA) { st.textContent = "Loading…"; return; }
+  if (OURA.connected) {
+    st.innerHTML = `<b class="oura-ok">Connected.</b> Last sync: ` +
+      (OURA.last_sync ? esc(OURA.last_sync.replace("T", " ")) : "never") +
+      ouraResultText(OURA.last_result);
+  } else if (OURA.configured) {
+    st.innerHTML = "Credentials saved — <b>not connected yet.</b> Click “Save &amp; connect” to authorize.";
+  } else {
+    st.innerHTML = "Not set up yet. Follow the steps below.";
+  }
+  $("#oura-disconnect").hidden = !OURA.connected;
+  $("#oura-sync-now").hidden = !OURA.connected;
+  // once connected the primary button is redundant -- it comes back (as a reconnect)
+  // only if the credential fields are edited
+  $("#oura-save").hidden = OURA.connected;
+  $("#oura-save").textContent = OURA.connected ? "Save & reconnect" : "Save & connect";
+  const f = $("#oura-form");
+  if (document.activeElement !== f.client_id) f.client_id.value = OURA.client_id || "";
+  f.client_secret.placeholder = OURA.configured ? "(unchanged — leave blank to keep)" : "";
+}
+
+async function refreshOuraStatus() {
+  try { OURA = await api("/api/oura/status"); } catch { OURA = null; }
+  renderOuraUI();
+}
+
+// Quiet background sync on page load: only when connected; re-render the grid if
+// anything was filled in or upgraded to Oura's precision.
+async function ouraAutoSync() {
+  await refreshOuraStatus();
+  if (!OURA || !OURA.connected) return;
+  try {
+    const r = await post("/api/oura/sync", {});
+    OURA.last_result = r;
+    renderOuraUI();
+    if (r.filled || r.updated) await loadGrid();
+  } catch (e) { console.warn("Oura sync failed:", e.message); }
+}
+
+function openOuraModal() { renderOuraUI(); $("#oura-backdrop").hidden = false; refreshOuraStatus(); }
+function closeOuraModal() { $("#oura-backdrop").hidden = true; }
+
+for (const field of ["client_id", "client_secret"])
+  $("#oura-form")[field].addEventListener("input", () => { $("#oura-save").hidden = false; });
+
+$("#oura-btn").addEventListener("click", openOuraModal);
+$("#oura-close").addEventListener("click", closeOuraModal);
+$("#oura-cancel").addEventListener("click", closeOuraModal);
+$("#oura-backdrop").addEventListener("click", (e) => { if (e.target === $("#oura-backdrop")) closeOuraModal(); });
+
+$("#oura-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    OURA = await post("/api/oura/config", {
+      client_id: f.client_id.value.trim(),
+      client_secret: f.client_secret.value,   // blank = keep stored secret
+    });
+    if (!OURA.configured) { renderOuraUI(); return; }
+    window.location.href = "/oura/connect";   // hand off to Oura's authorize page
+  } catch (err) { alert("Error: " + err.message); }
+});
+
+$("#oura-sync-now").addEventListener("click", async () => {
+  const btn = $("#oura-sync-now");
+  btn.disabled = true; btn.textContent = "Syncing…";
+  try {
+    const r = await post("/api/oura/sync", { force: true });
+    OURA.last_result = r;
+    await refreshOuraStatus();
+    if (r.filled || r.updated) await loadGrid();
+  } catch (e) { alert("Sync failed: " + e.message); }
+  btn.disabled = false; btn.textContent = "Sync now";
+});
+
+$("#oura-disconnect").addEventListener("click", async () => {
+  if (!confirm("Disconnect Oura?\n\nYour recorded nights are kept; the app just stops syncing.")) return;
+  OURA = await post("/api/oura/disconnect", {});
+  renderOuraUI();
+});
+
+// Returning from Oura's authorize page: /#oura=connected | denied | error
+function handleOuraReturn() {
+  const m = location.hash.match(/^#oura=(\w+)/);
+  if (!m) return;
+  history.replaceState(null, "", "/#grid");
+  if (m[1] === "connected") openOuraModal();   // ouraAutoSync() follows in the init chain
+  else alert(m[1] === "denied" ? "Oura connection was declined." : "Oura connection failed — try connecting again.");
+}
+
 loadGrid()
-  .then(() => switchView(location.hash.replace("#", "") || "grid"))
+  .then(() => {
+    handleOuraReturn();
+    switchView(location.hash.replace("#", "") || "grid");
+    ouraAutoSync();
+  })
   .catch((e) => { document.body.innerHTML = `<pre style="padding:40px;color:#ff7a7a">Failed to load: ${e.message}</pre>`; });

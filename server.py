@@ -13,11 +13,13 @@ is a plain coin flip per the current design.
 
 import json
 import os
+import secrets
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import bandit
+import oura
 import store
 
 HOST = "127.0.0.1"
@@ -125,6 +127,8 @@ def state_payload(conn):
             "date": n["date"],
             "hrv": n["hrv"],
             "lrhr": n["lrhr"],
+            "hrv_src": n["hrv_src"],
+            "lrhr_src": n["lrhr_src"],
             "status": n["status"],
             "note": n["note"],
             "excl_behavioral": bool(n["excl_behavioral"]),
@@ -156,6 +160,25 @@ def _readout(iv, all_nights, metric, negate):
     # among doses you've never compared, so the UI gates the recommendation on this.
     r["n_doses_seen"] = len({round(n["taken"][iv["id"]], 6)
                              for n in nights if n["taken"].get(iv["id"], 0) > 0})
+    # Raw (non-modeled) average of the metric on ON- vs OFF-nights, in native units.
+    # intervention_nights stores the value as +val (HRV) or -val (LRHR, negated for the
+    # engine), so undo the negation here to report the real HRV / resting-HR numbers.
+    iid = iv["id"]
+    on_vals = [(-n["hrv"] if negate else n["hrv"]) for n in nights if n["taken"].get(iid, 0) > 0]
+    off_vals = [(-n["hrv"] if negate else n["hrv"]) for n in nights if n["taken"].get(iid, 0) == 0]
+    r["on_mean"] = (sum(on_vals) / len(on_vals)) if on_vals else None
+    r["off_mean"] = (sum(off_vals) / len(off_vals)) if off_vals else None
+    # Same raw averages per dose/option (an always-on choice has no off baseline,
+    # so its report shows these instead of a modeled effect).
+    by_dose = {}
+    for n in nights:
+        dose = n["taken"].get(iid, 0)
+        if dose > 0:
+            by_dose.setdefault(round(dose, 6), []).append(-n["hrv"] if negate else n["hrv"])
+    for row in r.get("doses", []):
+        vals = by_dose.get(round(row["dose"], 6), [])
+        row["raw_mean"] = (sum(vals) / len(vals)) if vals else None
+        row["n_nights"] = len(vals)
     return r
 
 
@@ -233,6 +256,12 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    def _redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         path = urlparse(self.path).path
         statics = {
@@ -256,6 +285,31 @@ class Handler(BaseHTTPRequestHandler):
                     "interventions": store.list_interventions(conn),
                     "nights": store.recent_nights(conn, 100000),
                 })
+            if path == "/api/oura/status":
+                return self._send_json(oura.status(conn))
+            if path == "/oura/connect":
+                # start the OAuth dance: remember a CSRF state, hand off to Oura
+                client_id = store.get_setting(conn, "oura_client_id")
+                if not client_id:
+                    return self._send_json({"error": "Save your Oura client ID and secret first."}, 400)
+                state = secrets.token_urlsafe(16)
+                store.set_setting(conn, "oura_state", state)
+                return self._redirect(oura.authorize_url(client_id, state, PORT))
+            if path == "/oura/callback":
+                q = parse_qs(urlparse(self.path).query)
+                want = store.get_setting(conn, "oura_state")
+                store.set_setting(conn, "oura_state", None)
+                if q.get("error"):
+                    return self._redirect("/#oura=denied")
+                if not want or q.get("state", [None])[0] != want or not q.get("code"):
+                    return self._redirect("/#oura=error")
+                try:
+                    oura.exchange_code(conn, q["code"][0], PORT)
+                except oura.OuraError:
+                    return self._redirect("/#oura=error")
+                store._audit(conn, "oura_connect")
+                conn.commit()
+                return self._redirect("/#oura=connected")
         finally:
             conn.close()
         self.send_error(404)
@@ -303,6 +357,25 @@ class Handler(BaseHTTPRequestHandler):
                 store.set_exclusion(conn, body["date"], body.get("category", ""),
                                     bool(body.get("excluded")))
                 return self._send_json(state_payload(conn))
+
+            if path == "/api/oura/config":
+                store.set_setting(conn, "oura_client_id", (body.get("client_id") or "").strip() or None)
+                secret = (body.get("client_secret") or "").strip()
+                if secret:   # blank means "keep the stored secret"
+                    store.set_setting(conn, "oura_client_secret", secret)
+                return self._send_json(oura.status(conn))
+
+            if path == "/api/oura/sync":
+                return self._send_json(oura.sync(conn, today_str(),
+                                                 force=bool(body.get("force"))))
+
+            if path == "/api/oura/disconnect":
+                for k in ("oura_access_token", "oura_refresh_token", "oura_expires_at",
+                          "oura_state"):
+                    store.set_setting(conn, k, None)
+                store._audit(conn, "oura_disconnect")
+                conn.commit()
+                return self._send_json(oura.status(conn))
         finally:
             conn.close()
         self.send_error(404)

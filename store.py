@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS assignments (
     taken_dose      REAL,                      -- what you actually did; NULL until recorded
     PRIMARY KEY (night_date, intervention_id)
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts              TEXT NOT NULL,             -- EXACT local wall-clock time of the write (ms)
@@ -126,6 +130,18 @@ def connect():
         conn.execute("ALTER TABLE nights ADD COLUMN excl_behavioral INTEGER NOT NULL DEFAULT 0")
     if "excl_supplement" not in ncols:
         conn.execute("ALTER TABLE nights ADD COLUMN excl_supplement INTEGER NOT NULL DEFAULT 0")
+    if "hrv_src" not in ncols:
+        # where each metric's current value came from: 'manual' (typed in) or 'oura'
+        # (synced). NULL on legacy rows means manual.
+        conn.execute("ALTER TABLE nights ADD COLUMN hrv_src TEXT")
+        conn.execute("ALTER TABLE nights ADD COLUMN lrhr_src TEXT")
+    if "lrhr_30s" not in ncols:
+        # Oura reports lowest sleeping HR two ways: from 5-minute aggregate samples
+        # (what its app displays -- the basis of every hand-typed lrhr here) and from
+        # raw 30-second samples (the API's lowest_heart_rate field, usually a beat or
+        # two lower). lrhr stays on the 5-minute basis so the series is consistent;
+        # the 30-second reading is kept alongside for the record/export.
+        conn.execute("ALTER TABLE nights ADD COLUMN lrhr_30s REAL")
     conn.commit()
     return conn
 
@@ -413,6 +429,23 @@ def force_assignment(conn, d, iid, assigned_dose, taken_dose=None):
     conn.commit()
 
 
+def delete_assignment(conn, d, iid):
+    """Remove ONE intervention's cell from a night entirely -- as if it was never part of
+    the experiment that night, so the night stops counting as on OR off for it. A
+    deliberate, audit-logged correction; it leaves every other cell untouched. Returns
+    True if a row was removed."""
+    row = conn.execute(
+        "SELECT assigned_dose, taken_dose FROM assignments WHERE night_date=? AND intervention_id=?",
+        (d, iid)).fetchone()
+    if not row:
+        return False
+    conn.execute("DELETE FROM assignments WHERE night_date=? AND intervention_id=?", (d, iid))
+    _audit(conn, "delete_assignment", d, iid,
+           removed={"assigned_dose": row["assigned_dose"], "taken_dose": row["taken_dose"]})
+    conn.commit()
+    return True
+
+
 def clear_assignments(conn, d):
     """DANGER: deletes a night's plan outright, discarding the frozen record. Not used
     anywhere in the app's normal flow -- kept only for tooling. Never call this on a
@@ -471,13 +504,71 @@ def set_metric(conn, d, metric, value):
     ensure_night(conn, d)
     cleared = value is None or value == ""
     if cleared:
-        conn.execute(f"UPDATE nights SET {metric}=NULL WHERE date=?", (d,))
+        conn.execute(f"UPDATE nights SET {metric}=NULL, {metric}_src=NULL WHERE date=?", (d,))
     else:
-        conn.execute(f"UPDATE nights SET {metric}=? WHERE date=?", (float(value), d))
+        conn.execute(f"UPDATE nights SET {metric}=?, {metric}_src='manual' WHERE date=?",
+                     (float(value), d))
     # keep 'completed' tied to having the primary metric (HRV)
     conn.execute("UPDATE nights SET status=CASE WHEN hrv IS NOT NULL THEN 'completed' "
                  "ELSE 'planned' END WHERE date=?", (d,))
     _audit(conn, "set_metric", d, metric=metric, value=(None if cleared else float(value)))
+    conn.commit()
+
+
+def set_metric_from_oura(conn, d, metric, value):
+    """Write an Oura-sourced outcome metric. Oura's numbers are the measurement of
+    record (finer-grained than what its app displays, and than what was typed in by
+    hand), so an existing value IS replaced when it differs -- the audit log keeps the
+    old value. Returns 'filled' (was blank), 'updated' (replaced a different value),
+    or None (nothing to do / already identical)."""
+    if metric not in METRICS + ("lrhr_30s",) or value is None:
+        return None
+    value = float(value)
+    ensure_night(conn, d)
+    row = conn.execute(f"SELECT {metric} FROM nights WHERE date=?", (d,)).fetchone()
+    old = row[metric] if row else None
+    if old is not None and abs(old - value) < 0.05:   # same number at display precision
+        # value stands, but Oura has confirmed it -- tag the source (no audit needed,
+        # nothing measurable changed) so the UI doesn't flag it as hand-entered
+        if metric in METRICS:
+            cur = conn.execute(f"UPDATE nights SET {metric}_src='oura' "
+                               f"WHERE date=? AND {metric}_src IS NOT 'oura'", (d,))
+            if cur.rowcount:
+                conn.commit()
+        return None
+    if metric in METRICS:   # hrv/lrhr carry a source tag; lrhr_30s is oura-only anyway
+        conn.execute(f"UPDATE nights SET {metric}=?, {metric}_src='oura' WHERE date=?", (value, d))
+    else:
+        conn.execute(f"UPDATE nights SET {metric}=? WHERE date=?", (value, d))
+    conn.execute("UPDATE nights SET status=CASE WHEN hrv IS NOT NULL THEN 'completed' "
+                 "ELSE 'planned' END WHERE date=?", (d,))
+    _audit(conn, "oura_fill", d, metric=metric, value=value, replaced=old)
+    conn.commit()
+    return "filled" if old is None else "updated"
+
+
+def nights_for_oura_sync(conn, since, before):
+    """Past nights (since <= date < before) a sync should look at -- every night in the
+    window, because Oura data also upgrades hand-typed values to full precision."""
+    return [dict(r) for r in conn.execute(
+        "SELECT date, hrv, lrhr, lrhr_30s FROM nights WHERE date >= ? AND date < ? "
+        "ORDER BY date", (since, before))]
+
+
+# ---------------------------------------------------------------------------
+# Settings (small key/value pairs: Oura credentials + tokens, sync bookkeeping)
+# ---------------------------------------------------------------------------
+def get_setting(conn, key, default=None):
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn, key, value):
+    if value is None:
+        conn.execute("DELETE FROM settings WHERE key=?", (key,))
+    else:
+        conn.execute("INSERT INTO settings (key, value) VALUES (?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
     conn.commit()
 
 
@@ -543,8 +634,8 @@ def analysis_nights(conn):
 
 def recent_nights(conn, limit=30):
     rows = conn.execute(
-        "SELECT date, hrv, lrhr, status, note, excl_behavioral, excl_supplement "
-        "FROM nights ORDER BY date DESC LIMIT ?",
+        "SELECT date, hrv, lrhr, lrhr_30s, hrv_src, lrhr_src, status, note, "
+        "excl_behavioral, excl_supplement FROM nights ORDER BY date DESC LIMIT ?",
         (limit,)).fetchall()
     out = []
     for r in rows:

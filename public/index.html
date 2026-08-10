@@ -27,6 +27,7 @@
       <div class="toolbar">
         <button class="primary" id="add-btn">+ Add intervention</button>
         <span class="spacer"></span>
+        <button class="ghost" id="oura-btn">💍 Oura</button>
         <a class="ghost" href="/api/export" target="_blank">Export</a>
       </div>
       <div class="grid-wrap">
@@ -111,6 +112,33 @@
           <span class="spacer"></span>
           <button type="button" class="ghost" id="iv-cancel">Cancel</button>
           <button type="submit" class="primary">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Oura sync modal -->
+  <div class="modal-backdrop" id="oura-backdrop" hidden>
+    <div class="modal card">
+      <div class="card-head">
+        <h2>💍 Oura sync</h2>
+        <button class="ghost" id="oura-close">✕</button>
+      </div>
+      <p id="oura-status" class="oura-status">Loading…</p>
+      <form id="oura-form">
+        <label>Client ID
+          <input name="client_id" autocomplete="off" spellcheck="false">
+        </label>
+        <label>Client secret
+          <input name="client_secret" type="password" autocomplete="off">
+        </label>
+        <p class="field-hint">One-time setup: sign in at <b>cloud.ouraring.com</b> → Developer → OAuth&nbsp;applications and register a private app with redirect URI <code>http://localhost:8777/oura/callback</code>. Paste its Client ID and Client Secret here, then connect. After that, opening Sleep Bandit auto-fills each morning's <b>HRV</b> (averaged from Oura's raw 5-minute samples, one decimal more precise than the Oura app shows) and <b>lowest resting heart rate</b> (min of the same 5-minute samples the Oura app displays; the API's 30-second-based low is stored alongside and appears in the export). Oura's number replaces a hand-typed one when they differ; every change is kept in the audit log.</p>
+        <div class="modal-actions">
+          <button type="button" class="danger" id="oura-disconnect" hidden>Disconnect</button>
+          <span class="spacer"></span>
+          <button type="button" class="ghost" id="oura-sync-now" hidden>Sync now</button>
+          <button type="button" class="ghost" id="oura-cancel">Close</button>
+          <button type="submit" class="primary" id="oura-save">Save &amp; connect</button>
         </div>
       </form>
     </div>
