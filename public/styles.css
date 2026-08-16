@@ -210,8 +210,19 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .chart-cap { color: var(--muted); font-size: 11.5px; margin: 0 2px 2px; }
 .chart-cap .mk-dot { color: var(--good); font-weight: 700; }
 .chart-cap .mk-ci { color: var(--muted); font-weight: 700; }
+.chart-cap .mk-avg { color: var(--accent); font-weight: 700; }
+.chart-cap .mk-band { color: var(--accent-2); opacity: .5; }
+.chart-cap .mk-night { color: var(--muted); }
+.eff-line { margin-top: 10px; }
+.chart-head { display: flex; align-items: center; gap: 10px; }
+.chart-head .chart-cap { margin-bottom: 0; }
+.range-toggle { margin-left: auto; display: inline-flex; gap: 4px; }
+.range-toggle button { font: inherit; font-size: 11.5px; padding: 3px 10px; border-radius: 20px; border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; }
+.range-toggle button.on { background: var(--panel-2); color: var(--text); border-color: var(--accent); }
 .dose-chart { margin: 2px 0 2px; }
 .dose-chart svg { overflow: visible; }
+.hrv-chart { position: relative; }
+.hrv-tip { position: absolute; top: 10px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 11.5px; line-height: 1.5; color: var(--text); pointer-events: none; white-space: nowrap; box-shadow: 0 4px 14px rgba(0, 0, 0, .35); z-index: 3; }
 
 /* dose card: big does-it-work numbers (left) beside the dose graph (right) */
 .iv-2col { display: flex; gap: 24px; align-items: flex-start; margin-top: 12px; }

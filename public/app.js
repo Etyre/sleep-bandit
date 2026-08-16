@@ -32,6 +32,7 @@ const priorPct = (frac) => Math.round((Number(frac) || 0) * 100);
 const METRICS = [
   { key: "hrv", label: "HRV", hint: "higher is better" },
   { key: "lrhr", label: "Resting HR", hint: "lower is better · bpm" },
+  { key: "eff", label: "Sleep efficiency", hint: "higher is better · %" },
 ];
 
 // need a real contrast before we show any recommendation: at least this many
@@ -312,6 +313,7 @@ async function loadReports() {
   box.appendChild(el("p", "rep-stat", data.n_completed === 0
     ? "No nights logged yet — reports fill in as you enter your HRV on the Tracker."
     : `Based on <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}. “Effect” is the change in HRV from taking the intervention, in your HRV units. Anything reliably positive is worth keeping — even a small effect.`));
+  if (data.hrv_trend) box.appendChild(hrvTrendCard(data.hrv_trend));
   if (!data.interventions.length) {
     box.appendChild(el("p", "empty", "No interventions yet."));
     return;
@@ -442,7 +444,34 @@ function reportCard(iv) {
   }
 
   if (!lrhrHandled) appendLrhr(card, iv);
+  appendEff(card, iv);
   return card;
+}
+
+// Sleep-efficiency line (percent of time in bed spent asleep; effect is in
+// percentage points, higher is better). Compact like the resting-HR line -- HRV
+// stays the headline metric.
+function appendEff(card, iv) {
+  const re = iv.readout_eff || {};
+  const isChoice = iv.kind === "choice";
+  // For a choice, the effect is "any option vs skipping" -- needs a skip baseline.
+  if (isChoice && !iv.test_skip) return;
+  const nOn = re.n_on || 0, nOff = re.n_off || 0;
+  if (nOn + nOff === 0) return;
+  const ready = isChoice ? (nOn >= MIN_ON && nOff >= MIN_OFF) : enough(nOn, nOff, false);
+  if (!ready || re.on_effect == null) {
+    card.appendChild(el("p", "iv-meta eff-line",
+      `😴 <b>Sleep efficiency</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off.`));
+    return;
+  }
+  const cls = re.on_effect >= 0 ? "pos" : "neg";
+  const label = isChoice ? "Sleep efficiency — any option vs skipping" : "Sleep efficiency";
+  const avgs = (re.on_mean != null && re.off_mean != null)
+    ? ` Avg <b>${avg1(re.on_mean)}%</b> on / <b>${avg1(re.off_mean)}%</b> off.` : "";
+  card.appendChild(el("p", "iv-meta eff-line",
+    `😴 <b>${label}</b>: <span class="effect ${cls}">${signed(re.on_effect)}</span> pp ` +
+    `<span class="ci">[${signed(re.on_ci_low)}, ${signed(re.on_ci_high)}]</span> on average ` +
+    `(higher is better) — <b>${pct(re.p_helps)}</b> chance it improves your sleep efficiency.` + avgs));
 }
 
 // Big "does HRV improve?" hero number for a dose intervention (left column).
@@ -666,6 +695,189 @@ function optionChart(iv, rows, r) {
   const svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img" ` +
     `aria-label="Per-option HRV change vs skipping for ${esc(iv.name)}">${parts.join("")}</svg>`;
   return el("div", "dose-chart", svg);
+}
+
+// =====================================================================
+// HRV READINESS CARD (training guidance, separate from the interventions)
+// =====================================================================
+// Server computes everything in ln(RMSSD) space and exponentiates back to ms:
+// avg7 is the 7-day rolling mean, lo/hi the rolling 60-day mu +/- 0.5*sigma band
+// (Hopkins' smallest-worthwhile-change convention). avg7 at/above lo -> intervals;
+// below -> zone 2 training only.
+function hrvTrendCard(t) {
+  const card = el("div", "iv hrv-card");
+  const top = el("div", "iv-top");
+  top.appendChild(el("span", "iv-name", "🫀 HRV readiness"));
+  const L = t.latest;
+  if (L) {
+    const ok = L.status === "intervals";
+    top.appendChild(el("span", "verdict " + (ok ? "v-help" : "v-no"),
+      ok ? "🏃 intervals OK" : "🚶 zone 2"));
+    top.appendChild(el("span", "iv-meta",
+      `7-day avg <b>${avg1(L.avg7)}</b> ms · ${t.window_days}-day avg <b>${avg1(L.mid)}</b> ms · ` +
+      `lower bound <b>${avg1(L.lo)}</b> ms · as of ${shortDate(L.date)}'s night`));
+  } else {
+    top.appendChild(el("span", "verdict v-new", "🌱 gathering data"));
+    top.appendChild(el("span", "iv-meta",
+      `${t.n_nights}/${t.min_nights} nights toward a baseline band`));
+  }
+  card.appendChild(top);
+
+  // legend on the left, range toggle (recent window vs everything since the app's
+  // first night) on the right, sharing one row above the chart
+  const range = el("span", "range-toggle");
+  const btnRecent = el("button", "on", `${t.default_days} days`);
+  const btnAll = el("button", "", "all");
+  range.appendChild(btnRecent); range.appendChild(btnAll);
+  const head = el("div", "chart-head");
+  head.appendChild(el("p", "chart-cap",
+    '<span class="mk-avg">━</span> 7-day avg · <span class="mk-band">▮</span> ' +
+    `${t.window_days}-day μ ± 0.5σ band (of ln RMSSD) · <span class="mk-night">●</span> nightly`));
+  head.appendChild(range);
+  card.appendChild(head);
+  const chartBox = el("div");
+  const draw = (all) => {
+    btnRecent.classList.toggle("on", !all);
+    btnAll.classList.toggle("on", all);
+    chartBox.innerHTML = "";
+    chartBox.appendChild(hrvTrendChart(all ? t.days : t.days.slice(-t.default_days),
+      t.window_days, t.app_start));
+  };
+  btnRecent.onclick = () => draw(false);
+  btnAll.onclick = () => draw(true);
+  draw(false);
+  card.appendChild(chartBox);
+  card.appendChild(el("p", "iv-meta",
+    "Nightly HRV wobbles a lot and the wobble is lopsided; the log makes it symmetric, and the " +
+    "band means “within half a typical wobble of your average.” 7-day average at or above the " +
+    "band's lower edge → intervals; below → zone 2 training. The band refits over a rolling " +
+    `${t.window_days}-day window so it tracks fitness changes.`));
+  return card;
+}
+
+function hrvTrendChart(days, windowDays, appStart) {
+  const N = days.length;
+  const W = 1100, H = 210;
+  const mL = 40, mR = 46, mT = 10, mB = 24;
+  const pL = mL, pR = W - mR, pT = mT, pB = H - mB, pH = pB - pT, pW = pR - pL;
+
+  let lo = Infinity, hi = -Infinity;
+  for (const d of days) for (const v of [d.hrv, d.avg7, d.lo, d.hi])
+    if (v != null) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  if (!isFinite(lo)) return el("div", "dose-chart", "");
+  if (hi - lo < 1) { hi += 1; lo -= 1; }
+  const pad = (hi - lo) * 0.1; hi += pad; lo -= pad;
+  const px = (i) => N === 1 ? (pL + pR) / 2 : pL + (i / (N - 1)) * pW;
+  const py = (v) => pT + (hi - v) / (hi - lo) * pH;
+
+  // contiguous runs of days where a field is defined -> [[startIdx, endIdx], ...]
+  const runs = (key) => {
+    const out = []; let s = null;
+    days.forEach((d, i) => {
+      if (d[key] != null) { if (s === null) s = i; }
+      else if (s !== null) { out.push([s, i - 1]); s = null; }
+    });
+    if (s !== null) out.push([s, N - 1]);
+    return out;
+  };
+
+  const parts = [];
+  // y axis: a line down the left edge, with extent labels matching the other charts
+  parts.push(`<line x1="${pL}" y1="${pT}" x2="${pL}" y2="${pB}" stroke-width="1.5" style="stroke:var(--line)"/>`);
+  parts.push(`<text x="${pL - 6}" y="${pT + 4}" text-anchor="end" font-size="10" style="fill:var(--muted)">${Math.round(hi)}</text>`);
+  parts.push(`<text x="${pL - 6}" y="${pB}" text-anchor="end" font-size="10" style="fill:var(--muted)">${Math.round(lo)}</text>`);
+
+  // the mu +/- 0.5*sigma band: filled region, solid lower edge (the decision line),
+  // faint dashed center
+  for (const [a, b] of runs("lo")) {
+    const seg = days.slice(a, b + 1);
+    const fwd = seg.map((d, j) => `${px(a + j)},${py(d.hi)}`).join(" ");
+    const back = seg.map((d, j) => `${px(a + j)},${py(d.lo)}`).reverse().join(" ");
+    parts.push(`<polygon points="${fwd} ${back}" style="fill:var(--accent-2);opacity:.14"/>`);
+    parts.push(`<polyline points="${seg.map((d, j) => `${px(a + j)},${py(d.lo)}`).join(" ")}" fill="none" stroke-width="2" style="stroke:var(--accent-2)"/>`);
+    parts.push(`<polyline points="${seg.map((d, j) => `${px(a + j)},${py(d.mid)}`).join(" ")}" fill="none" stroke-width="1" stroke-dasharray="3 4" style="stroke:var(--accent-2);opacity:.5"/>`);
+  }
+
+  // nightly HRV dots (the raw data, deliberately quiet)
+  days.forEach((d, i) => {
+    if (d.hrv == null) return;
+    parts.push(`<circle cx="${px(i)}" cy="${py(d.hrv)}" r="2.5" style="fill:var(--muted);opacity:.55">` +
+      `<title>${shortDate(d.date)}: ${avg1(d.hrv)} ms</title></circle>`);
+  });
+
+  // the 7-day rolling average -- the readiness signal itself
+  for (const [a, b] of runs("avg7")) {
+    const seg = days.slice(a, b + 1);
+    parts.push(`<polyline points="${seg.map((d, j) => `${px(a + j)},${py(d.avg7)}`).join(" ")}" fill="none" stroke-width="2.5" stroke-linejoin="round" style="stroke:var(--accent)"/>`);
+  }
+
+  // latest-value labels on the right edge, nudged apart if they'd collide
+  const last = (key) => { for (let i = N - 1; i >= 0; i--) if (days[i][key] != null) return i; return -1; };
+  const iA = last("avg7"), iL = last("lo");
+  let yA = iA >= 0 ? py(days[iA].avg7) : null, yL = iL >= 0 ? py(days[iL].lo) : null;
+  if (yA != null && yL != null && Math.abs(yA - yL) < 11) {
+    const mid = (yA + yL) / 2, s = yA <= yL ? 1 : -1;
+    yA = mid - s * 5.5; yL = mid + s * 5.5;
+  }
+  if (yA != null) parts.push(`<text x="${px(iA) + 7}" y="${yA + 3.5}" font-size="11" font-weight="600" style="fill:var(--accent)">${avg1(days[iA].avg7)}</text>`);
+  if (yL != null) parts.push(`<text x="${px(iL) + 7}" y="${yL + 3.5}" font-size="11" font-weight="600" style="fill:var(--accent-2)">${avg1(days[iL].lo)}</text>`);
+
+  // marker at the night the app (and its interventions) came into use -- HRV to the
+  // left of this line is pure Oura history, untouched by any experiment
+  const iS = appStart ? days.findIndex((d) => d.date === appStart) : -1;
+  if (iS >= 0) {
+    const x = px(iS);
+    parts.push(`<line x1="${x}" y1="${pT}" x2="${x}" y2="${pB}" stroke-width="1.25" ` +
+      `stroke-dasharray="4 4" style="stroke:var(--warn);opacity:.55"/>`);
+    const flip = iS > N * 0.8;
+    parts.push(`<text x="${x + (flip ? -5 : 5)}" y="${pT + 8}" text-anchor="${flip ? "end" : "start"}" ` +
+      `font-size="9.3" style="fill:var(--warn);opacity:.78">app start</text>`);
+  }
+
+  // date ticks anchored on the newest day, in whole weeks, aiming for ~9 labels
+  const tickStep = Math.max(7, Math.ceil(N / 10 / 7) * 7);
+  for (let i = N - 1; i >= 0; i -= tickStep) {
+    parts.push(`<text x="${px(i)}" y="${pB + 15}" text-anchor="middle" font-size="10" style="fill:var(--muted)">${shortDate(days[i].date)}</text>`);
+  }
+
+  const svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img" ` +
+    `aria-label="7-day average HRV against the rolling baseline band">${parts.join("")}</svg>`;
+  const wrap = el("div", "dose-chart hrv-chart", svg);
+
+  // Hover: a vertical cursor line snapped to the nearest day, with that day's
+  // three header numbers (7-day avg, window avg, lower bound) in a floating box.
+  const svgEl = wrap.querySelector("svg");
+  const cursor = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  cursor.setAttribute("y1", pT); cursor.setAttribute("y2", pB);
+  cursor.setAttribute("stroke-width", "1"); cursor.setAttribute("stroke-dasharray", "2 3");
+  cursor.setAttribute("style", "stroke:var(--muted);opacity:.8");
+  cursor.setAttribute("visibility", "hidden");
+  svgEl.appendChild(cursor);
+  const tip = el("div", "hrv-tip");
+  tip.hidden = true;
+  wrap.appendChild(tip);
+  const fmt = (v) => (v == null ? "—" : avg1(v) + " ms");
+  svgEl.addEventListener("mousemove", (e) => {
+    const rect = svgEl.getBoundingClientRect();
+    const sx = (e.clientX - rect.left) * (W / rect.width);   // viewBox coords
+    const i = Math.max(0, Math.min(N - 1, Math.round((sx - pL) / pW * (N - 1))));
+    const d = days[i], x = px(i);
+    cursor.setAttribute("x1", x); cursor.setAttribute("x2", x);
+    cursor.setAttribute("visibility", "visible");
+    tip.innerHTML = `<b>${shortDate(d.date)}</b><br>7-day avg ${fmt(d.avg7)}` +
+      `<br>${windowDays || 60}-day avg ${fmt(d.mid)}<br>lower bound ${fmt(d.lo)}`;
+    tip.hidden = false;
+    // keep the box beside the cursor, flipping sides near the right edge
+    const left = x / W * rect.width;
+    const flip = left > rect.width * 0.62;
+    tip.style.left = flip ? "auto" : (left + 12) + "px";
+    tip.style.right = flip ? (rect.width - left + 12) + "px" : "auto";
+  });
+  svgEl.addEventListener("mouseleave", () => {
+    cursor.setAttribute("visibility", "hidden");
+    tip.hidden = true;
+  });
+  return wrap;
 }
 
 // =====================================================================

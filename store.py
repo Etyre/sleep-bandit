@@ -135,6 +135,11 @@ def connect():
         # (synced). NULL on legacy rows means manual.
         conn.execute("ALTER TABLE nights ADD COLUMN hrv_src TEXT")
         conn.execute("ALTER TABLE nights ADD COLUMN lrhr_src TEXT")
+    if "eff" not in ncols:
+        # sleep efficiency (percent asleep of time in bed, higher is better) --
+        # Oura's `efficiency` field, whole percent; tracked as a third outcome metric
+        conn.execute("ALTER TABLE nights ADD COLUMN eff REAL")
+        conn.execute("ALTER TABLE nights ADD COLUMN eff_src TEXT")
     if "lrhr_30s" not in ncols:
         # Oura reports lowest sleeping HR two ways: from 5-minute aggregate samples
         # (what its app displays -- the basis of every hand-typed lrhr here) and from
@@ -494,7 +499,7 @@ def set_taken(conn, d, iid, done):
     conn.commit()
 
 
-METRICS = ("hrv", "lrhr")  # hrv: higher is better; lrhr: lower is better
+METRICS = ("hrv", "lrhr", "eff")  # hrv/eff: higher is better; lrhr: lower is better
 
 
 def set_metric(conn, d, metric, value):
@@ -612,13 +617,26 @@ def completed_nights(conn):
     return out
 
 
+def hrv_series(conn):
+    """Every night with a recorded HRV as (date, hrv), oldest first."""
+    return [(r["date"], r["hrv"]) for r in conn.execute(
+        "SELECT date, hrv FROM nights WHERE hrv IS NOT NULL ORDER BY date")]
+
+
+def first_assigned_night(conn):
+    """Date of the earliest planned night -- i.e. when the app started being used.
+    Nights before this exist only as backfilled Oura history (no assignments)."""
+    row = conn.execute("SELECT MIN(night_date) AS d FROM assignments").fetchone()
+    return row["d"] if row else None
+
+
 def analysis_nights(conn):
     """Every recorded night with per-intervention (assigned, taken) so the engine
     can apply the compliance rule: on-assigned counts only if the box was checked;
     off-assigned always counts as a control."""
     rows = conn.execute(
-        "SELECT date, hrv, lrhr, excl_behavioral, excl_supplement FROM nights "
-        "WHERE hrv IS NOT NULL OR lrhr IS NOT NULL ORDER BY date").fetchall()
+        "SELECT date, hrv, lrhr, eff, excl_behavioral, excl_supplement FROM nights "
+        "WHERE hrv IS NOT NULL OR lrhr IS NOT NULL OR eff IS NOT NULL ORDER BY date").fetchall()
     out = []
     for r in rows:
         assigns = {}
@@ -626,7 +644,7 @@ def analysis_nights(conn):
                 "SELECT intervention_id, assigned_dose, taken_dose FROM assignments "
                 "WHERE night_date=?", (r["date"],)):
             assigns[a["intervention_id"]] = {"assigned": a["assigned_dose"], "taken": a["taken_dose"]}
-        out.append({"date": r["date"], "hrv": r["hrv"], "lrhr": r["lrhr"],
+        out.append({"date": r["date"], "hrv": r["hrv"], "lrhr": r["lrhr"], "eff": r["eff"],
                     "excl_behavioral": bool(r["excl_behavioral"]),
                     "excl_supplement": bool(r["excl_supplement"]), "assigns": assigns})
     return out
@@ -634,7 +652,7 @@ def analysis_nights(conn):
 
 def recent_nights(conn, limit=30):
     rows = conn.execute(
-        "SELECT date, hrv, lrhr, lrhr_30s, hrv_src, lrhr_src, status, note, "
+        "SELECT date, hrv, lrhr, lrhr_30s, eff, hrv_src, lrhr_src, eff_src, status, note, "
         "excl_behavioral, excl_supplement FROM nights ORDER BY date DESC LIMIT ?",
         (limit,)).fetchall()
     out = []

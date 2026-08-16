@@ -532,11 +532,18 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
             plan[iv["id"]] = 1.0
             continue
 
-        # Stage 2: it's on -- choose the dose. Stay on the STANDARD dose most nights while
-        # data is thin; the chance of deviating ramps with the warm-up (quadratic for
-        # supplements -> <1-in-10 for the first ~20 on-nights, faster for time-based).
-        # This gate covers BOTH exploiting a non-standard dose AND probing.
+        # Stage 2: it's on -- choose the dose. With dose exploration switched off the
+        # intervention only ever uses its standard dose -- no probing, no hill-climb
+        # (some doses aren't merely un-explored but physically unavailable, e.g. an AC
+        # that can't be set below its minimum temperature).
         std = _d(iv.get("default_dose") or 0)
+        if not iv.get("explore_doses", True):
+            plan[iv["id"]] = std
+            continue
+        # Otherwise stay on the STANDARD dose most nights while data is thin; the
+        # chance of deviating ramps with the warm-up (quadratic for supplements ->
+        # <1-in-10 for the first ~20 on-nights, faster for time-based). This gate
+        # covers BOTH exploiting a non-standard dose AND probing.
         step = _dose_step(iv)
         timed = _time_based(iv)
         warm = min(1.0, n_on.get(iv["id"], 0) / WARMUP_ON_NIGHTS)

@@ -1,5 +1,6 @@
 """
-oura.py -- pull each morning's HRV and lowest resting heart rate from the Oura API.
+oura.py -- pull each morning's HRV, lowest resting heart rate, and sleep efficiency
+from the Oura API.
 
 Oura's v2 API is OAuth2-only (personal access tokens were retired in Dec 2025), so
 one-time setup is: register a private OAuth app at https://cloud.ouraring.com
@@ -224,12 +225,35 @@ def sync(conn, current_night, force=False):
                 continue
             for metric, value in (("hrv", _hrv_value(doc)),
                                   ("lrhr", _lrhr_5min(doc)),
-                                  ("lrhr_30s", doc.get("lowest_heart_rate"))):
+                                  ("lrhr_30s", doc.get("lowest_heart_rate")),
+                                  ("eff", doc.get("efficiency"))):
                 wrote = store.set_metric_from_oura(conn, night["date"], metric, value)
                 if wrote:
                     result[wrote] += 1
     store.set_setting(conn, "oura_last_sync", datetime.now().isoformat(timespec="seconds"))
     store.set_setting(conn, "oura_last_result", json.dumps(result))
+    return result
+
+
+def backfill(conn, first_night, last_night):
+    """One-shot historical import: pull Oura's main-sleep HRV / resting HR for every
+    night in [first_night, last_night] (YYYY-MM-DD, evening-keyed) and write it in,
+    creating night rows as needed. Unlike sync() there's no throttle and no lookback
+    window -- this exists to seed history (e.g. so the HRV-readiness baseline band is
+    defined from the start of the chart). Idempotent: already-matching nights no-op."""
+    oura_start = (date.fromisoformat(first_night) + timedelta(days=1)).isoformat()
+    oura_end = (date.fromisoformat(last_night) + timedelta(days=2)).isoformat()  # exclusive
+    by_day = _main_sleep_by_day(fetch_sleep(conn, oura_start, oura_end))
+    result = {"nights_found": len(by_day), "filled": 0, "updated": 0}
+    for day, doc in sorted(by_day.items()):
+        night = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+        for metric, value in (("hrv", _hrv_value(doc)),
+                              ("lrhr", _lrhr_5min(doc)),
+                              ("lrhr_30s", doc.get("lowest_heart_rate")),
+                              ("eff", doc.get("efficiency"))):
+            wrote = store.set_metric_from_oura(conn, night, metric, value)
+            if wrote:
+                result[wrote] += 1
     return result
 
 

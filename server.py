@@ -12,9 +12,11 @@ is a plain coin flip per the current design.
 """
 
 import json
+import math
 import os
 import secrets
-from datetime import datetime, timedelta
+import statistics
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -127,8 +129,10 @@ def state_payload(conn):
             "date": n["date"],
             "hrv": n["hrv"],
             "lrhr": n["lrhr"],
+            "eff": n["eff"],
             "hrv_src": n["hrv_src"],
             "lrhr_src": n["lrhr_src"],
+            "eff_src": n["eff_src"],
             "status": n["status"],
             "note": n["note"],
             "excl_behavioral": bool(n["excl_behavioral"]),
@@ -197,6 +201,65 @@ def _p_scheduled(iv, all_nights):
     return res["readouts"].get(iv["id"], {}).get("p_helps")
 
 
+# ---------------------------------------------------------------------------
+# HRV readiness trend (training guidance, separate from the bandit)
+# ---------------------------------------------------------------------------
+# Nightly RMSSD is log-transformed (x = ln HRV) because its night-to-night wobble
+# is right-skewed; in log space it's roughly symmetric. The training band is
+# mu +/- 0.5*sigma of x over a rolling window -- the 0.5 is Hopkins' "smallest
+# worthwhile change" convention (what the trials used, not derivable). Decision
+# rule: 7-day rolling mean of x at/above the lower bound -> intervals; below ->
+# Z2 or rest. All numbers are exponentiated back to ms before leaving the server.
+HRV_BAND_COEF = 0.5        # Hopkins' SWC coefficient on the log-SD
+HRV_BASELINE_DAYS = 60     # band is refit over this rolling window (tracks fitness)
+HRV_BASELINE_MIN = 28      # ~4 weeks of nights before the band is shown at all
+HRV_AVG_DAYS = 7           # the readiness signal: rolling mean of ln(HRV)
+HRV_AVG_MIN = 3            # nights required inside the 7-day window
+HRV_DEFAULT_DAYS = 60      # the card opens on this many days; a toggle shows it all
+HRV_HISTORY_START = "2025-01-01"   # where the "all" view begins; nights backfilled
+                                   # from before this only feed the rolling windows
+
+
+def hrv_trend_payload(conn):
+    """Per-day series for the readiness card: nightly HRV, 7-day rolling mean, and
+    the rolling mu +/- 0.5*sigma band, all in ms. None until any HRV exists."""
+    x_by_date = {d: math.log(v) for d, v in store.hrv_series(conn) if v and v > 0}
+    if not x_by_date:
+        return None
+    hrv_by_date = {d: round(math.exp(x), 1) for d, x in x_by_date.items()}
+    end = date.fromisoformat(max(x_by_date))
+    start = max(date.fromisoformat(HRV_HISTORY_START), date.fromisoformat(min(x_by_date)))
+
+    def window(day, n_days):
+        """ln-HRV values recorded in the n_days ending on (and including) day."""
+        return [x_by_date[k] for j in range(n_days)
+                if (k := (day - timedelta(days=j)).isoformat()) in x_by_date]
+
+    days, latest = [], None
+    for i in range((end - start).days + 1):
+        day = start + timedelta(days=i)
+        iso = day.isoformat()
+        row = {"date": iso, "hrv": hrv_by_date.get(iso),
+               "avg7": None, "lo": None, "mid": None, "hi": None}
+        w7 = window(day, HRV_AVG_DAYS)
+        if len(w7) >= HRV_AVG_MIN:
+            row["avg7"] = round(math.exp(statistics.mean(w7)), 1)
+        base = window(day, HRV_BASELINE_DAYS)
+        if len(base) >= HRV_BASELINE_MIN:
+            mu, sd = statistics.mean(base), statistics.stdev(base)
+            row["lo"] = round(math.exp(mu - HRV_BAND_COEF * sd), 1)
+            row["mid"] = round(math.exp(mu), 1)
+            row["hi"] = round(math.exp(mu + HRV_BAND_COEF * sd), 1)
+        if row["avg7"] is not None and row["lo"] is not None:
+            latest = {"date": iso, "avg7": row["avg7"], "mid": row["mid"], "lo": row["lo"],
+                      "status": "intervals" if row["avg7"] >= row["lo"] else "recover"}
+        days.append(row)
+    return {"days": days, "latest": latest, "n_nights": len(x_by_date),
+            "min_nights": HRV_BASELINE_MIN, "window_days": HRV_BASELINE_DAYS,
+            "avg_days": HRV_AVG_DAYS, "default_days": HRV_DEFAULT_DAYS,
+            "app_start": store.first_assigned_night(conn)}
+
+
 def reports_payload(conn):
     """Per-intervention efficacy read-outs for BOTH metrics (HRV: higher better;
     LRHR: lower better). Each intervention is fit on its own compliant nights.
@@ -212,9 +275,11 @@ def reports_payload(conn):
             **iv,
             "readout": _readout(iv, all_nights, "hrv", negate=False),
             "readout_lrhr": _readout(iv, all_nights, "lrhr", negate=True),
+            "readout_eff": _readout(iv, all_nights, "eff", negate=False),
             "p_scheduled": _p_scheduled(iv, all_nights),
         })
-    return {"n_completed": n_hrv, "interventions": out}
+    return {"n_completed": n_hrv, "interventions": out,
+            "hrv_trend": hrv_trend_payload(conn)}
 
 
 # ---------------------------------------------------------------------------
