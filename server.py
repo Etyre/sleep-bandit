@@ -136,13 +136,19 @@ def reconcile_tonight_bounds(conn, iid, before=None):
     lo, hi = bandit._bounds(iv)
     old = float(cell["assigned_dose"])
     std_changed = before is not None and float(before.get("default_dose") or 0) != float(iv.get("default_dose") or 0)
-    if bandit._in_bounds(old, lo, hi) and not std_changed:
+    if bandit.is_open(old):
+        # tonight is the open-ended arm: fine as long as that arm still exists
+        if bandit.has_open_arm(iv):
+            return None
+    elif bandit._in_bounds(old, lo, hi) and not std_changed:
         return None
     new = bandit._clamp(float(iv.get("default_dose") or old), lo, hi)
     if float(new) == old:
         return None
     store._audit(conn, "clamp_assign", d, iid, old_dose=old, new_dose=float(new),
-                 min_dose=lo, max_dose=hi, reason=("standard_changed" if std_changed else "out_of_bounds"))
+                 min_dose=lo, max_dose=hi,
+                 reason=("open_arm_removed" if bandit.is_open(old) else
+                         "standard_changed" if std_changed else "out_of_bounds"))
     store.force_assignment(conn, d, iid, new, taken_dose=cell["taken_dose"])
     return new
 
@@ -487,6 +493,8 @@ class Handler(BaseHTTPRequestHandler):
                     dose_noun=body.get("dose_noun", ""),
                     explore_doses=body.get("explore_doses", True),
                     delay_explore=body.get("delay_explore", True),
+                    open_arm=body.get("open_arm", False),
+                    open_arm_label=body.get("open_arm_label", ""),
                     test_skip=body.get("test_skip", False),
                     prior_helps=body.get("prior_helps", 0) or 0,
                     min_dose=body.get("min_dose"),
@@ -547,7 +555,7 @@ class Handler(BaseHTTPRequestHandler):
                 fields = {k: body[k] for k in
                           ("name", "unit", "default_dose", "unit_dose", "dose_noun", "note",
                            "active", "kind", "options", "category", "explore_doses", "delay_explore",
-                           "test_skip",
+                           "open_arm", "open_arm_label", "test_skip",
                            "prior_helps", "min_dose", "max_dose", "noun_amount")
                           if k in body}
                 if "dose_levels" in body:

@@ -14,6 +14,11 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&l
 const signed = (x) => (x >= 0 ? "+" : "") + Number(x).toFixed(1);
 const pct = (p) => Math.round(p * 100) + "%";
 const numLabel = (d) => (Number.isInteger(d) ? d : +d.toFixed(3));
+// Open-ended arm above the max dose ("no timer — stay on until I fall asleep"): recorded
+// as this sentinel dose (mirrors bandit.OPEN_ARM_DOSE) and shown by its label, never as a number.
+const OPEN_ARM_DOSE = 1e9;
+const isOpenDose = (d) => Number(d) >= OPEN_ARM_DOSE / 2;
+const openLabel = (iv) => (iv.open_arm_label || "").trim() || "no timer";
 const avg1 = (x) => Number(x).toFixed(1);   // raw metric averages, one decimal
 const shortDate = (iso) => { const [y, m, d] = iso.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric" }); };
 const weekday = (iso) => { const [y, m, d] = iso.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "short" }); };
@@ -69,6 +74,7 @@ function pluralize(noun, n) {
 // countable noun -- one noun = noun_amount of the unit (falls back to the unit dose) --
 // otherwise as the raw amount ("144 mg").
 function doseText(iv, amount) {
+  if (isOpenDose(amount)) return `∞ ${esc(openLabel(iv))}`;
   const u = iv.noun_amount || iv.unit_dose || 0, noun = (iv.dose_noun || "").trim();
   if (u > 0 && noun) {
     const count = amount / u;
@@ -80,6 +86,7 @@ function doseText(iv, amount) {
 // Reports page shows doses in the supplement's native unit (mg/g/mcg/minutes),
 // never as a pill count -- the Tracker keeps pills, but results read in mass.
 function doseAmount(iv, amount) {
+  if (isOpenDose(amount)) return `∞ ${esc(openLabel(iv))}`;
   return iv.unit ? `${numLabel(amount)} ${esc(iv.unit)}` : "on";
 }
 
@@ -582,7 +589,7 @@ function doseRow(d, label, rec, isOff) {
 
 // Dose axis tick + unit caption, in the native unit (mg/g/…), never pills.
 function doseTick(iv, dose) {
-  return numLabel(dose);
+  return isOpenDose(dose) ? "∞" : numLabel(dose);
 }
 function doseUnitCaption(iv) {
   return iv.unit || "";
@@ -593,7 +600,11 @@ function doseUnitCaption(iv) {
 // uncertainty matters — it's huge early). Dots are colored by sign, baseline at 0.
 function doseChart(iv, rows, r, showRec) {
   const n = rows.length;
-  const W = Math.max(230, 54 + n * 72), H = 150;
+  // the open-ended arm (always the last, highest "dose") sits a bit apart from the
+  // numeric doses: an extra gap before it says "beyond the max, not one more step"
+  const hasOpen = rows.some((d) => isOpenDose(d.dose));
+  const GAP = hasOpen ? 0.6 : 0;                 // in column widths
+  const W = Math.max(230, 54 + (n + GAP) * 72), H = 150;
   const mL = 42, mR = 16, mT = 16, mB = 30;
   const pL = mL, pR = W - mR, pT = mT, pB = H - mB, pH = pB - pT, pW = pR - pL;
 
@@ -602,7 +613,7 @@ function doseChart(iv, rows, r, showRec) {
   if (hi - lo < 1) { hi += 1; lo -= 1; }
   const pad = (hi - lo) * 0.08; hi += pad; lo -= pad;
   const py = (v) => pT + (hi - v) / (hi - lo) * pH;
-  const colW = pW / n, cx = (i) => pL + colW * (i + 0.5);
+  const colW = pW / (n + GAP), cx = (i) => pL + colW * (i + 0.5 + (isOpenDose(rows[i].dose) ? GAP : 0));
   const y0 = py(0);
   const topLbl = (hi >= 0 ? "+" : "") + Math.round(hi);
   const botLbl = (lo >= 0 ? "+" : "") + Math.round(lo);
@@ -635,7 +646,8 @@ function doseChart(iv, rows, r, showRec) {
     parts.push(`<text x="${x}" y="${pB + 15}" text-anchor="middle" font-size="10.5" style="fill:var(--muted)">${esc(String(doseTick(iv, d.dose)))}</text>`);
   });
 
-  const cap = doseUnitCaption(iv);
+  let cap = doseUnitCaption(iv);
+  if (hasOpen) cap = (cap ? cap + " · " : "") + "∞ = " + openLabel(iv);
   if (cap) parts.push(`<text x="${(pL + pR) / 2}" y="${H - 2}" text-anchor="middle" font-size="9.5" style="fill:var(--muted)">${esc(cap)}</text>`);
 
   const svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img" ` +
@@ -1115,10 +1127,19 @@ document.addEventListener("click", () => $$(".tip.open").forEach((o) => o.classL
 // the "delay exploration" option only means something when exploring is on
 function syncDelay() {
   const f = $("#iv-form");
-  f.delay_explore.disabled = !f.explore_doses.checked;
-  $("#delay-explore-label").classList.toggle("dim", !f.explore_doses.checked);
+  const exploring = f.explore_doses.checked;
+  f.delay_explore.disabled = !exploring;
+  $("#delay-explore-label").classList.toggle("dim", !exploring);
+  // the open-ended arm needs exploration AND a max dose to sit above
+  const hasMax = parseFloat(f.max_dose.value) > 0;
+  const canOpen = exploring && hasMax;
+  f.open_arm.disabled = !canOpen;
+  $("#open-arm-label").classList.toggle("dim", !canOpen);
+  $("#open-arm-name").hidden = !(canOpen && f.open_arm.checked);
 }
 $("#iv-form").explore_doses.addEventListener("change", syncDelay);
+$("#iv-form").open_arm.addEventListener("change", syncDelay);
+$("#iv-form").max_dose.addEventListener("input", syncDelay);
 
 // ---- multiple-choice options editor (each option keeps a stable id) ----
 let modalOptions = [];  // [{id: number|null, label}]
@@ -1191,6 +1212,8 @@ function openModal(iv) {
   f.max_dose.value = iv && iv.max_dose != null ? iv.max_dose : "";
   f.explore_doses.checked = iv ? iv.explore_doses !== false : true;
   f.delay_explore.checked = iv ? iv.delay_explore !== false : true;
+  f.open_arm.checked = iv ? !!iv.open_arm : false;
+  f.open_arm_label.value = iv ? (iv.open_arm_label || "") : "";
   syncDelay();
   f.test_skip.checked = iv ? !!iv.test_skip : false;
   f.prior_helps.value = String(iv && iv.prior_helps ? priorPct(iv.prior_helps) : 50);
@@ -1246,6 +1269,8 @@ $("#iv-form").addEventListener("submit", async (e) => {
     payload.noun_amount = per > 0 ? per : null;
     payload.explore_doses = f.explore_doses.checked;
     payload.delay_explore = f.delay_explore.checked;
+    payload.open_arm = f.open_arm.checked && !f.open_arm.disabled;
+    payload.open_arm_label = f.open_arm_label.value.trim();
     // optional bounds: blank -> null (no bound). Keep the standard dose inside them.
     const lo = parseFloat(f.min_dose.value), hi = parseFloat(f.max_dose.value);
     payload.min_dose = lo > 0 ? lo : null;

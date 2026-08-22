@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS interventions (
     delay_explore INTEGER NOT NULL DEFAULT 1,   -- 1 = hold the standard dose until enough on-nights to judge efficacy
     min_dose     REAL,                          -- optional floor for explored doses (NULL = none)
     max_dose     REAL,                          -- optional ceiling for explored doses (NULL = none)
+    open_arm     INTEGER NOT NULL DEFAULT 0,    -- 1 = also test an open-ended arm above the max
+    open_arm_label TEXT NOT NULL DEFAULT '',    -- how that arm reads (e.g. 'no timer')
     dose_levels  TEXT NOT NULL DEFAULT '[]',   -- JSON array of candidate ON doses
     active       INTEGER NOT NULL DEFAULT 1,
     note         TEXT NOT NULL DEFAULT '',
@@ -112,6 +114,10 @@ def connect():
     if "delay_explore" not in cols:
         # per-intervention: delay dose exploration until the warm-up has enough on-nights
         conn.execute("ALTER TABLE interventions ADD COLUMN delay_explore INTEGER NOT NULL DEFAULT 1")
+    if "open_arm" not in cols:
+        # open-ended arm above the max dose (recorded as bandit.OPEN_ARM_DOSE)
+        conn.execute("ALTER TABLE interventions ADD COLUMN open_arm INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE interventions ADD COLUMN open_arm_label TEXT NOT NULL DEFAULT ''")
     if "noun_amount" not in cols:
         # how much of `unit` one dose_noun is (e.g. 50 mg per cap); NULL falls back to unit_dose
         conn.execute("ALTER TABLE interventions ADD COLUMN noun_amount REAL")
@@ -181,6 +187,8 @@ def _iv_to_dict(row):
         "delay_explore": bool(row["delay_explore"]),
         "min_dose": row["min_dose"],
         "max_dose": row["max_dose"],
+        "open_arm": bool(row["open_arm"]),
+        "open_arm_label": row["open_arm_label"] or "",
         "dose_levels": json.loads(row["dose_levels"]),
         "active": bool(row["active"]),
         "note": row["note"],
@@ -291,13 +299,17 @@ def create_intervention(conn, name, unit="", default_dose=1.0, unit_dose=0.0,
                         dose_levels=None, note="", kind="dose", options=None,
                         category="supplement", dose_noun="", explore_doses=True,
                         test_skip=False, prior_helps=0.0, min_dose=None, max_dose=None,
-                        noun_amount=None, delay_explore=True):
+                        noun_amount=None, delay_explore=True, open_arm=False, open_arm_label=""):
     kind = kind if kind in ("choice", "boolean") else "dose"
     explore_doses = bool(explore_doses)
     delay_explore = bool(delay_explore)
     min_dose, max_dose, noun_amount = _opt_dose(min_dose), _opt_dose(max_dose), _opt_dose(noun_amount)
+    # the open-ended arm needs a max to sit above (and exploration to reach it)
+    open_arm = bool(open_arm) and max_dose is not None and explore_doses
+    open_arm_label = (open_arm_label or "").strip()
     if kind != "dose":
         min_dose = max_dose = noun_amount = None
+        open_arm = False
     category = _norm_category(category)
     if kind == "choice":
         options = _norm_choice_options(options)
@@ -315,12 +327,12 @@ def create_intervention(conn, name, unit="", default_dose=1.0, unit_dose=0.0,
     ts = 1 if (kind == "choice" and test_skip) else 0
     cur = conn.execute(
         "INSERT INTO interventions (name, unit, default_dose, unit_dose, dose_noun, explore_doses, "
-        "delay_explore, min_dose, max_dose, noun_amount, dose_levels, active, note, kind, options, "
-        "category, test_skip, prior_helps, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)",
+        "delay_explore, min_dose, max_dose, open_arm, open_arm_label, noun_amount, dose_levels, "
+        "active, note, kind, options, category, test_skip, prior_helps, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)",
         (name.strip(), unit.strip(), float(default_dose), float(unit_dose or 0),
          (dose_noun or "").strip(), 1 if explore_doses else 0, 1 if delay_explore else 0,
-         min_dose, max_dose, noun_amount,
+         min_dose, max_dose, 1 if open_arm else 0, open_arm_label, noun_amount,
          json.dumps(dose_levels), note.strip(), kind, json.dumps(options), category, ts,
          _clamp_prior(prior_helps), _now()),
     )
@@ -364,6 +376,7 @@ def update_intervention(conn, iid, **fields):
         setcol("min_dose", None)
         setcol("max_dose", None)
         setcol("noun_amount", None)
+        setcol("open_arm", 0)
         ts = fields["test_skip"] if fields.get("test_skip") is not None else iv.get("test_skip")
         setcol("test_skip", 1 if ts else 0)
     elif kind == "boolean":
@@ -376,6 +389,7 @@ def update_intervention(conn, iid, **fields):
         setcol("min_dose", None)
         setcol("max_dose", None)
         setcol("noun_amount", None)
+        setcol("open_arm", 0)
         setcol("test_skip", 0)
     else:
         setcol("test_skip", 0)
@@ -399,6 +413,11 @@ def update_intervention(conn, iid, **fields):
         hi = _opt_dose(fields["max_dose"]) if "max_dose" in fields else _opt_dose(iv.get("max_dose"))
         setcol("min_dose", lo)
         setcol("max_dose", hi)
+        # open-ended arm above the max: needs a max (and exploration) to exist
+        oa = bool(fields["open_arm"]) if fields.get("open_arm") is not None else bool(iv.get("open_arm"))
+        setcol("open_arm", 1 if (oa and hi is not None and explore) else 0)
+        if fields.get("open_arm_label") is not None:
+            setcol("open_arm_label", str(fields["open_arm_label"]).strip())
         setcol("noun_amount", _opt_dose(fields["noun_amount"]) if "noun_amount" in fields
                else _opt_dose(iv.get("noun_amount")))
         if fields.get("dose_levels") is not None:

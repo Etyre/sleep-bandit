@@ -103,6 +103,10 @@
           </div>
           <label class="check-label"><input type="checkbox" name="explore_doses" checked> Explore dosages <span class="tip" tabindex="0" data-tip="On: the app tries doses one unit-dose step up and down from the standard (never below the min or above the max) to find the smallest dose that works. Off: always exactly the standard dose."></span></label>
           <label class="check-label" id="delay-explore-label"><input type="checkbox" name="delay_explore" checked> Delay dosage experimentation <span class="tip" tabindex="0" data-tip="On (default): stick to the standard dose for the first few dozen on-nights so the app can first judge whether the intervention helps at all, and only then start varying the dose. Off: explore doses from the first night."></span></label>
+          <label class="check-label" id="open-arm-label"><input type="checkbox" name="open_arm"> Open-ended arm above the max <span class="tip" tabindex="0" data-tip="One more arm ABOVE the max dose that isn’t a number — e.g. the spiky mat with no timer, staying on it until you fall asleep. It sits one step past the max on the exploration grid, so dose exploration can climb into it and back out, and it gets a few early tries of its own. The tracker shows it by its label; reports plot it last, set apart from the numeric doses. Needs a max dose and exploring on."></span></label>
+          <label id="open-arm-name" hidden>Label for that arm <span class="tip" tabindex="0" data-tip="How the open-ended arm reads in the tracker and reports, e.g. “no timer — until I fall asleep”. Blank = “no timer”."></span>
+            <input name="open_arm_label" placeholder="no timer — stay on until I fall asleep">
+          </label>
         </div>
         <div id="choice-fields" hidden>
           <label>Options <span class="tip" tabindex="0" data-tip="Each night the app picks one option. Options keep their own history — renaming an option keeps it; a removed option’s past nights still count."></span></label>

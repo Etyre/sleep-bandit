@@ -120,6 +120,29 @@ INTERACTION_SAMPLES = 2000
 # climb (or push it onward). Bigger = more robust but slower to map the curve.
 MIN_PROBES = 5
 
+# Open-ended top arm. A dose intervention can have ONE more arm ABOVE its max dose
+# that isn't a number -- e.g. the spiky mat with no timer, staying on it until you
+# fall asleep. It is recorded as this sentinel dose, sits exactly one rung above the
+# max on the exploration grid (so the ordinary one-rung-up / jump logic can step into
+# it and back out) and gets its own contrast column like any other level. While it
+# has fewer than MIN_PROBES readings, this share of probe nights go straight to it so
+# it actually gets measured. Mirrored in public/app.js (OPEN_ARM_DOSE).
+OPEN_ARM_DOSE = 1e9
+OPEN_ARM_PROBE_SHARE = 0.5
+
+
+def is_open(d):
+    """True if a recorded dose is the open-ended arm's sentinel."""
+    try:
+        return float(d) >= OPEN_ARM_DOSE / 2
+    except (TypeError, ValueError):
+        return False
+
+
+def has_open_arm(iv):
+    """The intervention tests an open-ended arm above its max (needs a max dose)."""
+    return bool(iv.get("open_arm")) and _bounds(iv)[1] is not None
+
 
 def _d(x):
     return round(float(x), DOSE_ROUND)
@@ -304,6 +327,8 @@ def build_columns(interventions, history_doses):
         for x in history_doses.get(iv["id"], ()):
             if x and float(x) > 0:
                 levels.add(_d(x))
+        if has_open_arm(iv):
+            levels.add(_d(OPEN_ARM_DOSE))      # the open-ended arm is a level of its own
         doses = sorted(levels)
         entry = {"on": idx, "doses": doses, "dev": [], "contrast": {}}
         idx += 1
@@ -598,14 +623,33 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
             plan[iv["id"]] = std
             continue
 
-        # Deviating tonight: reconstruct the measured dose-response curve.
-        counts = {}                                      # dose -> times measured
+        # Deviating tonight: reconstruct the measured dose-response curve. We work in
+        # GRID POSITIONS: if the intervention has an open-ended arm it sits one rung
+        # above the max, so the one-rung-up / jump logic below can step into it and
+        # back out exactly like any other dose; positions are mapped back to real
+        # doses (the sentinel OPEN_ARM_DOSE for that rung) at the end.
+        open_ok = has_open_arm(iv)
+        open_pos = _d(hi + step) if open_ok else None
+        top = open_pos if open_ok else hi                # effective ceiling on the grid
+
+        def pos(d):
+            return open_pos if (open_ok and is_open(d)) else d
+
+        def unpos(p):
+            if open_ok and hi is not None and p > hi:    # anything past the max = open arm
+                return OPEN_ARM_DOSE
+            return _clamp(p, lo, hi)                     # bounds cap every deviation
+
+        counts, real = {}, {}                            # position -> times measured / real dose
         for x in measured.get(iv["id"], ()):
             xd = _d(x)
-            if xd > 0:
-                counts[xd] = counts.get(xd, 0) + 1
+            if xd <= 0 or (is_open(xd) and not open_ok):
+                continue                                 # open-arm nights of a now-closed arm
+            p = pos(xd)
+            counts[p] = counts.get(p, 0) + 1
+            real[p] = xd
         seen = sorted(counts)
-        effs = {d: _effect(post["mN"], entry, d) for d in seen}   # posterior-mean curve
+        effs = {p: _effect(post["mN"], entry, real[p]) for p in seen}   # posterior-mean curve
         best = max(effs.values()) if effs else None
 
         # exploit target: minimum viable dose once there are >=2 measured doses
@@ -615,17 +659,19 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
             if mv is not None:
                 center = mv
 
+        n_open = counts.get(open_pos, 0) if open_ok else 0
         if random.random() < PROBE_SHARE:                # explore: map the curve
-            if timed:
+            if open_ok and n_open < MIN_PROBES and random.random() < OPEN_ARM_PROBE_SHARE:
+                dose = open_pos                          # give the open arm its first readings
+            elif timed:
                 j = random.randint(1, TIME_MAX_JUMP) * random.choice((-1, 1))
                 probe = _d(center + j * step)
                 dose = probe if probe > 0 else _d(center + step)
             else:
-                dose = _supp_probe(seen, counts, effs, best, std, step, lo, hi)
+                dose = _supp_probe(seen, counts, effs, best, std, step, lo, top)
         else:
             dose = center                                # exploit the best dose so far
-        # optional min/max bounds cap every deviation from the standard dose
-        dose = _clamp(dose, lo, hi) if dose and dose > 0 else 0.0
+        dose = unpos(dose) if dose and dose > 0 else 0.0
         plan[iv["id"]] = dose if dose and dose > 0 else 0.0
     return plan
 
