@@ -214,6 +214,16 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .chart-cap .mk-band { color: var(--accent-2); opacity: .5; }
 .chart-cap .mk-night { color: var(--muted); }
 .eff-line { margin-top: 10px; }
+/* the readiness card's headline numbers: their own row of labeled figures,
+   color-coded to the chart (blue = 7-day line, teal = band's lower edge) */
+.hrv-stats { display: flex; align-items: flex-end; gap: 28px; flex-wrap: wrap; margin: 4px 2px 10px; }
+.hrv-stats .stat { display: flex; flex-direction: column; gap: 1px; }
+.hrv-stats .stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.hrv-stats .stat-val { font-size: 21px; font-weight: 700; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.hrv-stats .stat-unit { font-size: 12px; font-weight: 400; color: var(--muted); }
+.hrv-stats .c-avg { color: var(--accent); }
+.hrv-stats .c-mid { color: var(--accent-2); }
+.hrv-stats .c-lo { color: var(--text); }
 .chart-head { display: flex; align-items: center; gap: 10px; }
 .chart-head .chart-cap { margin-bottom: 0; }
 .range-toggle { margin-left: auto; display: inline-flex; gap: 4px; }
@@ -242,6 +252,28 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .metric-note { color: var(--muted); font-size: 11.5px; opacity: .8; margin-top: 3px; }
 .metric-flag { color: var(--accent-2); font-weight: 600; }
 
+/* ---- reports sub-tabs + interactions page ---- */
+.subtabs { display: flex; gap: 6px; margin: 0 0 14px; }
+.subtab { font: inherit; font-size: 13px; padding: 5px 14px; border-radius: 20px; border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; }
+.subtab:hover { border-color: var(--accent); }
+.subtab.active { background: var(--panel-2); color: var(--text); border-color: var(--accent); font-weight: 600; }
+.v-sub { background: rgba(124,156,255,.14); color: var(--accent); }
+.v-indep { background: rgba(154,162,192,.12); color: var(--muted); }
+.pair-name { font-size: 16px; font-weight: 700; }
+.pair-name .plus { color: var(--muted); font-weight: 400; margin: 0 6px; }
+.pair-2col { display: flex; gap: 24px; align-items: flex-start; margin-top: 12px; flex-wrap: wrap; }
+.pair-2col > div { flex: 1 1 240px; }
+.cell-table { border-collapse: collapse; font-size: 13px; margin-top: 6px; }
+.cell-table th { color: var(--muted); font-weight: 500; font-size: 11.5px; padding: 4px 10px; text-align: left; }
+.cell-table td { padding: 6px 10px; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.cell-table td.both { background: rgba(94,224,192,.08); font-weight: 700; }
+.cell-table .n { color: var(--muted); font-size: 11px; font-weight: 400; margin-left: 4px; }
+.pair-rows { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 13px; }
+.pair-rows th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 8px; font-size: 11.5px; }
+.pair-rows td { padding: 6px 8px; border-top: 1px solid var(--line); }
+.pair-rows td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pair-rows tr.clickable { cursor: pointer; } .pair-rows tr.clickable:hover td { background: rgba(124,156,255,.06); }
+
 /* ---- modal ---- */
 .modal-backdrop { position: fixed; inset: 0; background: rgba(6,8,18,.66); display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 50; }
 .modal { max-width: 460px; width: 100%; }
@@ -251,6 +283,20 @@ h2 { margin: 0; font-size: 17px; }
 .modal-actions { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 label { display: block; font-size: 13px; color: var(--muted); font-weight: 500; }
 .field-hint { color: var(--muted); font-size: 11.5px; margin: -4px 0 0; }
+/* ⓘ tooltips on form fields: hover / keyboard focus, or tap to toggle on touch */
+.tip { position: relative; display: inline-flex; align-items: center; justify-content: center;
+  width: 15px; height: 15px; margin-left: 3px; border-radius: 50%; vertical-align: -2px;
+  font-size: 10.5px; font-weight: 700; font-style: normal; line-height: 1; cursor: help;
+  color: var(--muted); border: 1px solid var(--line); background: rgba(127,127,127,.12); }
+.tip::before { content: "?"; }
+.tip:hover, .tip:focus, .tip.open { color: var(--text); border-color: var(--accent); outline: none; }
+.tip::after { content: attr(data-tip); position: absolute; bottom: calc(100% + 7px); left: -6px; z-index: 60;
+  width: 250px; max-width: 80vw; padding: 8px 10px; border-radius: 9px; white-space: normal; text-align: left;
+  font-size: 11.5px; font-weight: 400; line-height: 1.4; color: var(--text); background: #1a1e3a;
+  border: 1px solid var(--line); box-shadow: 0 6px 22px rgba(0,0,0,.45); display: none; pointer-events: none; }
+.tip.r::after { left: auto; right: -6px; }
+.tip:hover::after, .tip:focus::after, .tip.open::after { display: block; }
+.check-label.dim { opacity: .5; }
 .check-label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); font-weight: 500; cursor: pointer; }
 input:not([type="checkbox"]), select, textarea {
   width: 100%; font: inherit; color: var(--text); background: #10132a;

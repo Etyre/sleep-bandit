@@ -38,7 +38,12 @@
 
     <!-- REPORTS -->
     <section id="view-reports" class="view" hidden>
+      <nav class="subtabs">
+        <button class="subtab active" data-sub="reports">Effects</button>
+        <button class="subtab" data-sub="interactions">Interactions</button>
+      </nav>
       <div id="reports-body"><p class="empty">Loading…</p></div>
+      <div id="interactions-body" hidden><p class="empty">Loading…</p></div>
     </section>
   </main>
 
@@ -54,13 +59,13 @@
           <input name="name" required placeholder="e.g. Magnesium glycinate">
         </label>
         <div class="row">
-          <label>Category
+          <label>Category <span class="tip" tabindex="0" data-tip="Supplement or behavioral. Used to group interventions and for per-night exclusions (e.g. a night where you skipped every supplement)."></span>
             <select name="category" id="iv-category">
               <option value="supplement">Supplement</option>
               <option value="behavioral">Behavioral</option>
             </select>
           </label>
-          <label>Type
+          <label>Type <span class="tip r" tabindex="0" data-tip="Dose: an amount the app can vary. Yes / no: simply on or off. Multiple choice: the app picks one of your options each night."></span>
             <select name="kind" id="iv-kind">
               <option value="dose">Dose — an amount</option>
               <option value="boolean">Yes / no — did it or not</option>
@@ -70,39 +75,47 @@
         </div>
         <div id="dose-fields">
           <div class="row">
-            <label>Standard dose
+            <label>Standard dose <span class="tip" tabindex="0" data-tip="The starting point. Enter doses in the real unit (mg, minutes, …) — that’s what the reports show. With exploring on, the app tries steps up and down from here."></span>
               <input name="default_dose" type="number" step="any" value="1" min="0">
             </label>
-            <label>Unit
+            <label>Unit <span class="tip r" tabindex="0" data-tip="What doses are measured in (mg, minutes, degrees…). Leave blank for a plain on/off intervention."></span>
               <input name="unit" placeholder="mg (blank = on/off)">
             </label>
           </div>
           <div class="row">
-            <label>Unit dose — smallest step between doses
+            <label>Unit dose <span class="tip" tabindex="0" data-tip="The smallest step between doses (e.g. one pill = 48 mg). When exploring, the app moves one unit dose up or down from the standard at a time."></span>
               <input name="unit_dose" type="number" step="any" min="0" placeholder="e.g. 48">
             </label>
-            <label>Count as (optional)
-              <input name="dose_noun" placeholder="pill">
+            <label>Min dose <span class="tip" tabindex="0" data-tip="Optional floor: the app never suggests a dose below this, no matter how exploration goes. Blank = no floor."></span>
+              <input name="min_dose" type="number" step="any" min="0" placeholder="no floor">
+            </label>
+            <label>Max dose <span class="tip r" tabindex="0" data-tip="Optional ceiling: the app never suggests a dose above this. Blank = no ceiling."></span>
+              <input name="max_dose" type="number" step="any" min="0" placeholder="no ceiling">
             </label>
           </div>
-          <label class="check-label"><input type="checkbox" name="explore_doses" checked> Explore dosages (try doses around the standard)</label>
-          <p class="field-hint">The standard dose is the starting point; with exploring on, the app tries up and down in unit-dose steps. Turn it off to always use exactly the standard dose. If you name the unit (e.g. “pill”), doses show as counts — 144&nbsp;mg with a 48&nbsp;mg unit dose displays as “3 pills”.</p>
+          <div class="row">
+            <label>Count as <span class="tip" tabindex="0" data-tip="Optional. Makes the tracker show counts instead of amounts: with unit mg, standard 50, unit dose 25, count as “cap” and 50 mg per cap, tonight reads “1 cap” while the report still reads “50 mg”."></span>
+              <input name="dose_noun" placeholder="pill">
+            </label>
+            <label>Amount per count <span class="tip r" tabindex="0" data-tip="How much of the unit one “count as” item is (e.g. 50 mg per cap). Blank = same as the unit dose."></span>
+              <input name="noun_amount" type="number" step="any" min="0" placeholder="defaults to unit dose">
+            </label>
+          </div>
+          <label class="check-label"><input type="checkbox" name="explore_doses" checked> Explore dosages <span class="tip" tabindex="0" data-tip="On: the app tries doses one unit-dose step up and down from the standard (never below the min or above the max) to find the smallest dose that works. Off: always exactly the standard dose."></span></label>
+          <label class="check-label" id="delay-explore-label"><input type="checkbox" name="delay_explore" checked> Delay dosage experimentation <span class="tip" tabindex="0" data-tip="On (default): stick to the standard dose for the first few dozen on-nights so the app can first judge whether the intervention helps at all, and only then start varying the dose. Off: explore doses from the first night."></span></label>
         </div>
         <div id="choice-fields" hidden>
-          <label>Options</label>
+          <label>Options <span class="tip" tabindex="0" data-tip="Each night the app picks one option. Options keep their own history — renaming an option keeps it; a removed option’s past nights still count."></span></label>
           <div id="options-list"></div>
           <div class="add-row">
             <input id="new-option" type="text" placeholder="Add an option…" autocomplete="off">
             <button type="button" class="ghost" id="add-option-btn">+ Add</button>
           </div>
-          <p class="field-hint">Each night the app picks one option. Options keep their own history — renaming an option keeps its history; a removed option's past nights still count.</p>
-          <label class="check-label"><input type="checkbox" name="test_skip"> Also test skipping (do none of these some nights)</label>
-          <p class="field-hint">Occasionally suggests a “skip” control night, so the report can show the average effect of doing <em>any</em> of these options versus nothing — on both HRV and resting HR.</p>
+          <label class="check-label"><input type="checkbox" name="test_skip"> Also test skipping <span class="tip" tabindex="0" data-tip="Occasionally suggests a “skip” control night (do none of these), so the report can show the average effect of doing any of these options versus nothing — on both HRV and resting HR."></span></label>
         </div>
-        <label>Prior probability it helps — % (scheduling only, not counted in results)
+        <label>Prior probability it helps (%) <span class="tip" tabindex="0" data-tip="Your belief, before your own data, that this helps your HRV. 50% = no prior. Higher makes the scheduler try it more often early — it’s exactly the chance it’s scheduled before any nights are logged. Capped at 80% so it still gets enough OFF nights to measure. Scheduling only: it never changes the measured results and fades as real nights accumulate."></span>
           <input name="prior_helps" type="number" min="1" max="80" step="1" value="50" inputmode="numeric">
         </label>
-        <p class="field-hint">Your belief, before your own data, that this helps your HRV. <b>50% = no prior.</b> Higher makes the scheduler try it more often early — this is exactly the chance it's scheduled before any nights are logged. Capped at <b>80%</b> so it still gets enough OFF nights to actually measure. It never changes the measured efficacy numbers and fades as real nights accumulate.</p>
         <label>Note (optional)
           <input name="note" placeholder="brand, timing, etc.">
         </label>

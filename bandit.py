@@ -70,8 +70,11 @@ READOUT_SAMPLES = 3000     # posterior samples behind the probability read-outs
 READOUT_SEED = 1234567
 DOSE_ROUND = 6             # decimals used to key doses (avoids float-equality bugs)
 
-# Cold-start dose exploration. Until an intervention has this many compliant
-# "on" nights, we lean on its standard dose instead of exploring alternatives.
+# Cold-start dose exploration (per-intervention option `delay_explore`, on by
+# default). Until an intervention has this many compliant "on" nights, we lean on
+# its standard dose instead of exploring alternatives -- so the on/off efficacy
+# question is answered at one dose before the dose itself starts moving. With
+# delay_explore off, the intervention skips the warm-up and explores from night one.
 # The chance of exploring an off-standard dose on an "on" night ramps up
 # *quadratically* -- p_explore = (n_on / WARMUP_ON_NIGHTS)**2 -- so it stays low
 # for a long time and only accelerates once there's real evidence. With
@@ -100,6 +103,17 @@ TIME_MAX_JUMP = 4
 # effect is at least this fraction of the best measured dose's effect -- so a smaller
 # dose that reaches ~95% of the peak is preferred over a bigger one at the peak.
 MIN_VIABLE_FRAC = 0.95
+
+# Pairwise interactions (Reports > Interactions). For two interventions A and B we
+# fit  y = baseline + a*A + b*B + g*(A and B) + noise  on the nights where BOTH are
+# determined (each confirmed-on or assigned-off). g is the interaction: g > 0 means
+# the pair does better together than their separate effects add up to (synergy);
+# g < 0 means worse than additive -- partial substitutes, or outright interference
+# when the pair is worse than the better one alone. The interaction prior is shrunk
+# below the main-effect prior: pairs are presumed roughly additive until the data
+# says otherwise, which also tempers the many-pairs multiple-comparison problem.
+INTERACTION_PRIOR_VAR = 0.3
+INTERACTION_SAMPLES = 2000
 
 # A frontier dose must gather at least this many measurements before the climb judges
 # whether to extend past it -- otherwise a single noisy reading can wrongly halt the
@@ -439,6 +453,29 @@ def _dose_step(iv):
     return 0.5 * s if s > 0 else 0.0
 
 
+def _bounds(iv):
+    """Optional (min, max) dose bounds on an intervention; None = unbounded on that side."""
+    def f(v):
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return None
+        return x if x > 0 else None
+    return f(iv.get("min_dose")), f(iv.get("max_dose"))
+
+
+def _in_bounds(d, lo, hi):
+    return (lo is None or d >= lo) and (hi is None or d <= hi)
+
+
+def _clamp(d, lo, hi):
+    if lo is not None and d < lo:
+        d = lo
+    if hi is not None and d > hi:
+        d = hi
+    return _d(d)
+
+
 def _time_based(iv):
     """True for time-dosed interventions (minutes/seconds/hours) -- safe to explore
     aggressively, unlike a supplement measured in mg/g."""
@@ -457,10 +494,11 @@ def _min_viable_dose(effs):
     return min(d for d, e in effs.items() if e >= thr)
 
 
-def _supp_probe(seen, counts, effs, best, std, step):
+def _supp_probe(seen, counts, effs, best, std, step, lo=None, hi=None):
     """A supplement's one-rung exploration probe: firm up an edge dose with a few
     readings (MIN_PROBES), then step exactly ONE unit dose past it -- up while the top is
-    still rising, down while the bottom is still viable. Never jumps more than one rung."""
+    still rising, down while the bottom is still viable. Never jumps more than one rung,
+    and never outside the optional [lo, hi] bounds."""
     if not seen:
         targets = [std - step, std + step]
     else:
@@ -475,7 +513,7 @@ def _supp_probe(seen, counts, effs, best, std, step):
             targets.append(bot)                       # firm up the bottom
         elif thr is None or effs[bot] >= thr:
             targets.append(bot - step)                # still viable -> reach down
-    targets = [_d(d) for d in targets if d > 0]
+    targets = [_d(d) for d in targets if d > 0 and _in_bounds(_d(d), lo, hi)]
     return random.choice(targets) if targets else std
 
 
@@ -489,7 +527,9 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
          -- and independent of how many candidate doses it has.
       2. If it's on, which dose?  Keep the STANDARD dose most nights while data is thin;
          the chance of deviating ramps with the warm-up (quadratic for supplements ->
-         under 1-in-10 for the first ~20 on-nights, faster for time-based). When it does
+         under 1-in-10 for the first ~20 on-nights, faster for time-based) -- unless the
+         intervention has delay_explore off, in which case it's fully warm from the
+         start and explores every on-night at the normal rate. When it does
          deviate it either exploits the MINIMUM VIABLE dose (smallest within
          MIN_VIABLE_FRAC of the best measured effect) or, PROBE_SHARE of the time, probes
          to map the curve -- supplements one unit dose at a time, time-based in bigger
@@ -537,17 +577,23 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
         # (some doses aren't merely un-explored but physically unavailable, e.g. an AC
         # that can't be set below its minimum temperature).
         std = _d(iv.get("default_dose") or 0)
+        lo, hi = _bounds(iv)
         if not iv.get("explore_doses", True):
             plan[iv["id"]] = std
             continue
-        # Otherwise stay on the STANDARD dose most nights while data is thin; the
-        # chance of deviating ramps with the warm-up (quadratic for supplements ->
-        # <1-in-10 for the first ~20 on-nights, faster for time-based). This gate
-        # covers BOTH exploiting a non-standard dose AND probing.
+        # Otherwise, if this intervention delays exploration (the default), stay on
+        # the STANDARD dose most nights while data is thin; the chance of deviating
+        # ramps with the warm-up (quadratic for supplements -> <1-in-10 for the first
+        # ~20 on-nights, faster for time-based). With the delay switched off the
+        # intervention is treated as fully warmed up from night one. Either way this
+        # gate covers BOTH exploiting a non-standard dose AND probing.
         step = _dose_step(iv)
         timed = _time_based(iv)
-        warm = min(1.0, n_on.get(iv["id"], 0) / WARMUP_ON_NIGHTS)
-        p_deviate = warm if timed else warm * warm
+        if iv.get("delay_explore", True):
+            warm = min(1.0, n_on.get(iv["id"], 0) / WARMUP_ON_NIGHTS)
+            p_deviate = warm if timed else warm * warm
+        else:
+            p_deviate = 1.0
         if step <= 0 or random.random() >= p_deviate:
             plan[iv["id"]] = std
             continue
@@ -575,9 +621,11 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
                 probe = _d(center + j * step)
                 dose = probe if probe > 0 else _d(center + step)
             else:
-                dose = _supp_probe(seen, counts, effs, best, std, step)
+                dose = _supp_probe(seen, counts, effs, best, std, step, lo, hi)
         else:
             dose = center                                # exploit the best dose so far
+        # optional min/max bounds cap every deviation from the standard dose
+        dose = _clamp(dose, lo, hi) if dose and dose > 0 else 0.0
         plan[iv["id"]] = dose if dose and dose > 0 else 0.0
     return plan
 
@@ -668,6 +716,75 @@ def readouts(interventions, betas, cols, observed=None):
             "doses": dose_rows,
         }
     return out
+
+
+def pair_interaction(nights):
+    """Interaction read-out for one pair. nights: [{"y": metric (higher = better),
+    "a": 0/1, "b": 0/1}] -- only nights where both A and B are determined.
+
+    Returns cell counts / raw means (neither, a_only, b_only, both) and, from the
+    posterior: the main effects a, b; the interaction g (mean, 90% CI); the combined
+    effect a+b+g; and the probabilities that drive the verdicts:
+      p_synergy   = P(g > 0)                     better together than additive
+      p_subadd    = P(g < 0)                     worse together than additive
+      p_interfere = P(a+b+g < max(a, b))         the pair is WORSE than the better one alone
+      p_stack     = P(a+b+g > max(a, b))         stacking beats the better one alone
+    plus the conditional effects each one adds with / without the other (a vs a+g,
+    b vs b+g) -- the direct answer to "does A still help on nights I take B?".
+    None if there are no nights."""
+    if not nights:
+        return None
+    X, y = [], []
+    cells = {(0, 0): [], (1, 0): [], (0, 1): [], (1, 1): []}
+    for n in nights:
+        a, b = (1 if n["a"] else 0), (1 if n["b"] else 0)
+        yv = float(n["y"])
+        X.append([1.0, float(a), float(b), float(a * b)])
+        y.append(yv)
+        cells[(a, b)].append(yv)
+    V0 = [INTERCEPT_PRIOR_VAR, ON_PRIOR_VAR, ON_PRIOR_VAR, INTERACTION_PRIOR_VAR]
+    post = fit(X, y, 4, V0)
+    state = random.getstate()
+    random.seed(READOUT_SEED)
+    try:
+        betas = [sample_beta(post)[0] for _ in range(INTERACTION_SAMPLES)]
+    finally:
+        random.setstate(state)
+    S = len(betas)
+    ga = [bt[1] for bt in betas]
+    gb = [bt[2] for bt in betas]
+    gg = [bt[3] for bt in betas]
+    comb = [ga[i] + gb[i] + gg[i] for i in range(S)]
+    best1 = [max(ga[i], gb[i]) for i in range(S)]
+    # conditional effects: what A adds when B is off (a) vs on (a+g), and vice versa.
+    a_with_b = [ga[i] + gg[i] for i in range(S)]
+    b_with_a = [gb[i] + gg[i] for i in range(S)]
+
+    def summ(v):
+        sv = sorted(v)
+        return {"mean": sum(sv) / S, "ci_low": _percentile(sv, 0.05), "ci_high": _percentile(sv, 0.95)}
+
+    def mean_or_none(v):
+        return (sum(v) / len(v)) if v else None
+
+    return {
+        "n": len(nights),
+        "n_neither": len(cells[(0, 0)]), "n_a_only": len(cells[(1, 0)]),
+        "n_b_only": len(cells[(0, 1)]), "n_both": len(cells[(1, 1)]),
+        "raw_neither": mean_or_none(cells[(0, 0)]), "raw_a_only": mean_or_none(cells[(1, 0)]),
+        "raw_b_only": mean_or_none(cells[(0, 1)]), "raw_both": mean_or_none(cells[(1, 1)]),
+        "effect_a": summ(ga), "effect_b": summ(gb),
+        "effect_a_with_b": summ(a_with_b), "effect_b_with_a": summ(b_with_a),
+        "p_a_helps_without_b": sum(1 for v in ga if v > 0) / S,
+        "p_a_helps_with_b": sum(1 for v in a_with_b if v > 0) / S,
+        "p_b_helps_without_a": sum(1 for v in gb if v > 0) / S,
+        "p_b_helps_with_a": sum(1 for v in b_with_a if v > 0) / S,
+        "interaction": summ(gg), "combined": summ(comb),
+        "p_synergy": sum(1 for v in gg if v > 0) / S,
+        "p_subadd": sum(1 for v in gg if v < 0) / S,
+        "p_interfere": sum(1 for i in range(S) if comb[i] < best1[i]) / S,
+        "p_stack": sum(1 for i in range(S) if comb[i] > best1[i]) / S,
+    }
 
 
 def fit_model(interventions, completed_nights, priors=None):

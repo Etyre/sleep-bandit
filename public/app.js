@@ -62,10 +62,11 @@ function pluralize(noun, n) {
   return noun + (/s$/i.test(noun) ? "" : "s");
 }
 
-// how a dose amount is written: as a count of unit-doses ("3 pills") if the
-// intervention names its unit dose, otherwise as the raw amount ("144 mg").
+// how a dose amount is written: as a count ("3 pills") if the intervention names a
+// countable noun -- one noun = noun_amount of the unit (falls back to the unit dose) --
+// otherwise as the raw amount ("144 mg").
 function doseText(iv, amount) {
-  const u = iv.unit_dose || 0, noun = (iv.dose_noun || "").trim();
+  const u = iv.noun_amount || iv.unit_dose || 0, noun = (iv.dose_noun || "").trim();
   if (u > 0 && noun) {
     const count = amount / u;
     return `${numLabel(count)} ${esc(pluralize(noun, count))}`;
@@ -709,19 +710,19 @@ function hrvTrendCard(t) {
   const top = el("div", "iv-top");
   top.appendChild(el("span", "iv-name", "🫀 HRV readiness"));
   const L = t.latest;
+  let metaSpan = null;
   if (L) {
     const ok = L.status === "intervals";
     top.appendChild(el("span", "verdict " + (ok ? "v-help" : "v-no"),
       ok ? "🏃 intervals OK" : "🚶 zone 2"));
-    top.appendChild(el("span", "iv-meta",
-      `7-day avg <b>${avg1(L.avg7)}</b> ms · ${t.window_days}-day avg <b>${avg1(L.mid)}</b> ms · ` +
-      `lower bound <b>${avg1(L.lo)}</b> ms · as of ${shortDate(L.date)}'s night`));
+    metaSpan = el("div", "hrv-stats");
   } else {
     top.appendChild(el("span", "verdict v-new", "🌱 gathering data"));
     top.appendChild(el("span", "iv-meta",
       `${t.n_nights}/${t.min_nights} nights toward a baseline band`));
   }
   card.appendChild(top);
+  if (metaSpan) card.appendChild(metaSpan);
 
   // legend on the left, range toggle (recent window vs everything since the app's
   // first night) on the right, sharing one row above the chart
@@ -739,9 +740,23 @@ function hrvTrendCard(t) {
   const draw = (all) => {
     btnRecent.classList.toggle("on", !all);
     btnAll.classList.toggle("on", all);
+    const slice = all ? t.days : t.days.slice(-t.default_days);
+    if (metaSpan) {
+      // middle figure follows the view: the geometric mean (consistent with the
+      // ln-space method) of the nights currently on screen
+      const logs = slice.filter((d) => d.hrv != null).map((d) => Math.log(d.hrv));
+      const gm = logs.length ? Math.exp(logs.reduce((a, b) => a + b, 0) / logs.length) : null;
+      // color-coded to the chart: blue = the 7-day line, teal = the band's lower edge
+      const stat = (label, val, cls) =>
+        `<span class="stat"><span class="stat-label">${label}</span>` +
+        `<span class="stat-val ${cls}">${avg1(val)}<span class="stat-unit"> ms</span></span></span>`;
+      metaSpan.innerHTML =
+        stat("7-day avg", L.avg7, "c-avg") +
+        (gm != null ? stat(all ? "all-time avg" : `${t.default_days}-day avg`, gm, "c-mid") : "") +
+        stat("lower bound", L.lo, "c-lo");
+    }
     chartBox.innerHTML = "";
-    chartBox.appendChild(hrvTrendChart(all ? t.days : t.days.slice(-t.default_days),
-      t.window_days, t.app_start));
+    chartBox.appendChild(hrvTrendChart(slice, t.window_days, t.app_start));
   };
   btnRecent.onclick = () => draw(false);
   btnAll.onclick = () => draw(true);
@@ -794,8 +809,8 @@ function hrvTrendChart(days, windowDays, appStart) {
     const fwd = seg.map((d, j) => `${px(a + j)},${py(d.hi)}`).join(" ");
     const back = seg.map((d, j) => `${px(a + j)},${py(d.lo)}`).reverse().join(" ");
     parts.push(`<polygon points="${fwd} ${back}" style="fill:var(--accent-2);opacity:.14"/>`);
-    parts.push(`<polyline points="${seg.map((d, j) => `${px(a + j)},${py(d.lo)}`).join(" ")}" fill="none" stroke-width="2" style="stroke:var(--accent-2)"/>`);
-    parts.push(`<polyline points="${seg.map((d, j) => `${px(a + j)},${py(d.mid)}`).join(" ")}" fill="none" stroke-width="1" stroke-dasharray="3 4" style="stroke:var(--accent-2);opacity:.5"/>`);
+    parts.push(`<polyline points="${seg.map((d, j) => `${px(a + j)},${py(d.mid)}`).join(" ")}" fill="none" stroke-width="2" style="stroke:var(--accent-2)"/>`);
+    parts.push(`<polyline points="${seg.map((d, j) => `${px(a + j)},${py(d.lo)}`).join(" ")}" fill="none" stroke-width="1" stroke-dasharray="3 4" style="stroke:var(--accent-2);opacity:.5"/>`);
   }
 
   // nightly HRV dots (the raw data, deliberately quiet)
@@ -813,14 +828,14 @@ function hrvTrendChart(days, windowDays, appStart) {
 
   // latest-value labels on the right edge, nudged apart if they'd collide
   const last = (key) => { for (let i = N - 1; i >= 0; i--) if (days[i][key] != null) return i; return -1; };
-  const iA = last("avg7"), iL = last("lo");
-  let yA = iA >= 0 ? py(days[iA].avg7) : null, yL = iL >= 0 ? py(days[iL].lo) : null;
+  const iA = last("avg7"), iL = last("mid");
+  let yA = iA >= 0 ? py(days[iA].avg7) : null, yL = iL >= 0 ? py(days[iL].mid) : null;
   if (yA != null && yL != null && Math.abs(yA - yL) < 11) {
     const mid = (yA + yL) / 2, s = yA <= yL ? 1 : -1;
     yA = mid - s * 5.5; yL = mid + s * 5.5;
   }
   if (yA != null) parts.push(`<text x="${px(iA) + 7}" y="${yA + 3.5}" font-size="11" font-weight="600" style="fill:var(--accent)">${avg1(days[iA].avg7)}</text>`);
-  if (yL != null) parts.push(`<text x="${px(iL) + 7}" y="${yL + 3.5}" font-size="11" font-weight="600" style="fill:var(--accent-2)">${avg1(days[iL].lo)}</text>`);
+  if (yL != null) parts.push(`<text x="${px(iL) + 7}" y="${yL + 3.5}" font-size="11" font-weight="600" style="fill:var(--accent-2)">${avg1(days[iL].mid)}</text>`);
 
   // marker at the night the app (and its interventions) came into use -- HRV to the
   // left of this line is pure Oura history, untouched by any experiment
@@ -880,18 +895,203 @@ function hrvTrendChart(days, windowDays, appStart) {
   return wrap;
 }
 
+
+// =====================================================================
+// INTERACTIONS (Reports > Interactions): do two interventions help more or
+// less together than their separate effects would add up to?
+// =====================================================================
+// Gate: a verdict needs this many nights with BOTH on, and a few in every other cell.
+const MIN_BOTH = 4, MIN_CELL = 2;
+const FLAG_P = 0.9, LEAN_P = 0.75;
+
+// verdict from the HRV read-out: [class, label, rank] -- rank orders the page
+// (strong flags first, gathering-data last).
+function pairVerdict(r) {
+  if (!r || r.n_both < MIN_BOTH || r.n_neither < MIN_CELL || r.n_a_only < MIN_CELL || r.n_b_only < MIN_CELL)
+    return ["v-new", "🌱 gathering data", 5];
+  // A flag needs the INTERACTION term itself to be reliably non-zero -- not merely
+  // "together < the better one alone", which is trivially true when neither helps.
+  // Given a reliably sub-additive pair: "substitutes" is the case where the pair is
+  // about as good as the better one alone (A adds nothing once B is on), so
+  // interference must CLEARLY beat that -- the pair is reliably worse than the
+  // better one alone -- not merely be the coin-flip side of "about equal".
+  if (r.p_synergy >= FLAG_P) return ["v-help", "✔ synergy — better together", 0];
+  if (r.p_subadd >= FLAG_P) {
+    return r.p_interfere >= LEAN_P ? ["v-no", "✕ interfere — worse together", 0]
+                                   : ["v-sub", "≈ substitutes — effects overlap", 1];
+  }
+  if (r.p_synergy >= LEAN_P) return ["v-maybe", "… leaning synergy", 2];
+  if (r.p_subadd >= LEAN_P) {
+    return r.p_interfere >= LEAN_P ? ["v-maybe", "… leaning interference", 2]
+                                   : ["v-maybe", "… leaning substitutes", 3];
+  }
+  return ["v-indep", "no interaction seen yet", 4];
+}
+
+function pairSortKey(p) {
+  const r = p.hrv || {};
+  const [, , rank] = pairVerdict(r);
+  const strength = Math.max(r.p_synergy || 0, r.p_subadd || 0, r.p_interfere || 0);
+  return [rank, -strength, -(r.n_both || 0)];
+}
+
+async function loadInteractions() {
+  const box = $("#interactions-body");
+  box.innerHTML = `<p class="empty">Crunching the numbers…</p>`;
+  let data;
+  try { data = await api("/api/interactions"); }
+  catch (e) { box.innerHTML = `<p class="empty">Error: ${esc(e.message)}</p>`; return; }
+
+  box.innerHTML = "";
+  const nPairs = data.pairs.length;
+  box.appendChild(el("p", "rep-stat",
+    `Every pair of interventions that has shared a night, across <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}. ` +
+    `For each pair the model asks whether the two did <em>better</em> together than their separate effects add up to (synergy), ` +
+    `about as much as either alone (substitutes — their effects overlap), or <em>worse</em> than the better one alone (interference). ` +
+    `A verdict needs ≥${MIN_BOTH} nights with both on. With ${nPairs} pair${nPairs === 1 ? "" : "s"} under test, expect the odd false flag — treat a flag as a lead to watch, not a conclusion.` +
+    (data.n_pairs_no_overlap ? ` ${data.n_pairs_no_overlap} pair${data.n_pairs_no_overlap === 1 ? " has" : "s have"} never co-occurred yet.` : "")));
+
+  if (!nPairs) { box.appendChild(el("p", "empty", "No two interventions have been on together on a logged night yet.")); return; }
+
+  const sorted = data.pairs.slice().sort((x, y) => {
+    const kx = pairSortKey(x), ky = pairSortKey(y);
+    for (let i = 0; i < kx.length; i++) if (kx[i] !== ky[i]) return kx[i] - ky[i];
+    return pairName(x).localeCompare(pairName(y));
+  });
+  const flagged = sorted.filter((p) => pairVerdict(p.hrv)[2] <= 3);
+  const rest = sorted.filter((p) => pairVerdict(p.hrv)[2] > 3);
+
+  if (flagged.length) {
+    box.appendChild(el("h3", "rep-group", "Flagged pairs"));
+    for (const p of flagged) box.appendChild(pairCard(p));
+  } else {
+    box.appendChild(el("h3", "rep-group", "Flagged pairs"));
+    box.appendChild(el("p", "empty", "Nothing flagged yet — no pair looks reliably better or worse than additive."));
+  }
+  if (rest.length) {
+    box.appendChild(el("h3", "rep-group", "All other pairs"));
+    box.appendChild(pairTable(rest));
+  }
+}
+
+const pairName = (p) => `${p.a.name} + ${p.b.name}`;
+
+// the raw-average story: "together X, vs Y if the two effects simply added"
+function additiveExpected(r) {
+  if (r.raw_neither == null || r.raw_a_only == null || r.raw_b_only == null) return null;
+  return r.raw_a_only + r.raw_b_only - r.raw_neither;
+}
+
+function pairCard(p) {
+  const r = p.hrv || {};
+  const [vc, vt] = pairVerdict(r);
+  const card = el("div", "iv" + (p.a.active && p.b.active ? "" : " inactive"));
+  const top = el("div", "iv-top");
+  top.appendChild(el("span", "pair-name", `${esc(p.a.name)}<span class="plus">+</span>${esc(p.b.name)}`));
+  top.appendChild(el("span", "verdict " + vc, vt));
+  top.appendChild(el("span", "iv-meta", `${r.n_both || 0} night${r.n_both === 1 ? "" : "s"} with both · ${r.n || 0} comparable`));
+  card.appendChild(top);
+
+  const cols = el("div", "pair-2col");
+  // left: the modeled numbers
+  const left = el("div");
+  left.appendChild(el("div", "metric-label", `Interaction on HRV <span class="metric-hint">beyond the two effects adding up</span>`));
+  if (r.interaction) {
+    const g = r.interaction;
+    const cls = g.mean >= 0 ? "pos" : "neg";
+    left.appendChild(el("div", `metric-val ${vc === "v-new" ? "muted" : cls}`,
+      `${signed(g.mean)}<span class="metric-unit"> HRV</span>`));
+    left.appendChild(el("div", "metric-sub",
+      `90% CI ${signed(g.ci_low)} to ${signed(g.ci_high)}. ` +
+      `Together: <b>${signed(r.combined.mean)}</b> vs the better one alone (${esc(r.effect_a.mean >= r.effect_b.mean ? p.a.name : p.b.name)}: <b>${signed(Math.max(r.effect_a.mean, r.effect_b.mean))}</b>).`));
+    left.appendChild(el("div", "metric-sub",
+      `P(better together than additive) <b>${pct(r.p_synergy)}</b> · P(worse than additive) <b>${pct(r.p_subadd)}</b> · P(pair beats the better one alone) <b>${pct(r.p_stack)}</b>`));
+    // the conditional story: what each adds with vs. without the other
+    const cond = (name, solo, withOther, other) =>
+      `<b>${esc(name)}</b> adds <b>${signed(solo.mean)}</b> without ${esc(other)}, <b>${signed(withOther.mean)}</b> with it`;
+    left.appendChild(el("div", "metric-sub",
+      cond(p.a.name, r.effect_a, r.effect_a_with_b, p.b.name) + " · " +
+      cond(p.b.name, r.effect_b, r.effect_b_with_a, p.a.name)));
+  } else {
+    left.appendChild(el("div", "metric-val muted", "—"));
+  }
+  const lr = p.lrhr;
+  if (lr && lr.n_both) {
+    // lrhr is fit on the NEGATED value (so higher = better inside the engine); flip the
+    // sign back so the number reads as a change in resting HR (negative = good).
+    const g = lr.interaction;
+    left.appendChild(el("div", "metric-note",
+      `Resting HR: interaction ${signed(-g.mean)} bpm (90% CI ${signed(-g.ci_high)} to ${signed(-g.ci_low)}; lower is better) · ` +
+      `P(better together) ${pct(lr.p_synergy)} · P(interfere) ${pct(lr.p_interfere)} · ${lr.n_both} nights with both`));
+  }
+  cols.appendChild(left);
+
+  // right: the raw 2x2 so the verdict is inspectable
+  const right = el("div");
+  right.appendChild(el("div", "metric-label", `Average HRV by night type <span class="metric-hint">raw averages · n nights</span>`));
+  const fmt = (v, n) => v == null ? `<span class="n">—</span>` : `${avg1(v)}<span class="n">n=${n}</span>`;
+  right.appendChild(el("table", "cell-table",
+    `<tr><th></th><th>${esc(p.b.name)} off</th><th>${esc(p.b.name)} on</th></tr>` +
+    `<tr><th>${esc(p.a.name)} off</th><td>${fmt(r.raw_neither, r.n_neither)}</td><td>${fmt(r.raw_b_only, r.n_b_only)}</td></tr>` +
+    `<tr><th>${esc(p.a.name)} on</th><td>${fmt(r.raw_a_only, r.n_a_only)}</td><td class="both">${fmt(r.raw_both, r.n_both)}</td></tr>`));
+  const exp = additiveExpected(r);
+  if (exp != null && r.raw_both != null) {
+    right.appendChild(el("div", "metric-sub",
+      `Both on averaged <b>${avg1(r.raw_both)}</b>; if the two effects simply added you'd expect about <b>${avg1(exp)}</b>.`));
+  }
+  cols.appendChild(right);
+  card.appendChild(cols);
+  return card;
+}
+
+function pairTable(pairs) {
+  const t = el("table", "pair-rows");
+  t.innerHTML = `<tr><th>Pair</th><th>Verdict</th><th>Nights with both</th><th>Interaction (HRV)</th><th>P(synergy)</th><th>P(sub-additive)</th></tr>`;
+  for (const p of pairs) {
+    const r = p.hrv || {};
+    const [vc, vt] = pairVerdict(r);
+    const tr = el("tr", "clickable");
+    const g = r.interaction;
+    tr.innerHTML =
+      `<td>${esc(pairName(p))}</td>` +
+      `<td><span class="verdict ${vc}">${vt}</span></td>` +
+      `<td class="num">${r.n_both || 0}</td>` +
+      `<td class="num">${g ? `<span class="effect ${g.mean >= 0 ? "pos" : "neg"}">${signed(g.mean)}</span> <span class="ci">[${signed(g.ci_low)}, ${signed(g.ci_high)}]</span>` : "—"}</td>` +
+      `<td class="num">${g ? pct(r.p_synergy) : "—"}</td>` +
+      `<td class="num">${g ? pct(r.p_subadd) : "—"}</td>`;
+    // click a row to expand it into a full card beneath
+    tr.addEventListener("click", () => {
+      const next = tr.nextElementSibling;
+      if (next && next.classList.contains("expand")) { next.remove(); return; }
+      const ex = el("tr", "expand");
+      const td = el("td"); td.colSpan = 6; td.appendChild(pairCard(p)); ex.appendChild(td);
+      tr.after(ex);
+    });
+    t.appendChild(tr);
+  }
+  return t;
+}
+
 // =====================================================================
 // NAV + MODAL
 // =====================================================================
+// views: grid | reports (effects) | interactions -- the last two are sub-pages of the
+// Reports tab, each with its own hash so they can be bookmarked.
 function switchView(view) {
-  if (view !== "grid" && view !== "reports") view = "grid";
-  $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === view));
-  $("#view-grid").hidden = view !== "grid";
-  $("#view-reports").hidden = view !== "reports";
+  if (!["grid", "reports", "interactions"].includes(view)) view = "grid";
+  const top = view === "grid" ? "grid" : "reports";
+  $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === top));
+  $("#view-grid").hidden = top !== "grid";
+  $("#view-reports").hidden = top !== "reports";
+  $$(".subtab").forEach((b) => b.classList.toggle("active", b.dataset.sub === view));
+  $("#reports-body").hidden = view !== "reports";
+  $("#interactions-body").hidden = view !== "interactions";
   if (("#" + view) !== location.hash) location.hash = view;
   if (view === "reports") loadReports();
+  if (view === "interactions") loadInteractions();
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
+$$(".subtab").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.sub)));
 window.addEventListener("hashchange", () => switchView(location.hash.replace("#", "")));
 
 let editingId = null;
@@ -901,6 +1101,21 @@ function syncKind() {
   $("#choice-fields").hidden = k !== "choice";
 }
 $("#iv-kind").addEventListener("change", syncKind);
+// ⓘ tooltips: tap toggles (for touch), and a click inside a <label> must not focus its input
+$$(".tip").forEach((t) => t.addEventListener("click", (e) => {
+  e.preventDefault(); e.stopPropagation();
+  const was = t.classList.contains("open");
+  $$(".tip.open").forEach((o) => o.classList.remove("open"));
+  if (!was) t.classList.add("open");
+}));
+document.addEventListener("click", () => $$(".tip.open").forEach((o) => o.classList.remove("open")));
+// the "delay exploration" option only means something when exploring is on
+function syncDelay() {
+  const f = $("#iv-form");
+  f.delay_explore.disabled = !f.explore_doses.checked;
+  $("#delay-explore-label").classList.toggle("dim", !f.explore_doses.checked);
+}
+$("#iv-form").explore_doses.addEventListener("change", syncDelay);
 
 // ---- multiple-choice options editor (each option keeps a stable id) ----
 let modalOptions = [];  // [{id: number|null, label}]
@@ -968,7 +1183,12 @@ function openModal(iv) {
   f.default_dose.value = iv ? iv.default_dose : 1;
   f.unit_dose.value = iv && iv.unit_dose ? iv.unit_dose : "";
   f.dose_noun.value = iv ? (iv.dose_noun || "") : "";
+  f.noun_amount.value = iv && iv.noun_amount != null ? iv.noun_amount : "";
+  f.min_dose.value = iv && iv.min_dose != null ? iv.min_dose : "";
+  f.max_dose.value = iv && iv.max_dose != null ? iv.max_dose : "";
   f.explore_doses.checked = iv ? iv.explore_doses !== false : true;
+  f.delay_explore.checked = iv ? iv.delay_explore !== false : true;
+  syncDelay();
   f.test_skip.checked = iv ? !!iv.test_skip : false;
   f.prior_helps.value = String(iv && iv.prior_helps ? priorPct(iv.prior_helps) : 50);
   f.note.value = iv ? iv.note : "";
@@ -1019,7 +1239,21 @@ $("#iv-form").addEventListener("submit", async (e) => {
     payload.default_dose = parseFloat(f.default_dose.value) || 1;
     payload.unit_dose = parseFloat(f.unit_dose.value) || 0;
     payload.dose_noun = f.dose_noun.value.trim();
+    const per = parseFloat(f.noun_amount.value);
+    payload.noun_amount = per > 0 ? per : null;
     payload.explore_doses = f.explore_doses.checked;
+    payload.delay_explore = f.delay_explore.checked;
+    // optional bounds: blank -> null (no bound). Keep the standard dose inside them.
+    const lo = parseFloat(f.min_dose.value), hi = parseFloat(f.max_dose.value);
+    payload.min_dose = lo > 0 ? lo : null;
+    payload.max_dose = hi > 0 ? hi : null;
+    if (payload.min_dose != null && payload.max_dose != null && payload.min_dose > payload.max_dose) {
+      alert("Min dose must be less than or equal to max dose."); return;
+    }
+    if ((payload.min_dose != null && payload.default_dose < payload.min_dose) ||
+        (payload.max_dose != null && payload.default_dose > payload.max_dose)) {
+      alert("The standard dose must be between the min and max dose."); return;
+    }
   }
   try {
     if (editingId) STATE = await api(`/api/interventions/${editingId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });

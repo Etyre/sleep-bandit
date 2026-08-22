@@ -114,6 +114,38 @@ def ensure_tonight(conn):
     return store.get_night(conn, d)
 
 
+def reconcile_tonight_bounds(conn, iid, before=None):
+    """After an intervention's dose settings change, bring TONIGHT's cell for it in
+    line with the new settings -- but only if the cell is still pending: assigned ON,
+    not ticked as taken, on a night that is still 'planned'. Past nights, OFF cells
+    and anything already marked taken are never touched, and the on/off decision is
+    never re-rolled. The dose is reset to the (clamped) new standard dose when the
+    standard dose itself changed, or when the old dose falls outside the new
+    [min_dose, max_dose]; otherwise it's left as planned. `before` is the
+    intervention dict prior to the edit (if known). Returns the new dose or None."""
+    iv = store.get_intervention(conn, iid)
+    if not iv or iv.get("kind") != "dose":
+        return None
+    d = today_str()
+    night = store.get_night(conn, d)
+    if not night or night.get("status") != "planned":
+        return None
+    cell = next((a for a in night["assignments"] if a["intervention_id"] == iid), None)
+    if not cell or (cell["taken_dose"] or 0) > 0 or not (cell["assigned_dose"] or 0) > 0:
+        return None
+    lo, hi = bandit._bounds(iv)
+    old = float(cell["assigned_dose"])
+    std_changed = before is not None and float(before.get("default_dose") or 0) != float(iv.get("default_dose") or 0)
+    if bandit._in_bounds(old, lo, hi) and not std_changed:
+        return None
+    new = bandit._clamp(float(iv.get("default_dose") or old), lo, hi)
+    if float(new) == old:
+        return None
+    store._audit(conn, "clamp_assign", d, iid, old_dose=old, new_dose=float(new),
+                 min_dose=lo, max_dose=hi, reason=("standard_changed" if std_changed else "out_of_bounds"))
+    store.force_assignment(conn, d, iid, new, taken_dose=cell["taken_dose"])
+    return new
+
 # ---------------------------------------------------------------------------
 # Grid-shaped state
 # ---------------------------------------------------------------------------
@@ -283,6 +315,60 @@ def reports_payload(conn):
 
 
 # ---------------------------------------------------------------------------
+# Pairwise interactions (Reports > Interactions)
+# ---------------------------------------------------------------------------
+def _on_state(night, iv_id):
+    """1 = confirmed on, 0 = assigned off (control), None = undetermined (not assigned
+    that night, or assigned on but never ticked -- dropped, same rule as elsewhere)."""
+    a = night["assigns"].get(iv_id)
+    if a is None:
+        return None
+    if (a["assigned"] or 0) > 0:
+        return 1 if (a["taken"] is not None and a["taken"] > 0) else None
+    return 0
+
+
+def _pair_nights(iv_a, iv_b, all_nights, metric, negate):
+    """Nights where BOTH interventions are determined (on or off) for this metric,
+    honoring each one's category exclusion. Shaped for bandit.pair_interaction."""
+    out = []
+    for n in all_nights:
+        val = n.get(metric)
+        if val is None:
+            continue
+        if n.get("excl_" + (iv_a.get("category") or "")) or n.get("excl_" + (iv_b.get("category") or "")):
+            continue
+        sa, sb = _on_state(n, iv_a["id"]), _on_state(n, iv_b["id"])
+        if sa is None or sb is None:
+            continue
+        out.append({"y": (-float(val) if negate else float(val)), "a": sa, "b": sb})
+    return out
+
+
+def interactions_payload(conn):
+    """Every pair of (non-archived) interventions that has shared at least one night
+    with both on, with its interaction read-out on HRV (primary) and resting HR.
+    Pairs that have never co-occurred are only counted."""
+    ivs = store.list_interventions(conn)
+    all_nights = store.analysis_nights(conn)
+    n_hrv = sum(1 for n in all_nights if n["hrv"] is not None)
+    pairs, no_overlap = [], 0
+    for i in range(len(ivs)):
+        for j in range(i + 1, len(ivs)):
+            a, b = ivs[i], ivs[j]
+            r_hrv = bandit.pair_interaction(_pair_nights(a, b, all_nights, "hrv", False))
+            r_lrhr = bandit.pair_interaction(_pair_nights(a, b, all_nights, "lrhr", True))
+            if not ((r_hrv and r_hrv["n_both"]) or (r_lrhr and r_lrhr["n_both"])):
+                no_overlap += 1
+                continue
+            brief = lambda iv: {"id": iv["id"], "name": iv["name"], "category": iv["category"],
+                                "kind": iv["kind"], "active": iv["active"]}
+            pairs.append({"a": brief(a), "b": brief(b), "hrv": r_hrv, "lrhr": r_lrhr})
+    return {"n_completed": n_hrv, "n_interventions": len(ivs), "pairs": pairs,
+            "n_pairs_no_overlap": no_overlap}
+
+
+# ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
@@ -345,6 +431,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(state_payload(conn))
             if path == "/api/reports":
                 return self._send_json(reports_payload(conn))
+            if path == "/api/interactions":
+                return self._send_json(interactions_payload(conn))
             if path == "/api/export":
                 return self._send_json({
                     "interventions": store.list_interventions(conn),
@@ -398,8 +486,12 @@ class Handler(BaseHTTPRequestHandler):
                     category=body.get("category", "supplement"),
                     dose_noun=body.get("dose_noun", ""),
                     explore_doses=body.get("explore_doses", True),
+                    delay_explore=body.get("delay_explore", True),
                     test_skip=body.get("test_skip", False),
                     prior_helps=body.get("prior_helps", 0) or 0,
+                    min_dose=body.get("min_dose"),
+                    max_dose=body.get("max_dose"),
+                    noun_amount=body.get("noun_amount"),
                 )
                 ensure_tonight(conn)
                 return self._send_json(state_payload(conn), 201)
@@ -454,14 +546,20 @@ class Handler(BaseHTTPRequestHandler):
                 iid = int(path.rsplit("/", 1)[-1])
                 fields = {k: body[k] for k in
                           ("name", "unit", "default_dose", "unit_dose", "dose_noun", "note",
-                           "active", "kind", "options", "category", "explore_doses", "test_skip",
-                           "prior_helps")
+                           "active", "kind", "options", "category", "explore_doses", "delay_explore",
+                           "test_skip",
+                           "prior_helps", "min_dose", "max_dose", "noun_amount")
                           if k in body}
                 if "dose_levels" in body:
                     fields["dose_levels"] = _clean_levels(body["dose_levels"])
+                before = store.get_intervention(conn, iid)
                 store.update_intervention(conn, iid, **fields)
                 # Pausing only stops FUTURE suggestions; a night that's already been
-                # planned is never changed, so we don't touch existing assignments.
+                # planned is never re-rolled. The one exception: if the standard dose
+                # or min/max bounds changed and tonight's ON cell is still pending,
+                # its dose follows the new settings so the plan can't show a stale or
+                # impossible dose.
+                reconcile_tonight_bounds(conn, iid, before)
                 ensure_tonight(conn)
                 return self._send_json(state_payload(conn))
         finally:

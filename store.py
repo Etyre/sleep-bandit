@@ -20,8 +20,12 @@ CREATE TABLE IF NOT EXISTS interventions (
     unit         TEXT NOT NULL DEFAULT '',
     default_dose REAL NOT NULL DEFAULT 1,       -- "standard dose": the starting point
     unit_dose    REAL NOT NULL DEFAULT 0,       -- smallest increment between doses
-    dose_noun    TEXT NOT NULL DEFAULT '',      -- countable name for one unit dose (e.g. "pill")
+    dose_noun    TEXT NOT NULL DEFAULT '',      -- countable name for doses (e.g. "pill")
+    noun_amount  REAL,                          -- amount (in `unit`) per one dose_noun; NULL = unit_dose
     explore_doses INTEGER NOT NULL DEFAULT 1,   -- 0 = only ever use the standard dose
+    delay_explore INTEGER NOT NULL DEFAULT 1,   -- 1 = hold the standard dose until enough on-nights to judge efficacy
+    min_dose     REAL,                          -- optional floor for explored doses (NULL = none)
+    max_dose     REAL,                          -- optional ceiling for explored doses (NULL = none)
     dose_levels  TEXT NOT NULL DEFAULT '[]',   -- JSON array of candidate ON doses
     active       INTEGER NOT NULL DEFAULT 1,
     note         TEXT NOT NULL DEFAULT '',
@@ -105,6 +109,16 @@ def connect():
         conn.execute("ALTER TABLE interventions ADD COLUMN dose_noun TEXT NOT NULL DEFAULT ''")
     if "explore_doses" not in cols:
         conn.execute("ALTER TABLE interventions ADD COLUMN explore_doses INTEGER NOT NULL DEFAULT 1")
+    if "delay_explore" not in cols:
+        # per-intervention: delay dose exploration until the warm-up has enough on-nights
+        conn.execute("ALTER TABLE interventions ADD COLUMN delay_explore INTEGER NOT NULL DEFAULT 1")
+    if "noun_amount" not in cols:
+        # how much of `unit` one dose_noun is (e.g. 50 mg per cap); NULL falls back to unit_dose
+        conn.execute("ALTER TABLE interventions ADD COLUMN noun_amount REAL")
+    if "min_dose" not in cols:
+        # optional bounds on dose exploration (NULL = unbounded on that side)
+        conn.execute("ALTER TABLE interventions ADD COLUMN min_dose REAL")
+        conn.execute("ALTER TABLE interventions ADD COLUMN max_dose REAL")
     if "archived" not in cols:
         # soft-delete flag: archived interventions are hidden but their data is kept
         conn.execute("ALTER TABLE interventions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
@@ -162,7 +176,11 @@ def _iv_to_dict(row):
         "default_dose": row["default_dose"],
         "unit_dose": row["unit_dose"],
         "dose_noun": row["dose_noun"],
+        "noun_amount": row["noun_amount"],
         "explore_doses": bool(row["explore_doses"]),
+        "delay_explore": bool(row["delay_explore"]),
+        "min_dose": row["min_dose"],
+        "max_dose": row["max_dose"],
         "dose_levels": json.loads(row["dose_levels"]),
         "active": bool(row["active"]),
         "note": row["note"],
@@ -188,10 +206,20 @@ def get_intervention(conn, iid):
     return _iv_to_dict(r) if r else None
 
 
-def dose_levels_from(standard, unit_dose, explore=True):
+def _opt_dose(v):
+    """Parse an optional dose bound: None/''/invalid/<=0 -> None."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def dose_levels_from(standard, unit_dose, explore=True, min_dose=None, max_dose=None):
     """Candidate doses to explore: the standard dose, plus/minus one unit-dose
-    step (dropping non-positive). If no unit dose is given, fall back to +/-50%.
-    When explore is False, the only candidate is the standard dose itself."""
+    step (dropping non-positive and anything outside the optional min/max bounds).
+    If no unit dose is given, fall back to +/-50%. When explore is False, the only
+    candidate is the standard dose itself."""
     s = float(standard)
     if not explore:
         return [int(s) if s.is_integer() else s]
@@ -202,7 +230,9 @@ def dose_levels_from(standard, unit_dose, explore=True):
         raw = {round(0.5 * s, 6), round(s, 6), round(1.5 * s, 6)}
     else:                       # on/off behaviour
         raw = {s}
-    tidy = sorted(x for x in raw if x > 0) or [s]
+    lo, hi = _opt_dose(min_dose), _opt_dose(max_dose)
+    tidy = sorted(x for x in raw if x > 0
+                  and (lo is None or x >= lo) and (hi is None or x <= hi)) or [s]
     return [int(x) if float(x).is_integer() else x for x in tidy]
 
 
@@ -260,9 +290,14 @@ def _clamp_prior(p):
 def create_intervention(conn, name, unit="", default_dose=1.0, unit_dose=0.0,
                         dose_levels=None, note="", kind="dose", options=None,
                         category="supplement", dose_noun="", explore_doses=True,
-                        test_skip=False, prior_helps=0.0):
+                        test_skip=False, prior_helps=0.0, min_dose=None, max_dose=None,
+                        noun_amount=None, delay_explore=True):
     kind = kind if kind in ("choice", "boolean") else "dose"
     explore_doses = bool(explore_doses)
+    delay_explore = bool(delay_explore)
+    min_dose, max_dose, noun_amount = _opt_dose(min_dose), _opt_dose(max_dose), _opt_dose(noun_amount)
+    if kind != "dose":
+        min_dose = max_dose = noun_amount = None
     category = _norm_category(category)
     if kind == "choice":
         options = _norm_choice_options(options)
@@ -276,15 +311,18 @@ def create_intervention(conn, name, unit="", default_dose=1.0, unit_dose=0.0,
     else:
         options = []
         if not dose_levels:
-            dose_levels = dose_levels_from(default_dose, unit_dose, explore_doses)
+            dose_levels = dose_levels_from(default_dose, unit_dose, explore_doses, min_dose, max_dose)
     ts = 1 if (kind == "choice" and test_skip) else 0
     cur = conn.execute(
         "INSERT INTO interventions (name, unit, default_dose, unit_dose, dose_noun, explore_doses, "
-        "dose_levels, active, note, kind, options, category, test_skip, prior_helps, created_at) "
-        "VALUES (?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)",
+        "delay_explore, min_dose, max_dose, noun_amount, dose_levels, active, note, kind, options, "
+        "category, test_skip, prior_helps, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)",
         (name.strip(), unit.strip(), float(default_dose), float(unit_dose or 0),
-         (dose_noun or "").strip(), 1 if explore_doses else 0, json.dumps(dose_levels),
-         note.strip(), kind, json.dumps(options), category, ts, _clamp_prior(prior_helps), _now()),
+         (dose_noun or "").strip(), 1 if explore_doses else 0, 1 if delay_explore else 0,
+         min_dose, max_dose, noun_amount,
+         json.dumps(dose_levels), note.strip(), kind, json.dumps(options), category, ts,
+         _clamp_prior(prior_helps), _now()),
     )
     _audit(conn, "create_intervention", intervention_id=cur.lastrowid,
            name=name.strip(), kind=kind, category=category)
@@ -323,6 +361,9 @@ def update_intervention(conn, iid, **fields):
         setcol("unit", "")
         setcol("default_dose", 1.0)
         setcol("dose_noun", "")
+        setcol("min_dose", None)
+        setcol("max_dose", None)
+        setcol("noun_amount", None)
         ts = fields["test_skip"] if fields.get("test_skip") is not None else iv.get("test_skip")
         setcol("test_skip", 1 if ts else 0)
     elif kind == "boolean":
@@ -332,6 +373,9 @@ def update_intervention(conn, iid, **fields):
         setcol("default_dose", 1.0)
         setcol("unit_dose", 0.0)
         setcol("dose_noun", "")
+        setcol("min_dose", None)
+        setcol("max_dose", None)
+        setcol("noun_amount", None)
         setcol("test_skip", 0)
     else:
         setcol("test_skip", 0)
@@ -345,12 +389,22 @@ def update_intervention(conn, iid, **fields):
         setcol("default_dose", std)
         setcol("unit_dose", udose)
         setcol("explore_doses", 1 if explore else 0)
+        delay = bool(fields["delay_explore"]) if fields.get("delay_explore") is not None \
+            else iv.get("delay_explore", True)
+        setcol("delay_explore", 1 if delay else 0)
         setcol("dose_noun", (fields["dose_noun"].strip() if fields.get("dose_noun") is not None
                              else (iv.get("dose_noun") or "")))
+        # bounds: an explicit null/blank clears them, absence keeps the old value
+        lo = _opt_dose(fields["min_dose"]) if "min_dose" in fields else _opt_dose(iv.get("min_dose"))
+        hi = _opt_dose(fields["max_dose"]) if "max_dose" in fields else _opt_dose(iv.get("max_dose"))
+        setcol("min_dose", lo)
+        setcol("max_dose", hi)
+        setcol("noun_amount", _opt_dose(fields["noun_amount"]) if "noun_amount" in fields
+               else _opt_dose(iv.get("noun_amount")))
         if fields.get("dose_levels") is not None:
             setcol("dose_levels", json.dumps(fields["dose_levels"]))
         else:
-            setcol("dose_levels", json.dumps(dose_levels_from(std, udose, explore)))
+            setcol("dose_levels", json.dumps(dose_levels_from(std, udose, explore, lo, hi)))
 
     vals.append(iid)
     conn.execute(f"UPDATE interventions SET {', '.join(cols)} WHERE id=?", vals)
