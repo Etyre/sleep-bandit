@@ -117,7 +117,7 @@
           </div>
           <label class="check-label"><input type="checkbox" name="test_skip"> Also test skipping <span class="tip" tabindex="0" data-tip="Occasionally suggests a “skip” control night (do none of these), so the report can show the average effect of doing any of these options versus nothing — on both HRV and resting HR."></span></label>
         </div>
-        <label>Prior probability it helps (%) <span class="tip" tabindex="0" data-tip="Your belief, before your own data, that this helps your HRV. 50% = no prior. Higher makes the scheduler try it more often early — it’s exactly the chance it’s scheduled before any nights are logged. Capped at 80% so it still gets enough OFF nights to measure. Scheduling only: it never changes the measured results and fades as real nights accumulate."></span>
+        <label id="prior-field">Prior probability it helps (%) <span class="tip" tabindex="0" data-tip="Your belief, before your own data, that this helps your HRV (for a multiple choice, that doing any of the options beats skipping). 50% = no prior. Higher makes the scheduler try it more often early — it’s exactly the chance it’s scheduled before any nights are logged. Capped at 80% so it still gets enough OFF nights to measure. Scheduling only: it never changes the measured results and fades as real nights accumulate."></span>
           <input name="prior_helps" type="number" min="1" max="80" step="1" value="50" inputmode="numeric">
         </label>
         <label>Note (optional)

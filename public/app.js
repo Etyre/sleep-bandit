@@ -1114,8 +1114,11 @@ function syncKind() {
   const k = $("#iv-kind").value;
   $("#dose-fields").hidden = k !== "dose";
   $("#choice-fields").hidden = k !== "choice";
+  // the prior drives the on/off draw; a multiple choice only has one if it also tests skipping
+  $("#prior-field").hidden = k === "choice" && !$("#iv-form").test_skip.checked;
 }
 $("#iv-kind").addEventListener("change", syncKind);
+$("#iv-form").test_skip.addEventListener("change", syncKind);
 // ⓘ tooltips: tap toggles (for touch), and a click inside a <label> must not focus its input
 $$(".tip").forEach((t) => t.addEventListener("click", (e) => {
   e.preventDefault(); e.stopPropagation();
