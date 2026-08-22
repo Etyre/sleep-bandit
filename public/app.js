@@ -58,6 +58,9 @@ function groupByCategory(list) {
 
 function pluralize(noun, n) {
   if (n === 1) return noun;
+  // only plain words pluralize ("pill" -> "pills"); unit-like symbols or
+  // abbreviations ("° c", "mg", "IU") are left alone
+  if (!/^[a-z][a-z -]*$/i.test(noun) || /^(mg|mcg|g|iu|ml|l|oz|kg|min|sec|hr|hrs)$/i.test(noun)) return noun;
   if (/[^aeiou]y$/i.test(noun)) return noun.slice(0, -1) + "ies";
   return noun + (/s$/i.test(noun) ? "" : "s");
 }
