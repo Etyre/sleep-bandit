@@ -99,6 +99,31 @@ WARMUP_ON_NIGHTS = 64
 PROBE_SHARE = 0.4
 TIME_MAX_JUMP = 4
 
+# FAST SWEEP: an intervention with delay_explore OFF *and* both a min and a max dose
+# has told us two things -- "explore from night one" and "every dose in this range is
+# fine to try" -- so the cautious one-rung-at-a-time climb (which also wants MIN_PROBES
+# readings per rung before moving) is the wrong tool: on a 30-degree thermostat it
+# would take months to leave the standard dose. Instead EVERY on-night is a Thompson
+# draw over the WHOLE [min, max] grid, so exploration is steered by what has worked:
+#   1. draw one posterior sample of the per-dose effects (the same draw that decided
+#      on/off), giving a sampled effect at each dose measured so far;
+#   2. the model treats doses as unrelated categories, so blend them across the grid
+#      with a Gaussian kernel (bandwidth FAST_KERNEL_STEPS unit doses) -- a rung
+#      inherits its neighbours' sampled effects, shrinking toward the plain "on"
+#      effect where there is no nearby data (pseudo-weight FAST_PRIOR_WEIGHT);
+#   3. each rung's own unknown deviation from that blend is then sampled too: a
+#      Gaussian with the model's prior sd for a per-dose deviation
+#      (sqrt(DOSE_DEV_PRIOR_VAR) x the sampled noise sd), shrunk by
+#      sqrt(1 + effective readings nearby) -- so an untried rung next to a good dose
+#      has a real chance of sampling highest, an untried rung next to a bad dose
+#      almost none, and the spread collapses as readings accrue;
+#   4. take the rung with the highest sampled value.
+# It's Thompson sampling over an approximate smooth dose-response, so it explores by
+# posterior probability of being best and exploits as the curve firms up. The on/off
+# decision is untouched. Everything else (unbounded, or delay on) keeps the slow climb.
+FAST_KERNEL_STEPS = 1.0
+FAST_PRIOR_WEIGHT = 0.25
+
 # Minimum viable dose: we recommend (and exploit) the SMALLEST dose whose estimated
 # effect is at least this fraction of the best measured dose's effect -- so a smaller
 # dose that reaches ~95% of the peak is preferred over a bigger one at the peak.
@@ -489,6 +514,56 @@ def _bounds(iv):
     return f(iv.get("min_dose")), f(iv.get("max_dose"))
 
 
+def _fast_grid(std, step, lo, hi, open_pos=None):
+    """Every rung of the [lo, hi] dose grid, laid out from the standard dose in
+    unit-dose steps (so the standard dose is always a rung), plus the open-arm rung
+    if there is one. Used by the fast sweep."""
+    rungs = set()
+    k = 0
+    while True:
+        up, down = _d(std + k * step), _d(std - k * step)
+        if up > hi and down < lo:
+            break
+        if lo <= up <= hi:
+            rungs.add(up)
+        if lo <= down <= hi and down > 0:
+            rungs.add(down)
+        k += 1
+        if k > 10000:                                    # degenerate step; give up
+            break
+    if open_pos is not None:
+        rungs.add(open_pos)
+    return sorted(rungs)
+
+
+def _fast_pick(grid, beta, entry, counts, real, step, noise_sd):
+    """The fast sweep's choice: one Thompson draw over the grid. Each rung's value is
+        smoothed sampled effect + N(0, dev_sd / sqrt(1 + n_eff)),
+    where the smoothed effect is a Gaussian-kernel blend (bandwidth FAST_KERNEL_STEPS
+    unit doses) of the SAMPLED effects at measured rungs, shrunk toward the sampled
+    plain "on" effect with pseudo-weight FAST_PRIOR_WEIGHT; dev_sd is the model's
+    prior sd for one dose's deviation (sqrt(DOSE_DEV_PRIOR_VAR) x noise sd); n_eff is
+    the kernel-weighted count of readings near the rung. Returns the rung with the
+    highest draw. counts/real: position -> readings / real dose (the open-arm rung's
+    real dose is the sentinel)."""
+    h = FAST_KERNEL_STEPS * step
+    alpha = beta[entry["on"]]
+    dev_sd = math.sqrt(DOSE_DEV_PRIOR_VAR) * noise_sd
+    measured = [(p, _effect(beta, entry, real[p]), counts[p]) for p in counts if counts[p] > 0]
+    best, best_val = None, None
+    for r in grid:
+        wsum, esum, n_eff = FAST_PRIOR_WEIGHT, FAST_PRIOR_WEIGHT * alpha, 0.0
+        for p, eff, n in measured:
+            w = math.exp(-0.5 * ((r - p) / h) ** 2) if h > 0 else (1.0 if r == p else 0.0)
+            wsum += w * n
+            esum += w * n * eff
+            n_eff += w * n
+        val = esum / wsum + random.gauss(0.0, dev_sd / math.sqrt(1.0 + n_eff))
+        if best_val is None or val > best_val:
+            best, best_val = r, val
+    return best
+
+
 def _in_bounds(d, lo, hi):
     return (lo is None or d >= lo) and (hi is None or d <= hi)
 
@@ -559,13 +634,16 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
          MIN_VIABLE_FRAC of the best measured effect) or, PROBE_SHARE of the time, probes
          to map the curve -- supplements one unit dose at a time, time-based in bigger
          jumps -- so the search can reach an optimum far from the standard.
+         FAST SWEEP: with delay_explore off AND both min and max bounds set, probing
+         instead draws from the whole bounded grid, near-uniformly, favouring the
+         least-measured rungs (FAST_PROBE_SHARE of on-nights) -- see the constant.
 
     Multiple-choice interventions skip stage 1 -- "off" is NOT an option and we take
     the best option even if all look weakly negative.
 
     measured: optional {iv_id: iterable of doses actually recorded} -- the points the
     curve is built from; n_on: optional {iv_id: compliant on-night count} for the ramp."""
-    beta, _ = sample_beta(post)
+    beta, sigma2 = sample_beta(post)
     n_on = n_on or {}
     measured = measured or {}
     plan = {}
@@ -660,6 +738,16 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
                 center = mv
 
         n_open = counts.get(open_pos, 0) if open_ok else 0
+        fast = (not iv.get("delay_explore", True)) and lo is not None and hi is not None
+        if fast:
+            # FAST SWEEP (delay off + bounded range): Thompson draw over the whole grid,
+            # smoothed across neighbouring rungs, with an optimism bonus where data is
+            # thin -- see FAST_* above.
+            grid = _fast_grid(std, step, lo, hi, open_pos)
+            dose = _fast_pick(grid, beta, entry, counts, real, step, math.sqrt(sigma2)) if grid else std
+            dose = unpos(dose) if dose and dose > 0 else 0.0
+            plan[iv["id"]] = dose if dose and dose > 0 else 0.0
+            continue
         if random.random() < PROBE_SHARE:                # explore: map the curve
             if open_ok and n_open < MIN_PROBES and random.random() < OPEN_ARM_PROBE_SHARE:
                 dose = open_pos                          # give the open arm its first readings
