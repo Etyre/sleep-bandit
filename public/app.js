@@ -175,7 +175,15 @@ function renderGrid() {
           body += `<td class="cell active${c.done ? " done" : ""}${todayCls}${exCls}" data-date="${n.date}" data-iv="${iv.id}">` +
             `<span class="dose">${label}</span><span class="check">✓</span></td>`;
         } else {
-          body += `<td class="cell off${todayCls}${exCls}">–</td>`;
+          // OFF (control) cell. Clicking it marks the rare "did it anyway" night:
+          // that one cell is excluded from this intervention's results (it's not a
+          // valid control), without touching the frozen assignment record.
+          const cex = !!c.excluded;
+          body += `<td class="cell off togglable${cex ? " cell-excl" : ""}${todayCls}${exCls}" ` +
+            `data-date="${n.date}" data-iv="${iv.id}" ` +
+            `title="${cex ? "Did it despite assigned off — excluded from this intervention's results. Click to count it as a control again."
+                          : "Assigned off (control night). Click if you did it anyway, to exclude this cell from this intervention's results."}">` +
+            `${cex ? "✗" : "–"}</td>`;
         }
       }
       body += `</tr>`;
@@ -219,6 +227,7 @@ function renderGrid() {
   table.innerHTML = head + body;
 
   $$(".cell.active", table).forEach((td) => td.addEventListener("click", () => toggleCell(td)));
+  $$(".cell.off.togglable", table).forEach((td) => td.addEventListener("click", () => toggleCellExclusion(td)));
   $$(".hrvcell input", table).forEach((inp) => inp.addEventListener("change", () => saveMetric(inp)));
   $$(".notecell textarea", table).forEach((t) => t.addEventListener("change", () => saveNote(t)));
   $$(".excl-btn", table).forEach((b) => b.addEventListener("click", () => toggleExclusion(b)));
@@ -238,6 +247,20 @@ async function toggleExclusion(btn) {
   GRID_SCROLL = wrap ? wrap.scrollLeft : null;   // stay where we are across the re-render
   try {
     STATE = await post("/api/exclude", { date, category: cat, excluded });
+    renderGrid();
+  } catch (e) {
+    alert("Could not update exclusion: " + e.message);
+  }
+}
+
+async function toggleCellExclusion(td) {
+  const cell = (STATE.cells[td.dataset.date] || {})[td.dataset.iv];
+  const excluded = !(cell && cell.excluded);
+  const wrap = $(".grid-wrap");
+  GRID_SCROLL = wrap ? wrap.scrollLeft : null;   // keep our place across the re-render
+  try {
+    STATE = await post("/api/exclude_cell",
+      { date: td.dataset.date, intervention_id: td.dataset.iv, excluded });
     renderGrid();
   } catch (e) {
     alert("Could not update exclusion: " + e.message);

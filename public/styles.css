@@ -159,6 +159,10 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 /* intervention cells */
 .cell { text-align: center; padding: 6px 4px; height: 46px; vertical-align: middle; }
 .cell.off { color: #454c6b; }
+.cell.off.togglable { cursor: pointer; }
+.cell.off.togglable:hover { background: rgba(124,156,255,.10); color: var(--muted); }
+/* single-cell exclusion: "did it anyway" — this cell no longer counts for its intervention */
+.cell.off.cell-excl { color: var(--bad); opacity: .8; font-weight: 700; }
 .cell.na { background: repeating-linear-gradient(45deg, transparent, transparent 6px, rgba(255,255,255,.015) 6px, rgba(255,255,255,.015) 12px); }
 .cell.active {
   cursor: pointer; background: rgba(124,156,255,.09); transition: background .12s;

@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS assignments (
     intervention_id INTEGER NOT NULL,
     assigned_dose   REAL NOT NULL,             -- 0 = "off" (skip tonight)
     taken_dose      REAL,                      -- what you actually did; NULL until recorded
+    excluded        INTEGER NOT NULL DEFAULT 0,-- drop THIS cell from analysis (e.g. did it despite OFF)
     PRIMARY KEY (night_date, intervention_id)
 );
 CREATE TABLE IF NOT EXISTS settings (
@@ -167,6 +168,13 @@ def connect():
         # two lower). lrhr stays on the 5-minute basis so the series is consistent;
         # the 30-second reading is kept alongside for the record/export.
         conn.execute("ALTER TABLE nights ADD COLUMN lrhr_30s REAL")
+    acols = {r["name"] for r in conn.execute("PRAGMA table_info(assignments)")}
+    if "excluded" not in acols:
+        # per-cell exclusion: this ONE (night, intervention) pair stops counting as on
+        # OR off -- for the rare night the intervention was assigned OFF but was done
+        # anyway (no longer a valid control), or the cell's data is otherwise invalid.
+        # Reversible and audit-logged; the frozen assignment record is never touched.
+        conn.execute("ALTER TABLE assignments ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 
@@ -673,6 +681,25 @@ def set_exclusion(conn, d, category, excluded):
     conn.commit()
 
 
+def set_cell_exclusion(conn, d, iid, excluded):
+    """Exclude (or re-include) ONE intervention's cell for a night, so that night stops
+    counting as on OR off for that intervention only. The rare case this exists for:
+    the intervention was assigned OFF but you did it anyway, so the night is not a
+    valid control for it. Like the category-level exclusion, it's a reversible,
+    audit-logged flag -- the frozen assignment record (assigned/taken) is untouched."""
+    row = conn.execute(
+        "SELECT excluded FROM assignments WHERE night_date=? AND intervention_id=?",
+        (d, iid)).fetchone()
+    if not row:
+        return
+    conn.execute(
+        "UPDATE assignments SET excluded=? WHERE night_date=? AND intervention_id=?",
+        (1 if excluded else 0, d, iid))
+    _audit(conn, "set_cell_exclusion", d, iid,
+           excluded=bool(excluded), was=bool(row["excluded"]))
+    conn.commit()
+
+
 def completed_nights(conn):
     """All recorded nights, shaped for the bandit engine."""
     rows = conn.execute(
@@ -714,9 +741,11 @@ def analysis_nights(conn):
     for r in rows:
         assigns = {}
         for a in conn.execute(
-                "SELECT intervention_id, assigned_dose, taken_dose FROM assignments "
+                "SELECT intervention_id, assigned_dose, taken_dose, excluded FROM assignments "
                 "WHERE night_date=?", (r["date"],)):
-            assigns[a["intervention_id"]] = {"assigned": a["assigned_dose"], "taken": a["taken_dose"]}
+            assigns[a["intervention_id"]] = {"assigned": a["assigned_dose"],
+                                             "taken": a["taken_dose"],
+                                             "excluded": bool(a["excluded"])}
         out.append({"date": r["date"], "hrv": r["hrv"], "lrhr": r["lrhr"], "eff": r["eff"],
                     "excl_behavioral": bool(r["excl_behavioral"]),
                     "excl_supplement": bool(r["excl_supplement"]), "assigns": assigns})

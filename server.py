@@ -57,7 +57,9 @@ def intervention_nights(iv_id, all_nights, metric, negate=False, category=None):
     negate so the engine's higher-is-better logic still applies).
 
     category: when given ('behavioral'|'supplement'), nights the user flagged as
-    excluded for that category are dropped entirely (neither on nor off)."""
+    excluded for that category are dropped entirely (neither on nor off). A cell the
+    user excluded individually (e.g. assigned OFF but done anyway) is likewise
+    dropped -- for this intervention only."""
     nights, n_on, n_off = [], 0, 0
     for n in all_nights:
         if category and n.get("excl_" + category):   # user excluded this night's data
@@ -67,6 +69,8 @@ def intervention_nights(iv_id, all_nights, metric, negate=False, category=None):
             continue
         a = n["assigns"].get(iv_id)
         if a is None:
+            continue
+        if a.get("excluded"):   # cell flagged invalid (e.g. done despite assigned OFF)
             continue
         assigned = a["assigned"] or 0
         taken = a["taken"]
@@ -184,6 +188,7 @@ def state_payload(conn):
             cmap[a["intervention_id"]] = {
                 "assigned_dose": assigned,
                 "done": taken is not None and taken > 0 and assigned > 0,
+                "excluded": bool(a["excluded"]),
             }
         cells[n["date"]] = cmap
 
@@ -327,7 +332,7 @@ def _on_state(night, iv_id):
     """1 = confirmed on, 0 = assigned off (control), None = undetermined (not assigned
     that night, or assigned on but never ticked -- dropped, same rule as elsewhere)."""
     a = night["assigns"].get(iv_id)
-    if a is None:
+    if a is None or a.get("excluded"):
         return None
     if (a["assigned"] or 0) > 0:
         return 1 if (a["taken"] is not None and a["taken"] > 0) else None
@@ -521,6 +526,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/exclude":
                 store.set_exclusion(conn, body["date"], body.get("category", ""),
                                     bool(body.get("excluded")))
+                return self._send_json(state_payload(conn))
+
+            if path == "/api/exclude_cell":
+                store.set_cell_exclusion(conn, body["date"],
+                                         int(body["intervention_id"]),
+                                         bool(body.get("excluded")))
                 return self._send_json(state_payload(conn))
 
             if path == "/api/oura/config":
