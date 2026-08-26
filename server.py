@@ -102,8 +102,8 @@ def ensure_tonight(conn):
     if missing:
         all_nights = store.analysis_nights(conn)
         for iv in missing:
-            nights, n_on, _ = intervention_nights(iv["id"], all_nights, "hrv",
-                                                  category=iv.get("category"))
+            nights, n_on, n_off = intervention_nights(iv["id"], all_nights, "hrv",
+                                                      category=iv.get("category"))
             # doses actually recorded so far (with repeats) -- the points the dose-
             # response curve and the hill-climb are built from.
             seen = [n["taken"][iv["id"]] for n in nights if n["taken"].get(iv["id"], 0) > 0]
@@ -113,7 +113,8 @@ def ensure_tonight(conn):
             pm = bandit.prior_mean_for_prob(iv.get("prior_helps") or 0)
             model = bandit.fit_model([iv], nights, priors=({iv["id"]: pm} if pm else None))
             plan = bandit.plan_night(model["post"], model["cols"], [iv],
-                                     n_on={iv["id"]: n_on}, measured={iv["id"]: seen})
+                                     n_on={iv["id"]: n_on}, n_off={iv["id"]: n_off},
+                                     measured={iv["id"]: seen})
             store.set_assignment(conn, d, iv["id"], plan.get(iv["id"], 0.0))
     return store.get_night(conn, d)
 
@@ -230,18 +231,33 @@ def _readout(iv, all_nights, metric, negate):
 
 
 def _p_scheduled(iv, all_nights):
+    """Scheduling probability actually used (clamped). See _sched_info."""
+    return _sched_info(iv, all_nights)["p_scheduled"]
+
+
+def _sched_info(iv, all_nights):
     """Probability tonight's planner assigns this intervention ON. The on/off draw takes
     it iff a sampled 'does it help' effect > 0, so this is P(alpha > 0) under the
     PRIOR-INCLUSIVE posterior on the HRV nights (scheduling uses the prior). With no
     prior it equals the measured P(helps); with a prior it starts higher and asymptotes
     to the measured value as nights accumulate. A choice with no 'skip' arm is always
-    scheduled. Kept SEPARATE from the efficacy read-outs, which stay prior-free."""
+    scheduled. Kept SEPARATE from the efficacy read-outs, which stay prior-free.
+    While the smaller arm is thin the value is clamped by tier (bandit.LOCKIN_TIERS:
+    <15 nights -> [10%, 90%], <30 -> [5%, 95%]), exactly as the planner does.
+    Returns {p_scheduled (clamped), p_scheduled_raw, sched_cap (the tier's cap if the
+    clamp changed the value, else None), sched_n_on, sched_n_off}."""
     if iv.get("kind") == "choice" and not iv.get("test_skip"):
-        return 1.0
-    nights, _, _ = intervention_nights(iv["id"], all_nights, "hrv", category=iv.get("category"))
+        return {"p_scheduled": 1.0, "p_scheduled_raw": 1.0, "sched_cap": None,
+                "sched_n_on": None, "sched_n_off": None}
+    nights, n_on, n_off = intervention_nights(iv["id"], all_nights, "hrv", category=iv.get("category"))
     pm = bandit.prior_mean_for_prob(iv.get("prior_helps") or 0)
     res = bandit.analyze([iv], nights, priors=({iv["id"]: pm} if pm else None))
-    return res["readouts"].get(iv["id"], {}).get("p_helps")
+    raw = res["readouts"].get(iv["id"], {}).get("p_helps")
+    p = bandit.clamp_p_on(raw, n_on, n_off)
+    capped = raw is not None and p != raw
+    return {"p_scheduled": p, "p_scheduled_raw": raw,
+            "sched_cap": bandit.lockin_cap(n_on, n_off) if capped else None,
+            "sched_n_on": n_on, "sched_n_off": n_off}
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +335,7 @@ def reports_payload(conn):
             "readout": _readout(iv, all_nights, "hrv", negate=False),
             "readout_lrhr": _readout(iv, all_nights, "lrhr", negate=True),
             "readout_eff": _readout(iv, all_nights, "eff", negate=False),
-            "p_scheduled": _p_scheduled(iv, all_nights),
+            **_sched_info(iv, all_nights),
         })
     return {"n_completed": n_hrv, "interventions": out,
             "hrv_trend": hrv_trend_payload(conn)}

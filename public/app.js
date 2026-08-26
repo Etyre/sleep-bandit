@@ -386,7 +386,20 @@ function reportCard(iv) {
   if (!iv.active) {
     card.appendChild(el("p", "iv-sched muted", "🗓 Paused — not currently scheduled."));
   } else if (iv.p_scheduled != null) {
-    card.appendChild(el("p", "iv-sched", `🗓 <b>Scheduling tomorrow night: ${pct(iv.p_scheduled)}</b>`));
+    // Early lock-in guard: while the smaller arm is thin the planner clamps this
+    // probability (<15 nights: 10–90%, <30: 5–95%). Say so when it actually bit.
+    let capNote = "";
+    if (iv.sched_cap != null) {
+      const arm = iv.sched_n_on <= iv.sched_n_off ? `${iv.sched_n_on} on-night${iv.sched_n_on === 1 ? "" : "s"}`
+                                                  : `${iv.sched_n_off} off-night${iv.sched_n_off === 1 ? "" : "s"}`;
+      const hi = iv.p_scheduled_raw > 0.5;
+      const bound = hi ? pct(iv.sched_cap) : pct(1 - iv.sched_cap);
+      capNote = ` <span class="sched-cap" title="Measured chance is ${pct(iv.p_scheduled_raw)}, but with only ${arm} so far ` +
+        `the planner ${hi ? "caps" : "floors"} scheduling at ${bound} so a few noisy early nights can't lock the decision in. ` +
+        `The limit is ${pct(iv.sched_cap)} / ${pct(1 - iv.sched_cap)} until the smaller arm has 15 nights, then 95% / 5% until it has 30.">` +
+        `${hi ? "capped" : "floored"} at ${bound} · ${arm}</span>`;
+    }
+    card.appendChild(el("p", "iv-sched", `🗓 <b>Scheduling tomorrow night: ${pct(iv.p_scheduled)}</b>${capNote}`));
   }
 
   const lObs = (iv.readout_lrhr?.n_on || 0) + (iv.readout_lrhr?.n_off || 0);

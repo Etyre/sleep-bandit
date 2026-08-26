@@ -124,6 +124,18 @@ TIME_MAX_JUMP = 4
 FAST_KERNEL_STEPS = 1.0
 FAST_PRIOR_WEIGHT = 0.25
 
+# Early lock-in guard for the on/off decision. Thompson sampling schedules an
+# intervention ON with probability P(it helps); a few noisy early nights can push
+# that near 1 (or near 0) and the intervention then gets (almost) always the same
+# arm -- so the contrast that would correct the estimate stops being collected.
+# The clamp is TIERED on the SMALLER arm's compliant-night count: under 15 nights the
+# scheduling probability is held within [10%, 90%]; under 30, within [5%, 95%]; from
+# 30 up it is unclamped. Between the bounds the decision is the ordinary Thompson
+# draw; the clamp only bites at the extremes. The efficacy read-outs are not
+# affected -- this is scheduling only.
+LOCKIN_TIERS = ((15, 0.90), (30, 0.95))   # (smaller arm has fewer than N nights, cap)
+LOCKIN_P_SAMPLES = 400     # posterior draws used to estimate P(helps) for the clamp
+
 # Minimum viable dose: we recommend (and exploit) the SMALLEST dose whose estimated
 # effect is at least this fraction of the best measured dose's effect -- so a smaller
 # dose that reaches ~95% of the peak is preferred over a bigger one at the peak.
@@ -465,6 +477,55 @@ def sample_beta(post):
     return beta, sigma2
 
 
+def lockin_cap(n_on, n_off):
+    """The scheduling-probability cap in force for these arm sizes (LOCKIN_TIERS,
+    keyed on the smaller arm), or None once both arms are big enough."""
+    smaller = min(n_on or 0, n_off or 0)
+    for min_nights, cap in LOCKIN_TIERS:
+        if smaller < min_nights:
+            return cap
+    return None
+
+
+def lockin_active(n_on, n_off):
+    """True while the early lock-in guard applies."""
+    return lockin_cap(n_on, n_off) is not None
+
+
+def clamp_p_on(p, n_on, n_off):
+    """The scheduling probability actually used: p clamped to [1 - cap, cap] for the
+    tier in force, else p itself."""
+    cap = lockin_cap(n_on, n_off)
+    if p is None or cap is None:
+        return p
+    return min(max(p, 1.0 - cap), cap)
+
+
+def p_on_estimate(post, on_col, samples=LOCKIN_P_SAMPLES):
+    """Monte-Carlo P(alpha > 0) for one intervention's 'on' column."""
+    hits = 0
+    for _ in range(samples):
+        b, _ = sample_beta(post)
+        if b[on_col] > 0.0:
+            hits += 1
+    return hits / float(samples)
+
+
+def _decide_on(beta, post, entry, n_on, n_off):
+    """Stage 1 of planning: is the intervention ON tonight? The ordinary Thompson
+    rule is 'on iff the sampled alpha > 0'. While the lock-in guard applies, P(on) is
+    estimated and, if it lies outside the tier's [1 - cap, cap], the decision is a
+    coin at the clamped probability instead; inside the bounds the sample decides."""
+    on = beta[entry["on"]] > 0.0
+    if not lockin_active(n_on, n_off):
+        return on
+    p = p_on_estimate(post, entry["on"])
+    pc = clamp_p_on(p, n_on, n_off)
+    if pc != p:                                   # clamp bites: override the sample
+        return random.random() < pc
+    return on
+
+
 def _effect(beta, entry, dose):
     """effect(i, d) = alpha_i + delta_{i,d} from a sampled beta vector, where the
     deviation is the orthonormal-contrast reconstruction (0 if the intervention
@@ -617,7 +678,7 @@ def _supp_probe(seen, counts, effs, best, std, step, lo=None, hi=None):
     return random.choice(targets) if targets else std
 
 
-def plan_night(post, cols, active_interventions, n_on=None, measured=None):
+def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off=None):
     """Draw ONE posterior sample (Thompson sampling) and, per intervention, decide
     tonight's arm in TWO independent stages:
 
@@ -642,9 +703,11 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
     the best option even if all look weakly negative.
 
     measured: optional {iv_id: iterable of doses actually recorded} -- the points the
-    curve is built from; n_on: optional {iv_id: compliant on-night count} for the ramp."""
+    curve is built from; n_on / n_off: optional {iv_id: compliant on-/off-night count}
+    for the warm-up ramp and the early lock-in guard (LOCKIN_*)."""
     beta, sigma2 = sample_beta(post)
     n_on = n_on or {}
+    n_off = n_off or {}
     measured = measured or {}
     plan = {}
     for iv in active_interventions:
@@ -658,15 +721,17 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None):
             # "skip" option, run stage 1 first: skip when a sampled alpha <= 0, which
             # sprinkles in control nights so the average effect of doing ANY option vs
             # nothing becomes measurable.
-            if iv.get("test_skip") and beta[entry["on"]] <= 0.0:
+            if iv.get("test_skip") and not _decide_on(beta, post, entry,
+                                                      n_on.get(iv["id"], 0), n_off.get(iv["id"], 0)):
                 plan[iv["id"]] = 0.0
                 continue
             best_dose, _ = _best_dose(beta, entry, iv["dose_levels"])
             plan[iv["id"]] = best_dose if best_dose is not None else 0.0
             continue
 
-        # Stage 1: on/off from the "does it help at all" effect alone (unbiased).
-        if beta[entry["on"]] <= 0.0:
+        # Stage 1: on/off from the "does it help at all" effect alone (unbiased),
+        # with the early lock-in guard clamping the extremes while data is thin.
+        if not _decide_on(beta, post, entry, n_on.get(iv["id"], 0), n_off.get(iv["id"], 0)):
             plan[iv["id"]] = 0.0
             continue
 

@@ -124,6 +124,16 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .iv-sched { font-size: 12.5px; color: var(--muted); margin: 2px 0 8px; }
 .iv-sched b { color: var(--accent); font-weight: 700; }
 .iv-sched.muted b { color: var(--muted); }
+/* lock-in guard marker: the scheduling probability shown was clamped. Deliberately
+   NOT a filled pill (the verdict badges are), so it can't be mistaken for one:
+   unfilled, dashed, square-cornered, cool-toned, with a lock icon. */
+.iv-sched .sched-cap {
+  display: inline-block; margin-left: 8px; padding: 0 6px; border-radius: 3px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--muted); background: transparent; border: 1px dashed rgba(154,162,192,.55);
+  cursor: help; vertical-align: 1px;
+}
+.iv-sched .sched-cap::before { content: "🔒"; font-size: 10px; margin-right: 4px; }
 
 /* outcome metric rows (HRV, resting HR) */
 .outcomes-row th.group-lab { color: var(--warn); }
