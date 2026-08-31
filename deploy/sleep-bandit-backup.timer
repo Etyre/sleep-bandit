@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the Sleep Bandit DB backup daily
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

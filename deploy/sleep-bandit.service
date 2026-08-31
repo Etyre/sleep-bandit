@@ -1,0 +1,24 @@
+# systemd unit for the hosted Sleep Bandit. Installed by deploy/setup.sh.
+[Unit]
+Description=Sleep Bandit (hosted)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sleepbandit
+Group=sleepbandit
+WorkingDirectory=/opt/sleep-bandit
+EnvironmentFile=/etc/sleep-bandit.env
+ExecStart=/usr/bin/python3 /opt/sleep-bandit/server.py
+Restart=always
+RestartSec=5
+# hardening: the app only needs its own directory (for the SQLite DB) and the network
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sleep-bandit/data /opt/sleep-bandit/backups
+
+[Install]
+WantedBy=multi-user.target

@@ -16,18 +16,40 @@ import math
 import os
 import secrets
 import statistics
+import threading
+import time
+import traceback
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+import auth
 import bandit
 import oura
 import store
 
-HOST = "127.0.0.1"
-PORT = 8777
+HOST = os.environ.get("SB_HOST", "127.0.0.1")
+PORT = int(os.environ.get("SB_PORT", "8777"))
 PUBLIC_DIR = os.path.join(os.path.dirname(__file__), "public")
 GRID_NIGHTS = 21          # how many night-columns to show (newest first)
+
+# ---------------------------------------------------------------------------
+# Hosted ("public") mode -- see deploy/README.md. Off by default: on your own
+# machine everything is read/write with no login, exactly as before.
+#   SB_PUBLIC=1            the root is a READ-ONLY view (no notes, no writes)
+#   SB_ADMIN_PATH=...      the unlinked path that asks for the password and then
+#                          gives full read/write (default "admin")
+#   SB_PASSWORD_HASH=...   from `python3 auth.py`
+#   SB_BASE_URL=https://.. the public URL (Oura's redirect goes back here)
+#   SB_AUTOSYNC=1          plan tonight + Oura-sync in the background (default on
+#                          when hosted, off locally where opening the app does it)
+# ---------------------------------------------------------------------------
+PUBLIC_MODE = os.environ.get("SB_PUBLIC", "") == "1"
+ADMIN_PATH = "/" + os.environ.get("SB_ADMIN_PATH", "admin").strip("/")
+BASE_URL = os.environ.get("SB_BASE_URL", "").rstrip("/") or None
+PASSWORD_HASH = os.environ.get("SB_PASSWORD_HASH", "")
+AUTOSYNC = os.environ.get("SB_AUTOSYNC", "1" if PUBLIC_MODE else "0") == "1"
+AUTOSYNC_MINUTES = 20
 
 # A "night" rolls over at 4 AM, not midnight. A routine done in the small hours
 # (any time before 4 AM) belongs to the PREVIOUS evening's night -- that's how the
@@ -56,7 +78,7 @@ def intervention_nights(iv_id, all_nights, metric, negate=False, category=None):
     Returns (nights, n_on, n_off). For LRHR pass negate=True (lower is better ->
     negate so the engine's higher-is-better logic still applies).
 
-    category: when given ('behavioral'|'supplement'), nights the user flagged as
+    category: when given (one of store.CATEGORIES), nights the user flagged as
     excluded for that category are dropped entirely (neither on nor off). A cell the
     user excluded individually (e.g. assigned OFF but done anyway) is likewise
     dropped -- for this intervention only."""
@@ -110,8 +132,8 @@ def ensure_tonight(conn):
             # Scheduling uses the intervention's prior (if any): a believed-helpful
             # intervention is more likely to be assigned ON while data is thin. The
             # stored prior is a PROBABILITY; convert it to a prior mean on the effect.
-            pm = bandit.prior_mean_for_prob(iv.get("prior_helps") or 0)
-            model = bandit.fit_model([iv], nights, priors=({iv["id"]: pm} if pm else None))
+            pri = bandit.scheduling_priors(iv)
+            model = bandit.fit_model([iv], nights, priors=({iv["id"]: pri} if pri else None))
             plan = bandit.plan_night(model["post"], model["cols"], [iv],
                                      n_on={iv["id"]: n_on}, n_off={iv["id"]: n_off},
                                      measured={iv["id"]: seen})
@@ -160,6 +182,18 @@ def reconcile_tonight_bounds(conn, iid, before=None):
 # ---------------------------------------------------------------------------
 # Grid-shaped state
 # ---------------------------------------------------------------------------
+def public_scrub(payload):
+    """What the read-only public view must not show: the written notes (per night
+    and per intervention). Everything else is shown as-is."""
+    for n in payload.get("nights", []) or []:
+        if "note" in n:
+            n["note"] = ""
+    for iv in payload.get("interventions", []) or []:
+        if "note" in iv:
+            iv["note"] = ""
+    return payload
+
+
 def state_payload(conn):
     ensure_tonight(conn)
     d_today = today_str()
@@ -172,14 +206,19 @@ def state_payload(conn):
             "date": n["date"],
             "hrv": n["hrv"],
             "lrhr": n["lrhr"],
+            "tst": n["tst"],
+            "lat": n["lat"],
             "eff": n["eff"],
             "hrv_src": n["hrv_src"],
             "lrhr_src": n["lrhr_src"],
+            "tst_src": n["tst_src"],
+            "lat_src": n["lat_src"],
             "eff_src": n["eff_src"],
             "status": n["status"],
             "note": n["note"],
             "excl_behavioral": bool(n["excl_behavioral"]),
             "excl_supplement": bool(n["excl_supplement"]),
+            "excl_environmental": bool(n["excl_environmental"]),
             "is_today": n["date"] == d_today,
         })
         cmap = {}
@@ -190,6 +229,7 @@ def state_payload(conn):
                 "assigned_dose": assigned,
                 "done": taken is not None and taken > 0 and assigned > 0,
                 "excluded": bool(a["excluded"]),
+                "input_value": a["input_value"],
             }
         cells[n["date"]] = cmap
 
@@ -243,20 +283,27 @@ def _sched_info(iv, all_nights):
     to the measured value as nights accumulate. A choice with no 'skip' arm is always
     scheduled. Kept SEPARATE from the efficacy read-outs, which stay prior-free.
     While the smaller arm is thin the value is clamped by tier (bandit.LOCKIN_TIERS:
-    <15 nights -> [10%, 90%], <30 -> [5%, 95%]), exactly as the planner does.
+    <15 nights -> [10%, 90%], <30 -> [5%, 95%]), exactly as the planner does -- unless
+    the intervention's no_lockin override is set, in which case the raw value is used.
     Returns {p_scheduled (clamped), p_scheduled_raw, sched_cap (the tier's cap if the
-    clamp changed the value, else None), sched_n_on, sched_n_off}."""
-    if iv.get("kind") == "choice" and not iv.get("test_skip"):
+    clamp changed the value, else None), sched_tier (the tier cap in force for these
+    arm sizes whether or not it bit -- None once both arms are big enough),
+    sched_n_on, sched_n_off}."""
+    if iv.get("kind") in ("choice", "choice_dose") and not iv.get("test_skip"):
         return {"p_scheduled": 1.0, "p_scheduled_raw": 1.0, "sched_cap": None,
-                "sched_n_on": None, "sched_n_off": None}
+                "sched_tier": None, "sched_n_on": None, "sched_n_off": None}
     nights, n_on, n_off = intervention_nights(iv["id"], all_nights, "hrv", category=iv.get("category"))
-    pm = bandit.prior_mean_for_prob(iv.get("prior_helps") or 0)
-    res = bandit.analyze([iv], nights, priors=({iv["id"]: pm} if pm else None))
+    pri = bandit.scheduling_priors(iv)
+    res = bandit.analyze([iv], nights, priors=({iv["id"]: pri} if pri else None))
     raw = res["readouts"].get(iv["id"], {}).get("p_helps")
-    p = bandit.clamp_p_on(raw, n_on, n_off)
-    capped = raw is not None and p != raw
+    tier = bandit.lockin_cap(n_on, n_off)
+    if iv.get("no_lockin"):
+        p, capped = raw, False
+    else:
+        p = bandit.clamp_p_on(raw, n_on, n_off)
+        capped = raw is not None and p != raw
     return {"p_scheduled": p, "p_scheduled_raw": raw,
-            "sched_cap": bandit.lockin_cap(n_on, n_off) if capped else None,
+            "sched_cap": tier if capped else None, "sched_tier": tier,
             "sched_n_on": n_on, "sched_n_off": n_off}
 
 
@@ -334,6 +381,8 @@ def reports_payload(conn):
             **iv,
             "readout": _readout(iv, all_nights, "hrv", negate=False),
             "readout_lrhr": _readout(iv, all_nights, "lrhr", negate=True),
+            "readout_tst": _readout(iv, all_nights, "tst", negate=False),
+            "readout_lat": _readout(iv, all_nights, "lat", negate=True),
             "readout_eff": _readout(iv, all_nights, "eff", negate=False),
             **_sched_info(iv, all_nights),
         })
@@ -440,11 +489,66 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    # ---- hosted-mode helpers -------------------------------------------------
+    def _client_ip(self):
+        # behind the reverse proxy (Caddy) the real client is in X-Forwarded-For
+        xff = self.headers.get("X-Forwarded-For", "")
+        return (xff.split(",")[0].strip() if xff else self.client_address[0])
+
+    def _session_ok(self):
+        if not PUBLIC_MODE:
+            return True
+        tok = auth.cookie_from_header(self.headers.get("Cookie"))
+        if not tok:
+            return False
+        conn = store.connect()
+        try:
+            return auth.check_token(auth.session_secret(conn), tok)
+        finally:
+            conn.close()
+
+    def _can_write(self):
+        return (not PUBLIC_MODE) or self._session_ok()
+
+    def _forbid(self):
+        return self._send_json({"error": "read-only"}, 403)
+
+    def _send_page(self, mode):
+        """index.html with the runtime config injected: mode is 'local' (your own
+        machine), 'public' (read-only), 'login' (admin path, not signed in) or 'admin'."""
+        try:
+            with open(os.path.join(PUBLIC_DIR, "index.html"), "rb") as f:
+                html = f.read().decode("utf-8")
+        except FileNotFoundError:
+            return self.send_error(404)
+        base = (ADMIN_PATH if mode in ("login", "admin") else "/")
+        cfg = {"mode": mode, "base": base, "hosted": PUBLIC_MODE,
+               "redirect_uri": oura.redirect_uri(PORT, BASE_URL)}
+        html = html.replace("<!--SB_CONFIG-->", "<script>window.SB=" + json.dumps(cfg) + "</script>")
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _set_session_cookie(self, token, clear=False):
+        secure = "; Secure" if (BASE_URL or "").startswith("https") else ""
+        if clear:
+            val = f"{auth.COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}"
+        else:
+            val = (f"{auth.COOKIE_NAME}={token}; Path=/; Max-Age={auth.SESSION_DAYS * 86400}; "
+                   f"HttpOnly; SameSite=Strict{secure}")
+        self.send_header("Set-Cookie", val)
+
     def do_GET(self):
         path = urlparse(self.path).path
+        if path in ("/", "/index.html"):
+            return self._send_page("public" if PUBLIC_MODE else "local")
+        if PUBLIC_MODE and path == ADMIN_PATH:
+            return self._send_page("admin" if self._session_ok() else "login")
         statics = {
-            "/": ("index.html", "text/html; charset=utf-8"),
-            "/index.html": ("index.html", "text/html; charset=utf-8"),
             "/styles.css": ("styles.css", "text/css; charset=utf-8"),
             "/app.js": ("app.js", "application/javascript; charset=utf-8"),
         }
@@ -452,14 +556,19 @@ class Handler(BaseHTTPRequestHandler):
             name, ctype = statics[path]
             return self._send_file(os.path.join(PUBLIC_DIR, name), ctype)
 
+        writer = self._can_write()          # hosted: only a signed-in admin
+        scrub = (lambda p: p) if writer else public_scrub
         conn = store.connect()
         try:
             if path == "/api/state":
-                return self._send_json(state_payload(conn))
+                return self._send_json(scrub(state_payload(conn)))
             if path == "/api/reports":
-                return self._send_json(reports_payload(conn))
+                return self._send_json(scrub(reports_payload(conn)))
             if path == "/api/interactions":
-                return self._send_json(interactions_payload(conn))
+                return self._send_json(scrub(interactions_payload(conn)))
+            if path.startswith("/api/") or path.startswith("/oura/"):
+                if not writer:
+                    return self._forbid()
             if path == "/api/export":
                 return self._send_json({
                     "interventions": store.list_interventions(conn),
@@ -474,22 +583,23 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send_json({"error": "Save your Oura client ID and secret first."}, 400)
                 state = secrets.token_urlsafe(16)
                 store.set_setting(conn, "oura_state", state)
-                return self._redirect(oura.authorize_url(client_id, state, PORT))
+                return self._redirect(oura.authorize_url(client_id, state, PORT, BASE_URL))
             if path == "/oura/callback":
+                home = (ADMIN_PATH if PUBLIC_MODE else "/")
                 q = parse_qs(urlparse(self.path).query)
                 want = store.get_setting(conn, "oura_state")
                 store.set_setting(conn, "oura_state", None)
                 if q.get("error"):
-                    return self._redirect("/#oura=denied")
+                    return self._redirect(home + "#oura=denied")
                 if not want or q.get("state", [None])[0] != want or not q.get("code"):
-                    return self._redirect("/#oura=error")
+                    return self._redirect(home + "#oura=error")
                 try:
-                    oura.exchange_code(conn, q["code"][0], PORT)
+                    oura.exchange_code(conn, q["code"][0], PORT, BASE_URL)
                 except oura.OuraError:
-                    return self._redirect("/#oura=error")
+                    return self._redirect(home + "#oura=error")
                 store._audit(conn, "oura_connect")
                 conn.commit()
-                return self._redirect("/#oura=connected")
+                return self._redirect(home + "#oura=connected")
         finally:
             conn.close()
         self.send_error(404)
@@ -497,6 +607,39 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         body = self._read_body()
+        if PUBLIC_MODE and path == "/api/login":
+            ip = self._client_ip()
+            if not auth.login_allowed(ip):
+                return self._send_json({"error": "Too many attempts — try again in a few minutes."}, 429)
+            ok = bool(PASSWORD_HASH) and auth.verify_password(str(body.get("password", "")), PASSWORD_HASH)
+            auth.note_login(ip, ok)
+            if not ok:
+                time.sleep(0.5)      # blunt, cheap slowdown for guessing
+                return self._send_json({"error": "Wrong password."}, 401)
+            conn = store.connect()
+            try:
+                token = auth.make_token(auth.session_secret(conn))
+                store._audit(conn, "admin_login")
+                conn.commit()
+            finally:
+                conn.close()
+            payload = json.dumps({"ok": True}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._set_session_cookie(token)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            return self.wfile.write(payload)
+        if PUBLIC_MODE and path == "/api/logout":
+            payload = json.dumps({"ok": True}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._set_session_cookie("", clear=True)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            return self.wfile.write(payload)
+        if not self._can_write():
+            return self._forbid()
         conn = store.connect()
         try:
             if path == "/api/interventions":
@@ -521,13 +664,36 @@ class Handler(BaseHTTPRequestHandler):
                     min_dose=body.get("min_dose"),
                     max_dose=body.get("max_dose"),
                     noun_amount=body.get("noun_amount"),
+                    input_type=body.get("input_type", "checkbox"),
+                    input_options=body.get("input_options"),
+                    input_label=body.get("input_label", ""),
                 )
                 ensure_tonight(conn)
                 return self._send_json(state_payload(conn), 201)
 
             if path == "/api/cell":
-                store.set_taken(conn, body["date"], int(body["intervention_id"]),
-                                bool(body.get("done")))
+                iid = int(body["intervention_id"])
+                # completion detail for non-checkbox input types, validated against
+                # the intervention's settings: radio -> one of its option ids;
+                # quantity -> a number as typed, or '-' (done but not measured).
+                # Anything else is dropped (the tick itself still goes through).
+                val = body.get("input_value")
+                if val is not None:
+                    val = str(val).strip()
+                    iv = store.get_intervention(conn, iid) or {}
+                    if iv.get("input_type") == "radio":
+                        if not any(str(o["id"]) == val for o in iv.get("input_options", [])):
+                            val = None
+                    elif iv.get("input_type") == "quantity":
+                        if val != "-":
+                            try:
+                                float(val)
+                            except ValueError:
+                                val = None
+                    else:
+                        val = None
+                store.set_taken(conn, body["date"], iid, bool(body.get("done")),
+                                input_value=val)
                 return self._send_json(state_payload(conn))
 
             if path == "/api/metric":
@@ -575,6 +741,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         path = urlparse(self.path).path
         body = self._read_body()
+        if not self._can_write():
+            return self._forbid()
         conn = store.connect()
         try:
             if path.startswith("/api/interventions/"):
@@ -583,7 +751,8 @@ class Handler(BaseHTTPRequestHandler):
                           ("name", "unit", "default_dose", "unit_dose", "dose_noun", "note",
                            "active", "kind", "options", "category", "explore_doses", "delay_explore",
                            "open_arm", "open_arm_label", "test_skip",
-                           "prior_helps", "min_dose", "max_dose", "noun_amount")
+                           "prior_helps", "min_dose", "max_dose", "noun_amount", "no_lockin",
+                           "input_type", "input_options", "input_label")
                           if k in body}
                 if "dose_levels" in body:
                     fields["dose_levels"] = _clean_levels(body["dose_levels"])
@@ -603,6 +772,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urlparse(self.path).path
+        if not self._can_write():
+            return self._forbid()
         conn = store.connect()
         try:
             if path.startswith("/api/interventions/"):
@@ -627,11 +798,36 @@ def _clean_levels(levels):
     return sorted(set(out)) or None
 
 
+def _autosync_loop():
+    """Hosted mode has no 'someone opened the app' moment to plan tonight and pull
+    Oura's numbers, so do both on a timer. Every pass: create tonight's plan if it
+    isn't there yet, then (if Oura is connected) sync. Errors are logged, never fatal."""
+    while True:
+        try:
+            conn = store.connect()
+            try:
+                ensure_tonight(conn)
+                if oura.status(conn).get("connected"):
+                    oura.sync(conn, today_str())
+            finally:
+                conn.close()
+        except Exception:
+            traceback.print_exc()
+        time.sleep(AUTOSYNC_MINUTES * 60)
+
+
 def main():
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    print("Sleep Bandit is running.")
-    print(f"  Open http://localhost:{PORT} in your browser.")
-    print("  Press Ctrl+C to stop.")
+    if PUBLIC_MODE:
+        if not PASSWORD_HASH:
+            print("WARNING: SB_PUBLIC=1 but SB_PASSWORD_HASH is unset -- the admin page cannot be used.")
+        print(f"Sleep Bandit (hosted, read-only root; admin at {ADMIN_PATH}) on {HOST}:{PORT}")
+    else:
+        print("Sleep Bandit is running.")
+        print(f"  Open http://localhost:{PORT} in your browser.")
+        print("  Press Ctrl+C to stop.")
+    if AUTOSYNC:
+        threading.Thread(target=_autosync_loop, name="autosync", daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

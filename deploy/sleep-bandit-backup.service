@@ -1,0 +1,8 @@
+[Unit]
+Description=Sleep Bandit nightly DB backup
+
+[Service]
+Type=oneshot
+User=sleepbandit
+WorkingDirectory=/opt/sleep-bandit
+ExecStart=/usr/bin/python3 /opt/sleep-bandit/deploy/backup.py

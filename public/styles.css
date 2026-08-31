@@ -87,6 +87,14 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .grid .rowlab { font-weight: 600; font-size: 13.5px; }
 .grid .rowlab .rmeta { display: block; font-weight: 400; font-size: 11px; color: var(--muted); }
 .grid tr.paused .rowlab { opacity: .5; }
+/* fold row for a category's paused interventions */
+.fold-row th.fold-lab { padding: 2px 10px; }
+.fold-row .group-fill { background: transparent; }
+.fold-btn {
+  background: none; border: none; padding: 2px 4px; font-size: 11.5px; color: var(--muted);
+  cursor: pointer; letter-spacing: .02em;
+}
+.fold-btn:hover { color: var(--text); border: none; }
 
 /* category group header rows */
 .group-row th.group-lab {
@@ -134,6 +142,13 @@ button:hover, .ghost:hover { border-color: var(--accent); }
   cursor: help; vertical-align: 1px;
 }
 .iv-sched .sched-cap::before { content: "🔒"; font-size: 10px; margin-right: 4px; }
+/* clickable (writer view): opens the guard box to toggle the clamp per intervention */
+.iv-sched .sched-cap.clickable { cursor: pointer; }
+.iv-sched .sched-cap.clickable:hover { border-color: var(--accent); color: var(--text); }
+/* guard switched off for this intervention: same shape, unlocked icon, warm border */
+.iv-sched .sched-cap.cap-off { border-color: var(--warn); }
+.iv-sched .sched-cap.cap-off::before { content: "🔓"; }
+.cap-text { font-size: 13.5px; line-height: 1.5; margin: 4px 0 10px; }
 
 /* outcome metric rows (HRV, resting HR) */
 .outcomes-row th.group-lab { color: var(--warn); }
@@ -170,6 +185,16 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .cell { text-align: center; padding: 6px 4px; height: 46px; vertical-align: middle; }
 .cell.off { color: #454c6b; }
 .cell.off.togglable { cursor: pointer; }
+/* hosted read-only view: cells are display only */
+.cell.active.ro { cursor: default; }
+.cell.active.ro:hover { background: var(--on-bg, transparent); }
+.cell.active.ro:not(.done):hover { background: rgba(124,156,255,.08); }
+.hrvcell input[readonly] { cursor: default; }
+.excl-btn.static { cursor: default; pointer-events: none; }
+.login-modal { max-width: 360px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; }
+.login-modal h2 { margin-top: 0; }
+#login-error.bad { color: var(--bad); }
+#logout-btn { margin-left: 6px; }
 .cell.off.togglable:hover { background: rgba(124,156,255,.10); color: var(--muted); }
 /* single-cell exclusion: "did it anyway" — this cell no longer counts for its intervention */
 .cell.off.cell-excl { color: var(--bad); opacity: .8; font-weight: 700; }
@@ -188,6 +213,28 @@ button:hover, .ghost:hover { border-color: var(--accent); }
   width: 20px; height: 20px; margin-top: 3px; border-radius: 6px;
   border: 1.5px solid var(--line); color: transparent; font-size: 13px; font-weight: 800;
 }
+/* per-cell completion inputs (input_type 'radio' / 'quantity'): the cell is
+   marked done through its inner control, not a whole-cell click */
+.cell.active.has-input { cursor: default; }
+.cell.active.has-input:hover { background: transparent; }
+.cell.active.has-input.done:hover { background: var(--on-bg); }
+.cell .in-radio {
+  display: block; margin: 3px auto 0; padding: 1px 7px; max-width: 95%;
+  font-size: 10.5px; line-height: 1.5; border-radius: 9px; cursor: pointer;
+  border: 1px solid var(--line); background: transparent; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cell .in-radio:hover { border-color: var(--accent); color: var(--text); }
+.cell .in-radio.on { border-color: var(--good); color: var(--accent-2); font-weight: 600; }
+.cell .in-qty {
+  display: block; width: 76px; margin: 3px auto 0; padding: 1px 4px; text-align: center;
+  font-size: 11.5px; background: rgba(255,255,255,.04); border: 1px solid var(--line);
+  border-radius: 4px; color: var(--text);
+}
+.cell .in-qty:focus { border-color: var(--accent); outline: none; }
+.cell .in-qty::placeholder { color: #454c6b; font-size: 10.5px; }
+/* read-only view: the recorded button / number as plain text */
+.cell .in-val { display: block; margin-top: 2px; font-size: 10.5px; color: var(--accent-2); }
 .cell.active.done { background: var(--on-bg); box-shadow: inset 3px 0 0 var(--good); }
 .cell.active.done .dose { color: var(--accent-2); }
 .cell.active.done .check { background: var(--good); border-color: var(--good); color: #06210f; }
@@ -202,6 +249,13 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px 22px; }
 .iv { border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin-bottom: 12px; background: var(--panel); }
 .iv.inactive { opacity: .55; }
+/* paused card folded to its header line */
+.iv.collapsed { padding-top: 10px; padding-bottom: 10px; margin-bottom: 8px; }
+.iv.collapsed > :not(.iv-top) { display: none; }
+.iv.collapsed .iv-top { margin-bottom: 0; }
+.iv-top.toggle { cursor: pointer; user-select: none; }
+.iv-top.toggle:hover .iv-name { color: var(--accent); }
+.iv-chev { color: var(--muted); font-size: 12px; width: 10px; }
 .iv-top { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
 .iv-name { font-size: 16px; font-weight: 700; }
 .iv-meta { color: var(--muted); font-size: 12.5px; margin: 2px 0; }
@@ -225,9 +279,16 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .chart-cap .mk-dot { color: var(--good); font-weight: 700; }
 .chart-cap .mk-ci { color: var(--muted); font-weight: 700; }
 .chart-cap .mk-avg { color: var(--accent); font-weight: 700; }
+.chart-cap .mk-peak { color: var(--accent); opacity: .7; }
 .chart-cap .mk-band { color: var(--accent-2); opacity: .5; }
 .chart-cap .mk-night { color: var(--muted); }
-.eff-line { margin-top: 10px; }
+/* the minor sleep metrics (total sleep, latency, efficiency): visibly smaller than the
+   HRV / resting-HR read-outs, on both pages */
+.eff-line { margin-top: 8px; font-size: 11px; }
+.eff-line .effect { font-size: 11.5px; }
+.metric-row.minor .rowlab { font-size: 12px; padding-top: 4px; padding-bottom: 4px; }
+.metric-row.minor .rowlab .rmeta { font-size: 10.5px; }
+.metric-row.minor .hrvcell input { font-size: 12px; font-weight: 600; padding: 3px 2px; }
 /* the readiness card's headline numbers: their own row of labeled figures,
    color-coded to the chart (blue = 7-day line, teal = band's lower edge) */
 .hrv-stats { display: flex; align-items: flex-end; gap: 28px; flex-wrap: wrap; margin: 4px 2px 10px; }
@@ -325,6 +386,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .opt-row { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
   border: 1px solid var(--line); border-radius: 9px; background: #10132a; }
 .opt-label { flex: 1; font-size: 13.5px; }
+.opt-row .opt-prior { width: 56px; padding: 4px 6px; font-size: 12.5px; text-align: right; }
+.opt-row .opt-pct { color: var(--muted); font-size: 12px; margin-right: 4px; }
+#prior-sum-hint { margin: -2px 0 6px; }
+#prior-sum-hint.bad { color: var(--bad); }
 .opt-btn { padding: 4px 9px; font-size: 12px; }
 .opt-del { color: var(--bad); border-color: #5b2b3a; padding: 4px 8px; }
 .add-row { display: flex; gap: 8px; }

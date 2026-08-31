@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Sleep Bandit</title>
   <link rel="stylesheet" href="/styles.css">
+  <!--SB_CONFIG-->
 </head>
 <body>
   <header class="topbar">
@@ -18,6 +19,7 @@
     <nav class="tabs">
       <button class="tab active" data-view="grid">🗓 Tracker</button>
       <button class="tab" data-view="reports">📊 Reports</button>
+      <button class="ghost" id="logout-btn" hidden title="Sign out of the admin page">Log out</button>
     </nav>
   </header>
 
@@ -47,6 +49,22 @@
     </section>
   </main>
 
+  <!-- Admin sign-in (hosted mode, unlinked admin path only) -->
+  <div class="modal-backdrop" id="login-backdrop" hidden>
+    <div class="modal login-modal">
+      <h2>Sign in</h2>
+      <form id="login-form">
+        <label>Password
+          <input name="password" type="password" autocomplete="current-password" autofocus>
+        </label>
+        <p class="field-hint bad" id="login-error" hidden></p>
+        <div class="modal-actions">
+          <button type="submit" class="primary">Sign in</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- Add / edit intervention modal -->
   <div class="modal-backdrop" id="modal-backdrop" hidden>
     <div class="modal card">
@@ -59,17 +77,19 @@
           <input name="name" required placeholder="e.g. Magnesium glycinate">
         </label>
         <div class="row">
-          <label>Category <span class="tip" tabindex="0" data-tip="Supplement or behavioral. Used to group interventions and for per-night exclusions (e.g. a night where you skipped every supplement)."></span>
+          <label>Category <span class="tip" tabindex="0" data-tip="Supplement, behavioral (things you do), or environmental (the room: temperature, light, noise, bedding). Used to group interventions and for per-night exclusions (e.g. a night where you skipped every supplement)."></span>
             <select name="category" id="iv-category">
               <option value="supplement">Supplement</option>
               <option value="behavioral">Behavioral</option>
+              <option value="environmental">Environmental</option>
             </select>
           </label>
-          <label>Type <span class="tip r" tabindex="0" data-tip="Dose: an amount the app can vary. Yes / no: simply on or off. Multiple choice: the app picks one of your options each night."></span>
+          <label>Type <span class="tip r" tabindex="0" data-tip="Dose: an amount the app can vary. Yes / no: simply on or off. Multiple choice: the app picks one of your options each night. Multiple choice + dose: it picks an option AND a dose each night and searches over both — every option × dose pair is tested on its own."></span>
             <select name="kind" id="iv-kind">
               <option value="dose">Dose — an amount</option>
               <option value="boolean">Yes / no — did it or not</option>
               <option value="choice">Multiple choice — pick one option</option>
+              <option value="choice_dose">Multiple choice + dose — pick an option and its amount</option>
             </select>
           </label>
         </div>
@@ -109,14 +129,33 @@
           </label>
         </div>
         <div id="choice-fields" hidden>
-          <label>Options <span class="tip" tabindex="0" data-tip="Each night the app picks one option. Options keep their own history — renaming an option keeps it; a removed option’s past nights still count."></span></label>
+          <label>Options <span class="tip" tabindex="0" data-tip="Each night the app picks one option. Options keep their own history — renaming an option keeps it; a removed option’s past nights still count. The % box is an optional prior that THAT option is the best one: the numbers must add up to 100%, and any option left blank gets an equal share of whatever is left. Like the ‘prior it helps’, it only steers early scheduling and fades as nights accumulate; the measured results never include it."></span></label>
           <div id="options-list"></div>
+          <p class="field-hint" id="prior-sum-hint" hidden></p>
           <div class="add-row">
             <input id="new-option" type="text" placeholder="Add an option…" autocomplete="off">
             <button type="button" class="ghost" id="add-option-btn">+ Add</button>
           </div>
           <label class="check-label"><input type="checkbox" name="test_skip"> Also test skipping <span class="tip" tabindex="0" data-tip="Occasionally suggests a “skip” control night (do none of these), so the report can show the average effect of doing any of these options versus nothing — on both HRV and resting HR."></span></label>
         </div>
+        <label>Completion input <span class="tip" tabindex="0" data-tip="How you mark the intervention done on the tracker. Checkbox: the usual tick. Buttons: you define labeled, mutually exclusive buttons — clicking any one counts as having done it, and which one you picked is saved. Number: you enter a quantity (or “-” for done but not measured) and that entry counts as having done it. Everything entered is stored per night so it can be analyzed later."></span>
+          <select name="input_type" id="iv-input-type">
+            <option value="checkbox">Checkbox — tick when done</option>
+            <option value="radio">Buttons — pick one to mark it done</option>
+            <option value="quantity">Number — enter a quantity to mark it done</option>
+          </select>
+        </label>
+        <div id="input-radio-fields" hidden>
+          <label>Button labels <span class="tip" tabindex="0" data-tip="The mutually exclusive buttons shown in each night's cell. Clicking one marks the night done and records which you picked; clicking it again un-marks the night. Buttons keep their own history — renaming one keeps its past nights attached."></span></label>
+          <div id="input-options-list"></div>
+          <div class="add-row">
+            <input id="new-input-option" type="text" placeholder="Add a button…" autocomplete="off">
+            <button type="button" class="ghost" id="add-input-option-btn">+ Add</button>
+          </div>
+        </div>
+        <label id="input-qty-field" hidden>What the number measures <span class="tip" tabindex="0" data-tip="The quantity you'll enter each night (e.g. “minutes on mat”, “ml”). Shown as the hint in the cell. Entering a number — or “-” for done but not measured — marks the night done."></span>
+          <input name="input_label" placeholder="e.g. minutes on mat">
+        </label>
         <label id="prior-field">Prior probability it helps (%) <span class="tip" tabindex="0" data-tip="Your belief, before your own data, that this helps your HRV (for a multiple choice, that doing any of the options beats skipping). 50% = no prior. Higher makes the scheduler try it more often early — it’s exactly the chance it’s scheduled before any nights are logged. Capped at 80% so it still gets enough OFF nights to measure. Scheduling only: it never changes the measured results and fades as real nights accumulate."></span>
           <input name="prior_helps" type="number" min="1" max="80" step="1" value="50" inputmode="numeric">
         </label>
@@ -131,6 +170,23 @@
           <button type="submit" class="primary">Save</button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- Early lock-in guard modal (opened from the cap indicator on a report card) -->
+  <div class="modal-backdrop" id="cap-backdrop" hidden>
+    <div class="modal card">
+      <div class="card-head">
+        <h2>🔒 Early lock-in guard</h2>
+        <button class="ghost" id="cap-close">✕</button>
+      </div>
+      <p id="cap-text" class="cap-text"></p>
+      <p class="field-hint" id="cap-hint"></p>
+      <div class="modal-actions">
+        <span class="spacer"></span>
+        <button type="button" class="ghost" id="cap-cancel">Cancel</button>
+        <button type="button" class="primary" id="cap-toggle"></button>
+      </div>
     </div>
   </div>
 

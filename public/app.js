@@ -18,6 +18,12 @@ const numLabel = (d) => (Number.isInteger(d) ? d : +d.toFixed(3));
 // as this sentinel dose (mirrors bandit.OPEN_ARM_DOSE) and shown by its label, never as a number.
 const OPEN_ARM_DOSE = 1e9;
 const isOpenDose = (d) => Number(d) >= OPEN_ARM_DOSE / 2;
+// "Multiple choice + dose": a cell's level packs option id and dose as
+// option_id * COMBO_BASE + dose (mirrors bandit.COMBO_BASE).
+const COMBO_BASE = 1e6;
+const comboDecode = (level) => { const o = Math.floor(Number(level) / COMBO_BASE); return [o, +(Number(level) - o * COMBO_BASE).toFixed(6)]; };
+const isChoiceKind = (iv) => iv.kind === "choice" || iv.kind === "choice_dose";
+const sameLevel = (a, b) => Math.abs(Number(a) - Number(b)) < 1e-6;
 const openLabel = (iv) => (iv.open_arm_label || "").trim() || "no timer";
 const avg1 = (x) => Number(x).toFixed(1);   // raw metric averages, one decimal
 const shortDate = (iso) => { const [y, m, d] = iso.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric" }); };
@@ -25,8 +31,14 @@ const weekday = (iso) => { const [y, m, d] = iso.split("-").map(Number); return 
 
 let STATE = null;
 
-const CATEGORY_ORDER = ["supplement", "behavioral"];
-const CATEGORY_LABEL = { supplement: "Supplements", behavioral: "Behavioral" };
+// Runtime config injected by the server (see server._send_page). mode: "local" (your
+// own machine, full access, no login), "public" (hosted root: read-only, no notes),
+// "login" (hosted admin path, not signed in) or "admin" (signed in, full access).
+const SB = window.SB || { mode: "local", base: "/", hosted: false };
+const READ_ONLY = SB.mode === "public" || SB.mode === "login";
+
+const CATEGORY_ORDER = ["supplement", "behavioral", "environmental"];
+const CATEGORY_LABEL = { supplement: "Supplements", behavioral: "Behavioral", environmental: "Environmental" };
 
 // "prior belief it helps" is stored as a PROBABILITY in [0,1] (0 or 0.5 = neutral / no
 // prior). It's used for scheduling only, never in the efficacy numbers. The UI edits it
@@ -37,8 +49,15 @@ const priorPct = (frac) => Math.round((Number(frac) || 0) * 100);
 const METRICS = [
   { key: "hrv", label: "HRV", hint: "higher is better" },
   { key: "lrhr", label: "Resting HR", hint: "lower is better · bpm" },
-  { key: "eff", label: "Sleep efficiency", hint: "higher is better · %" },
+  // the three sleep-architecture metrics are minor next to HRV / resting HR: shown smaller
+  { key: "tst", label: "Total sleep", hint: "higher is better · hours", minor: true },
+  { key: "lat", label: "Sleep latency", hint: "lower is better · min", minor: true },
+  { key: "eff", label: "Sleep efficiency", hint: "higher is better · %", minor: true },
 ];
+
+// Report-card charts fill their column (about half the card) instead of hugging
+// their few data points; the column shrinks them proportionally on narrow screens.
+const CHART_MIN_W = 540;
 
 // need a real contrast before we show any recommendation: at least this many
 // nights on AND off (choice: this many option-nights total).
@@ -73,15 +92,16 @@ function pluralize(noun, n) {
 // how a dose amount is written: as a count ("3 pills") if the intervention names a
 // countable noun -- one noun = noun_amount of the unit (falls back to the unit dose) --
 // otherwise as the raw amount ("144 mg").
-function doseText(iv, amount) {
-  if (isOpenDose(amount)) return `∞ ${esc(openLabel(iv))}`;
+function doseTextPlain(iv, amount) {
+  if (isOpenDose(amount)) return `∞ ${openLabel(iv)}`;
   const u = iv.noun_amount || iv.unit_dose || 0, noun = (iv.dose_noun || "").trim();
   if (u > 0 && noun) {
     const count = amount / u;
-    return `${numLabel(count)} ${esc(pluralize(noun, count))}`;
+    return `${numLabel(count)} ${pluralize(noun, count)}`;
   }
-  return iv.unit ? `${numLabel(amount)} ${esc(iv.unit)}` : "on";
+  return iv.unit ? `${numLabel(amount)} ${iv.unit}` : "on";
 }
+const doseText = (iv, amount) => esc(doseTextPlain(iv, amount));
 
 // Reports page shows doses in the supplement's native unit (mg/g/mcg/minutes),
 // never as a pill count -- the Tracker keeps pills, but results read in mass.
@@ -92,13 +112,19 @@ function doseAmount(iv, amount) {
 
 // options are {id, label}; look one up by its stable id
 function optLabel(iv, id) {
+  if (iv.kind === "choice_dose") {
+    // an encoded option+dose pair reads "Option · dose" (plain text; callers escape)
+    const [oid, dose] = comboDecode(id);
+    const o = (iv.options || []).find((x) => x.id === oid);
+    return o ? `${o.label} · ${doseTextPlain(iv, dose)}` : null;
+  }
   const o = (iv.options || []).find((x) => x.id === Math.round(id));
   return o ? o.label : null;
 }
 
 // label shown in a grid cell (null = not activated / grayed out)
 function cellLabel(iv, assigned) {
-  if (iv.kind === "choice") {
+  if (isChoiceKind(iv)) {
     const label = optLabel(iv, assigned);
     return label != null ? esc(label) : null;
   }
@@ -108,6 +134,7 @@ function cellLabel(iv, assigned) {
 }
 
 function ivMeta(iv) {
+  if (iv.kind === "choice_dose") return (iv.options || []).map((o) => esc(o.label)).join(" · ") + ` × ${doseText(iv, iv.default_dose)}`;
   if (iv.kind === "choice") return (iv.options || []).map((o) => esc(o.label)).join(" · ");
   if (iv.kind === "boolean") return "yes / no";
   return doseText(iv, iv.default_dose);
@@ -149,11 +176,16 @@ function renderGrid() {
       a.active === b.active ? a.name.localeCompare(b.name) : (a.active ? -1 : 1));
     // category header row: each night gets a toggle to exclude that night's data for
     // this category (its outcome stops counting toward these interventions' results).
-    const exKey = cat === "behavioral" ? "excl_behavioral" : "excl_supplement";
+    const exKey = "excl_" + cat;
     const catWord = CATEGORY_LABEL[cat].toLowerCase();
     body += `<tr class="group-row"><th class="rowlab group-lab">${CATEGORY_LABEL[cat]}</th>`;
     for (const n of nights) {
       const ex = !!n[exKey];
+      if (READ_ONLY) {   // no toggles; just mark the excluded nights
+        body += `<td class="group-fill exclcell${n.is_today ? " col-today" : ""}">` +
+          (ex ? `<span class="excl-btn on static" title="${catWord} data excluded from this night's results">excluded</span>` : "") + `</td>`;
+        continue;
+      }
       body += `<td class="group-fill exclcell${n.is_today ? " col-today" : ""}">` +
         `<button class="excl-btn${ex ? " on" : ""}" data-date="${n.date}" data-cat="${cat}" ` +
         `title="${ex ? `${catWord} data excluded from this night's results — click to include`
@@ -161,7 +193,15 @@ function renderGrid() {
         `${ex ? "excluded" : "exclude"}</button></td>`;
     }
     body += `</tr>`;
+    // Paused interventions sit under a fold row ("▸ 3 paused") so they don't clutter
+    // the grid; click it to show or hide them. Remembered per category.
+    const nPaused = list.filter((iv) => !iv.active).length;
+    const open = !!PAUSED_OPEN[cat];
     for (const iv of list) {
+      if (!iv.active && !open) continue;
+      if (!iv.active && iv === list.find((x) => !x.active)) {
+        body += foldRow(cat, nPaused, open, nights.length);
+      }
       const meta = ivMeta(iv) + (iv.active ? "" : " · paused");
       body += `<tr class="${iv.active ? "" : "paused"}" data-iv-id="${iv.id}">` +
         `<th class="rowlab">${esc(iv.name)}<span class="rmeta">${meta}</span></th>`;
@@ -171,9 +211,44 @@ function renderGrid() {
         const exCls = n[exKey] ? " excluded" : "";   // dim: this night doesn't count here
         if (!c) { body += `<td class="cell na${todayCls}${exCls}"></td>`; continue; }
         const label = cellLabel(iv, c.assigned_dose);
+        const ro = READ_ONLY ? " ro" : "";
         if (label != null) {
-          body += `<td class="cell active${c.done ? " done" : ""}${todayCls}${exCls}" data-date="${n.date}" data-iv="${iv.id}">` +
-            `<span class="dose">${label}</span><span class="check">✓</span></td>`;
+          // ON cell. How completion is recorded depends on the intervention's
+          // input type: the default checkbox (click the cell), mutually exclusive
+          // buttons (click one — it records WHICH and marks the night done), or a
+          // number ("-" = done but not measured). The recorded value is saved per
+          // cell (input_value) for later analysis.
+          // the ✓ checkmark visual belongs to the checkbox type only; radio and
+          // quantity cells show their own control (the done state still colors
+          // the cell)
+          const cls = `cell active${c.done ? " done" : ""}${todayCls}${exCls}${ro}`;
+          const core = `<span class="dose">${label}</span>`;
+          const inputType = iv.input_type || "checkbox";
+          if (inputType === "radio" && (iv.input_options || []).length) {
+            const sel = c.input_value != null ? String(c.input_value) : null;
+            let controls = "";
+            for (const o of iv.input_options) {
+              const on = sel === String(o.id);
+              if (READ_ONLY) { if (on) controls += `<span class="in-val">${esc(o.label)}</span>`; }
+              else controls += `<button type="button" class="in-radio${on ? " on" : ""}" data-oid="${o.id}" ` +
+                `title="${on ? "Recorded — click to un-mark this night" : "Mark done: " + esc(o.label)}">${esc(o.label)}</button>`;
+            }
+            body += `<td class="${cls} has-input" data-date="${n.date}" data-iv="${iv.id}">${core}${controls}</td>`;
+          } else if (inputType === "quantity") {
+            const v = c.input_value != null ? String(c.input_value) : "";
+            const controls = READ_ONLY
+              ? (v ? `<span class="in-val">${esc(v)}${iv.input_label ? " " + esc(iv.input_label) : ""}</span>` : "")
+              : `<input class="in-qty" type="text" inputmode="decimal" value="${esc(v)}" ` +
+                `placeholder="${esc(iv.input_label || "qty")}" ` +
+                `title="${esc(iv.input_label || "Quantity")} — a number, or “-” for done but not measured; clear to un-mark">`;
+            body += `<td class="${cls} has-input" data-date="${n.date}" data-iv="${iv.id}">${core}${controls}</td>`;
+          } else {
+            body += `<td class="${cls}" data-date="${n.date}" data-iv="${iv.id}">${core}<span class="check">✓</span></td>`;
+          }
+        } else if (READ_ONLY) {
+          const cex = !!c.excluded;
+          body += `<td class="cell off${cex ? " cell-excl" : ""}${todayCls}${exCls}" ` +
+            `title="${cex ? "Done despite assigned off — excluded from this intervention's results" : "Assigned off (control night)"}">${cex ? "✗" : "–"}</td>`;
         } else {
           // OFF (control) cell. Clicking it marks the rare "did it anyway" night:
           // that one cell is excluded from this intervention's results (it's not a
@@ -188,6 +263,7 @@ function renderGrid() {
       }
       body += `</tr>`;
     }
+    if (nPaused && !open) body += foldRow(cat, nPaused, open, nights.length);
   }
 
   // separator between interventions and the outcome metrics
@@ -196,7 +272,7 @@ function renderGrid() {
 
   // outcome metric rows (HRV = target; resting HR = secondary, lower is better)
   for (const m of METRICS) {
-    body += `<tr class="metric-row"><th class="rowlab metric-lab">${m.label}` +
+    body += `<tr class="metric-row${m.minor ? " minor" : ""}"><th class="rowlab metric-lab">${m.label}` +
       `<span class="rmeta">${m.hint}</span></th>`;
     for (const n of nights) {
       // source marker: hand-entered values get a small pencil (Oura-synced is the
@@ -210,27 +286,42 @@ function renderGrid() {
         (manual ? n[m.key] : Number(n[m.key]).toFixed(1));
       body += `<td class="hrvcell${n.is_today ? " col-today" : ""}${manual ? " manual" : ""}">` +
         `<input type="number" step="any" min="0" data-date="${n.date}" data-metric="${m.key}" ` +
-        `value="${val}" placeholder="—"${title}></td>`;
+        `value="${val}" placeholder="—"${title}${READ_ONLY ? " readonly tabindex=\"-1\"" : ""}></td>`;
     }
     body += `</tr>`;
   }
-  // per-night free-text notes (one editable cell per column)
-  body += `<tr class="metric-row notes-row"><th class="rowlab metric-lab">Notes` +
-    `<span class="rmeta">per night</span></th>`;
-  for (const n of nights) {
-    body += `<td class="notecell${n.is_today ? " col-today" : ""}">` +
-      `<textarea rows="2" data-date="${n.date}" placeholder="—">${esc(n.note || "")}</textarea></td>`;
+  // per-night free-text notes (one editable cell per column) -- never on the public view
+  if (!READ_ONLY) {
+    body += `<tr class="metric-row notes-row"><th class="rowlab metric-lab">Notes` +
+      `<span class="rmeta">per night</span></th>`;
+    for (const n of nights) {
+      body += `<td class="notecell${n.is_today ? " col-today" : ""}">` +
+        `<textarea rows="2" data-date="${n.date}" placeholder="—">${esc(n.note || "")}</textarea></td>`;
+    }
+    body += `</tr>`;
   }
-  body += `</tr>`;
 
   body += `</tbody>`;
   table.innerHTML = head + body;
 
-  $$(".cell.active", table).forEach((td) => td.addEventListener("click", () => toggleCell(td)));
-  $$(".cell.off.togglable", table).forEach((td) => td.addEventListener("click", () => toggleCellExclusion(td)));
-  $$(".hrvcell input", table).forEach((inp) => inp.addEventListener("change", () => saveMetric(inp)));
-  $$(".notecell textarea", table).forEach((t) => t.addEventListener("change", () => saveNote(t)));
-  $$(".excl-btn", table).forEach((b) => b.addEventListener("click", () => toggleExclusion(b)));
+  if (!READ_ONLY) {
+    // cells with a non-checkbox input type save through their inner controls,
+    // not a whole-cell click
+    $$(".cell.active:not(.has-input)", table).forEach((td) => td.addEventListener("click", () => toggleCell(td)));
+    $$(".cell .in-radio", table).forEach((b) => b.addEventListener("click", () => saveCellRadio(b)));
+    $$(".cell .in-qty", table).forEach((inp) => inp.addEventListener("change", () => saveCellQty(inp)));
+    $$(".cell.off.togglable", table).forEach((td) => td.addEventListener("click", () => toggleCellExclusion(td)));
+    $$(".hrvcell input", table).forEach((inp) => inp.addEventListener("change", () => saveMetric(inp)));
+    $$(".notecell textarea", table).forEach((t) => t.addEventListener("change", () => saveNote(t)));
+    $$(".excl-btn", table).forEach((b) => b.addEventListener("click", () => toggleExclusion(b)));
+  }
+  $$(".fold-btn", table).forEach((b) => b.addEventListener("click", () => {
+    PAUSED_OPEN[b.dataset.cat] = !PAUSED_OPEN[b.dataset.cat];
+    try { localStorage.setItem("sb.pausedOpen", JSON.stringify(PAUSED_OPEN)); } catch (e) { /* private mode etc. */ }
+    const wrap = $(".grid-wrap");
+    GRID_SCROLL = wrap ? wrap.scrollLeft : null;
+    renderGrid();
+  }));
 
   // Tonight is the right-most column, so start scrolled all the way over to it --
   // but only on a fresh load; a re-render (e.g. after a toggle) keeps your place.
@@ -239,6 +330,17 @@ function renderGrid() {
 }
 
 let GRID_SCROLL = null;  // remembered horizontal scroll, so re-renders don't jump to Tonight
+
+// which categories currently show their paused interventions (default: hidden)
+let PAUSED_OPEN = {};
+try { PAUSED_OPEN = JSON.parse(localStorage.getItem("sb.pausedOpen") || "{}") || {}; } catch (e) { PAUSED_OPEN = {}; }
+
+function foldRow(cat, n, open, ncols) {
+  return `<tr class="fold-row"><th class="rowlab fold-lab">` +
+    `<button class="fold-btn" data-cat="${cat}" title="${open ? "Hide" : "Show"} paused interventions">` +
+    `${open ? "▾" : "▸"} ${n} paused</button></th>` +
+    `<td class="group-fill" colspan="${ncols}"></td></tr>`;
+}
 
 async function toggleExclusion(btn) {
   const date = btn.dataset.date, cat = btn.dataset.cat;
@@ -277,6 +379,47 @@ async function toggleCell(td) {
   } catch (e) {
     td.classList.toggle("done", !done);
     if (cell) cell.done = !done;
+    alert("Could not save: " + e.message);
+  }
+}
+
+// Radio completion: clicking a button records it (and marks the night done);
+// clicking the selected button again clears the night back to not-done.
+async function saveCellRadio(btn) {
+  const td = btn.closest("td");
+  const cell = (STATE.cells[td.dataset.date] || {})[td.dataset.iv];
+  const value = btn.classList.contains("on") ? null : btn.dataset.oid;
+  const wrap = $(".grid-wrap");
+  GRID_SCROLL = wrap ? wrap.scrollLeft : null;   // keep our place across the re-render
+  try {
+    await post("/api/cell", { date: td.dataset.date, intervention_id: td.dataset.iv,
+                              done: value != null, input_value: value });
+    if (cell) { cell.done = value != null; cell.input_value = value; }
+    renderGrid();
+  } catch (e) {
+    alert("Could not save: " + e.message);
+  }
+}
+
+// Quantity completion: a number (or "-" for done but not measured) marks the night
+// done and is recorded; clearing the field un-marks it. Saved on change; the cell
+// updates in place so focus isn't lost to a re-render.
+async function saveCellQty(inp) {
+  const td = inp.closest("td");
+  const cell = (STATE.cells[td.dataset.date] || {})[td.dataset.iv];
+  const v = inp.value.trim();
+  if (v !== "" && v !== "-" && !Number.isFinite(Number(v))) {
+    alert("Enter a number, “-” for done but not measured, or clear the field.");
+    inp.value = cell && cell.input_value != null ? cell.input_value : "";
+    return;
+  }
+  const value = v === "" ? null : v;
+  try {
+    await post("/api/cell", { date: td.dataset.date, intervention_id: td.dataset.iv,
+                              done: value != null, input_value: value });
+    if (cell) { cell.done = value != null; cell.input_value = value; }
+    td.classList.toggle("done", value != null);
+  } catch (e) {
     alert("Could not save: " + e.message);
   }
 }
@@ -354,18 +497,91 @@ async function loadReports() {
   }
   for (const [cat, list] of groupByCategory(data.interventions)) {
     box.appendChild(el("h3", "rep-group", CATEGORY_LABEL[cat]));
-    for (const iv of list.slice().sort((a, b) => a.name.localeCompare(b.name)))
-      box.appendChild(reportCard(iv));
+    // active cards first (by name), then paused ones -- each paused card collapsed
+    // to its header line unless you've opened it.
+    const sorted = list.slice().sort((a, b) =>
+      a.active === b.active ? a.name.localeCompare(b.name) : (a.active ? -1 : 1));
+    for (const iv of sorted) box.appendChild(reportCard(iv));
   }
 }
 
+// ---- early lock-in guard modal (opened from a report card's cap indicator) --
+// Lets the user switch the scheduling clamp (bandit.LOCKIN_TIERS) off for one
+// intervention — trading slower growth of the thin arm for scheduling that
+// follows the measured probability right away — and back on again.
+let capIv = null;
+
+function openCapModal(iv) {
+  capIv = iv;
+  const armN = Math.min(iv.sched_n_on ?? 0, iv.sched_n_off ?? 0);
+  const armSide = (iv.sched_n_on ?? 0) <= (iv.sched_n_off ?? 0) ? "on" : "off";
+  const arm = `${armN} ${armSide}-night${armN === 1 ? "" : "s"}`;
+  const raw = pct(iv.p_scheduled_raw);
+  if (iv.no_lockin) {
+    $("#cap-text").innerHTML = `The guard is <b>off</b> for <b>${esc(iv.name)}</b>: the planner follows the ` +
+      `measured <b>${raw}</b> chance unclamped, even though its smaller arm (${arm}) is still thin.`;
+    $("#cap-hint").textContent = "Turning it back on re-clamps scheduling to 10–90% until the smaller arm has " +
+      "15 nights, then 5–95% until it has 30 — so contrast nights keep being collected while the estimate is thin.";
+    $("#cap-toggle").textContent = "Turn the guard back on";
+  } else {
+    $("#cap-text").innerHTML = `The measured chance that <b>${esc(iv.name)}</b> helps is <b>${raw}</b>, but its ` +
+      `smaller arm has only <b>${arm}</b>, so the planner clamps scheduling to ` +
+      `<b>${pct(iv.sched_tier)} / ${pct(1 - iv.sched_tier)}</b>: a few noisy early nights can't lock the decision ` +
+      `in, and the arm the estimate is short on keeps being sampled.`;
+    $("#cap-hint").textContent = "Turning the guard off lets scheduling follow the measured chance immediately. " +
+      "The cost: the under-sampled arm grows even more slowly, so the effect estimate stays uncertain for longer. " +
+      "Scheduling only — the efficacy numbers are never affected either way.";
+    $("#cap-toggle").textContent = "Turn the guard off";
+  }
+  $("#cap-backdrop").hidden = false;
+}
+
+function closeCapModal() { $("#cap-backdrop").hidden = true; capIv = null; }
+
+$("#cap-close").addEventListener("click", closeCapModal);
+$("#cap-cancel").addEventListener("click", closeCapModal);
+$("#cap-backdrop").addEventListener("click", (e) => { if (e.target === $("#cap-backdrop")) closeCapModal(); });
+$("#cap-toggle").addEventListener("click", async () => {
+  if (!capIv) return;
+  try {
+    // pass dose_levels back so the update doesn't regenerate them (as togglePause does)
+    STATE = await api(`/api/interventions/${capIv.id}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ no_lockin: !capIv.no_lockin, dose_levels: capIv.dose_levels }),
+    });
+  } catch (err) { alert("Error: " + err.message); return; }
+  closeCapModal();
+  loadReports();
+});
+
+// which paused report cards are expanded (default: collapsed), by intervention id
+let REPORT_OPEN = {};
+try { REPORT_OPEN = JSON.parse(localStorage.getItem("sb.reportOpen") || "{}") || {}; } catch (e) { REPORT_OPEN = {}; }
+
 function reportCard(iv) {
   const r = iv.readout || {};
-  const isChoice = iv.kind === "choice";
+  const isChoice = isChoiceKind(iv);
   const nOn = r.n_on || 0, nOff = r.n_off || 0, nObs = nOn + nOff;
   const card = el("div", "iv" + (iv.active ? "" : " inactive"));
 
   const top = el("div", "iv-top");
+  if (!iv.active) {
+    // paused: the whole header is a toggle; only the header shows while collapsed
+    const open = !!REPORT_OPEN[iv.id];
+    card.classList.toggle("collapsed", !open);
+    const chev = el("span", "iv-chev", open ? "▾" : "▸");
+    top.appendChild(chev);
+    top.classList.add("toggle");
+    top.title = "Paused — click to " + (open ? "collapse" : "expand");
+    top.addEventListener("click", () => {
+      const nowOpen = card.classList.contains("collapsed");
+      card.classList.toggle("collapsed", !nowOpen);
+      chev.textContent = nowOpen ? "▾" : "▸";
+      top.title = "Paused — click to " + (nowOpen ? "collapse" : "expand");
+      REPORT_OPEN[iv.id] = nowOpen;
+      try { localStorage.setItem("sb.reportOpen", JSON.stringify(REPORT_OPEN)); } catch (e) { /* ignore */ }
+    });
+  }
   top.appendChild(el("span", "iv-name", esc(iv.name)));
   if (isChoice && !iv.test_skip) {
     // A plain choice (no skip baseline) can't say "helps vs nothing", so it only
@@ -376,7 +592,8 @@ function reportCard(iv) {
     top.appendChild(el("span", "verdict " + vc, vt));
   }
   top.appendChild(el("span", "iv-meta",
-    isChoice ? `${(iv.options || []).length} options`
+    iv.kind === "choice_dose" ? `${(iv.options || []).length} options × dose · standard ${doseAmount(iv, iv.default_dose)}`
+    : isChoice ? `${(iv.options || []).length} options`
     : iv.kind === "boolean" ? "yes / no"
     : `standard ${doseAmount(iv, iv.default_dose)}`));
   card.appendChild(top);
@@ -387,19 +604,34 @@ function reportCard(iv) {
     card.appendChild(el("p", "iv-sched muted", "🗓 Paused — not currently scheduled."));
   } else if (iv.p_scheduled != null) {
     // Early lock-in guard: while the smaller arm is thin the planner clamps this
-    // probability (<15 nights: 10–90%, <30: 5–95%). Say so when it actually bit.
+    // probability (<15 nights: 10–90%, <30: 5–95%). Say so when it actually bit —
+    // or when the guard is switched off for this intervention while it would
+    // otherwise apply. Clicking the marker opens a box to toggle the guard.
     let capNote = "";
-    if (iv.sched_cap != null) {
+    if (iv.sched_cap != null || (iv.no_lockin && iv.sched_tier != null)) {
       const arm = iv.sched_n_on <= iv.sched_n_off ? `${iv.sched_n_on} on-night${iv.sched_n_on === 1 ? "" : "s"}`
                                                   : `${iv.sched_n_off} off-night${iv.sched_n_off === 1 ? "" : "s"}`;
-      const hi = iv.p_scheduled_raw > 0.5;
-      const bound = hi ? pct(iv.sched_cap) : pct(1 - iv.sched_cap);
-      capNote = ` <span class="sched-cap" title="Measured chance is ${pct(iv.p_scheduled_raw)}, but with only ${arm} so far ` +
-        `the planner ${hi ? "caps" : "floors"} scheduling at ${bound} so a few noisy early nights can't lock the decision in. ` +
-        `The limit is ${pct(iv.sched_cap)} / ${pct(1 - iv.sched_cap)} until the smaller arm has 15 nights, then 95% / 5% until it has 30.">` +
-        `${hi ? "capped" : "floored"} at ${bound} · ${arm}</span>`;
+      if (iv.sched_cap != null) {
+        const hi = iv.p_scheduled_raw > 0.5;
+        const bound = hi ? pct(iv.sched_cap) : pct(1 - iv.sched_cap);
+        capNote = ` <span class="sched-cap" title="Measured chance is ${pct(iv.p_scheduled_raw)}, but with only ${arm} so far ` +
+          `the planner ${hi ? "caps" : "floors"} scheduling at ${bound} so a few noisy early nights can't lock the decision in. ` +
+          `The limit is ${pct(iv.sched_cap)} / ${pct(1 - iv.sched_cap)} until the smaller arm has 15 nights, then 95% / 5% until it has 30.` +
+          `${READ_ONLY ? "" : " Click to adjust."}">` +
+          `${hi ? "capped" : "floored"} at ${bound} · ${arm}</span>`;
+      } else {
+        capNote = ` <span class="sched-cap cap-off" title="The early lock-in guard is switched off for this intervention: ` +
+          `scheduling follows the measured ${pct(iv.p_scheduled_raw)} unclamped even though the smaller arm has only ${arm}.` +
+          `${READ_ONLY ? "" : " Click to turn it back on."}">guard off · ${arm}</span>`;
+      }
     }
-    card.appendChild(el("p", "iv-sched", `🗓 <b>Scheduling tomorrow night: ${pct(iv.p_scheduled)}</b>${capNote}`));
+    const sched = el("p", "iv-sched", `🗓 <b>Scheduling tomorrow night: ${pct(iv.p_scheduled)}</b>${capNote}`);
+    const capEl = sched.querySelector(".sched-cap");
+    if (capEl && !READ_ONLY) {
+      capEl.classList.add("clickable");
+      capEl.addEventListener("click", () => openCapModal(iv));
+    }
+    card.appendChild(sched);
   }
 
   const lObs = (iv.readout_lrhr?.n_on || 0) + (iv.readout_lrhr?.n_off || 0);
@@ -448,7 +680,7 @@ function reportCard(iv) {
       // Always on, so there's no baseline to measure an effect against — show each
       // option's raw average HRV and resting HR instead.
       const doses = (r.doses || []).slice().sort((a, b) => b.p_best - a.p_best);
-      const lrByOpt = new Map((iv.readout_lrhr?.doses || []).map((d) => [Math.round(d.dose), d]));
+      const lrByOpt = new Map((iv.readout_lrhr?.doses || []).map((d) => [Number(d.dose).toFixed(6), d]));
       const best = optLabel(iv, r.recommended_dose);
       card.appendChild(el("p", "iv-meta",
         (best ? `📈 Best for HRV: <b>${esc(best)}</b> — each option's average across its nights. ` : "📈 ") +
@@ -457,8 +689,8 @@ function reportCard(iv) {
         const table = el("table", "dose-table");
         table.innerHTML = "<tr><th>Option</th><th>Avg HRV</th><th>Avg resting HR</th><th>P(best)</th><th></th></tr>";
         for (const d of doses) {
-          const rec = Math.round(d.dose) === Math.round(r.recommended_dose) && r.recommended_dose > 0;
-          table.appendChild(choiceRow(d, lrByOpt.get(Math.round(d.dose)),
+          const rec = sameLevel(d.dose, r.recommended_dose) && r.recommended_dose > 0;
+          table.appendChild(choiceRow(d, lrByOpt.get(Number(d.dose).toFixed(6)),
             esc(optLabel(iv, d.dose) || "(removed)"), rec));
         }
         card.appendChild(table);
@@ -491,8 +723,61 @@ function reportCard(iv) {
   }
 
   if (!lrhrHandled) appendLrhr(card, iv);
+  appendTst(card, iv);
+  appendLat(card, iv);
   appendEff(card, iv);
   return card;
+}
+
+// Sleep-onset latency line (minutes to fall asleep, LOWER is better). The fit is on
+// -latency, so flip back to report a real change in minutes.
+function appendLat(card, iv) {
+  const re = iv.readout_lat || {};
+  const isChoice = isChoiceKind(iv);
+  if (isChoice && !iv.test_skip) return;
+  const nOn = re.n_on || 0, nOff = re.n_off || 0;
+  if (nOn + nOff === 0) return;
+  const ready = isChoice ? (nOn >= MIN_ON && nOff >= MIN_OFF) : enough(nOn, nOff, false);
+  if (!ready || re.on_effect == null) {
+    card.appendChild(el("p", "iv-meta eff-line",
+      `⏱ <b>Sleep latency</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off.`));
+    return;
+  }
+  const delta = -re.on_effect, lo = -re.on_ci_high, hi = -re.on_ci_low;   // minutes, real sign
+  const cls = delta <= 0 ? "pos" : "neg";
+  const label = isChoice ? "Sleep latency — any option vs skipping" : "Sleep latency";
+  const avgs = (re.on_mean != null && re.off_mean != null)
+    ? ` Avg <b>${avg1(re.on_mean)} min</b> on / <b>${avg1(re.off_mean)} min</b> off.` : "";
+  card.appendChild(el("p", "iv-meta eff-line",
+    `⏱ <b>${label}</b>: <span class="effect ${cls}">${signed(delta)}</span> min ` +
+    `<span class="ci">[${signed(lo)}, ${signed(hi)}]</span> on average ` +
+    `(lower is better) — <b>${pct(re.p_helps)}</b> chance it shortens time to fall asleep.` + avgs));
+}
+
+// Total-sleep-time line (hours asleep; effect is in hours, higher is better).
+// Same compact form as the sleep-efficiency line, and shown just above it.
+function appendTst(card, iv) {
+  const re = iv.readout_tst || {};
+  const isChoice = isChoiceKind(iv);
+  if (isChoice && !iv.test_skip) return;
+  const nOn = re.n_on || 0, nOff = re.n_off || 0;
+  if (nOn + nOff === 0) return;
+  const ready = isChoice ? (nOn >= MIN_ON && nOff >= MIN_OFF) : enough(nOn, nOff, false);
+  if (!ready || re.on_effect == null) {
+    card.appendChild(el("p", "iv-meta eff-line",
+      `🛌 <b>Total sleep</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off.`));
+    return;
+  }
+  const cls = re.on_effect >= 0 ? "pos" : "neg";
+  const label = isChoice ? "Total sleep — any option vs skipping" : "Total sleep";
+  const hm = (h) => { const m = Math.round(h * 60); return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`; };
+  const mins = (h) => (h >= 0 ? "+" : "−") + Math.round(Math.abs(h) * 60) + " min";
+  const avgs = (re.on_mean != null && re.off_mean != null)
+    ? ` Avg <b>${hm(re.on_mean)}</b> on / <b>${hm(re.off_mean)}</b> off.` : "";
+  card.appendChild(el("p", "iv-meta eff-line",
+    `🛌 <b>${label}</b>: <span class="effect ${cls}">${mins(re.on_effect)}</span> ` +
+    `<span class="ci">[${mins(re.on_ci_low)}, ${mins(re.on_ci_high)}]</span> on average ` +
+    `(higher is better) — <b>${pct(re.p_helps)}</b> chance it lengthens your sleep.` + avgs));
 }
 
 // Sleep-efficiency line (percent of time in bed spent asleep; effect is in
@@ -500,7 +785,7 @@ function reportCard(iv) {
 // stays the headline metric.
 function appendEff(card, iv) {
   const re = iv.readout_eff || {};
-  const isChoice = iv.kind === "choice";
+  const isChoice = isChoiceKind(iv);
   // For a choice, the effect is "any option vs skipping" -- needs a skip baseline.
   if (isChoice && !iv.test_skip) return;
   const nOn = re.n_on || 0, nOff = re.n_off || 0;
@@ -567,7 +852,7 @@ function rhrMetric(iv) {
 // Resting-HR line (LRHR fit is on -LRHR, so flip the sign back to bpm; negative = lower = good)
 function appendLrhr(card, iv) {
   const rl = iv.readout_lrhr || {};
-  const isChoice = iv.kind === "choice";
+  const isChoice = isChoiceKind(iv);
   // For a choice, the resting-HR effect is "any option vs skipping" -- only meaningful
   // when it's testing the skip option and has some control nights.
   if (isChoice && !iv.test_skip) return;
@@ -640,8 +925,9 @@ function doseChart(iv, rows, r, showRec) {
   // numeric doses: an extra gap before it says "beyond the max, not one more step"
   const hasOpen = rows.some((d) => isOpenDose(d.dose));
   const GAP = hasOpen ? 0.6 : 0;                 // in column widths
-  const W = Math.max(230, 54 + (n + GAP) * 72), H = 150;
-  const mL = 42, mR = 16, mT = 16, mB = 30;
+  // fill the report column (it's ~half the card); only grow past that for many doses
+  const W = Math.max(CHART_MIN_W, 54 + (n + GAP) * 72), H = 170;
+  const mL = 42, mR = 44, mT = 16, mB = 30;   // right margin fits the last value label
   const pL = mL, pR = W - mR, pT = mT, pB = H - mB, pH = pB - pT, pW = pR - pL;
 
   let lo = 0, hi = 0;
@@ -649,15 +935,27 @@ function doseChart(iv, rows, r, showRec) {
   if (hi - lo < 1) { hi += 1; lo -= 1; }
   const pad = (hi - lo) * 0.08; hi += pad; lo -= pad;
   const py = (v) => pT + (hi - v) / (hi - lo) * pH;
-  const colW = pW / (n + GAP), cx = (i) => pL + colW * (i + 0.5 + (isOpenDose(rows[i].dose) ? GAP : 0));
+  // x is TO SCALE: numeric doses sit at their value along the axis (half a column of
+  // padding at each end); the open-ended arm keeps its own slot at the far right.
+  const slotW = pW / (n + GAP);
+  const nums = rows.filter((d) => !isOpenDose(d.dose)).map((d) => Number(d.dose));
+  const dmin = Math.min(...nums), dmax = Math.max(...nums);
+  const numL = pL + slotW / 2, numW = pW - slotW - (hasOpen ? slotW * (1 + GAP) : 0);
+  const cx = (i) => {
+    const d = Number(rows[i].dose);
+    if (isOpenDose(d)) return pR - slotW / 2;
+    return dmax === dmin ? numL + numW / 2 : numL + (d - dmin) / (dmax - dmin) * numW;
+  };
   const y0 = py(0);
   const topLbl = (hi >= 0 ? "+" : "") + Math.round(hi);
   const botLbl = (lo >= 0 ? "+" : "") + Math.round(lo);
 
   const parts = [];
-  // y extents + baseline
-  parts.push(`<text x="${pL - 6}" y="${pT + 4}" text-anchor="end" font-size="10" style="fill:var(--muted)">${topLbl}</text>`);
-  parts.push(`<text x="${pL - 6}" y="${pB}" text-anchor="end" font-size="10" style="fill:var(--muted)">${botLbl}</text>`);
+  // y extents + baseline (an extent label that would sit on the "0" is dropped)
+  if (Math.abs((pT + 4) - (y0 + 3.5)) > 11)
+    parts.push(`<text x="${pL - 6}" y="${pT + 4}" text-anchor="end" font-size="10" style="fill:var(--muted)">${topLbl}</text>`);
+  if (Math.abs(pB - (y0 + 3.5)) > 11)
+    parts.push(`<text x="${pL - 6}" y="${pB}" text-anchor="end" font-size="10" style="fill:var(--muted)">${botLbl}</text>`);
   parts.push(`<line x1="${pL}" y1="${y0}" x2="${pR}" y2="${y0}" stroke-width="1.5" stroke-dasharray="4 4" style="stroke:var(--line)"/>`);
   parts.push(`<text x="${pL - 6}" y="${y0 + 3.5}" text-anchor="end" font-size="10" style="fill:var(--text)">0</text>`);
 
@@ -675,9 +973,8 @@ function doseChart(iv, rows, r, showRec) {
     // mean dot with a surface ring, plus a native hover tooltip
     parts.push(`<circle cx="${x}" cy="${yM}" r="5" stroke-width="2" style="fill:${col};stroke:var(--panel)">` +
       `<title>${doseAmount(iv, d.dose)}: ${signed(d.mean_effect)} HRV [${signed(d.ci_low)}, ${signed(d.ci_high)}]</title></circle>`);
-    // direct value label, flipped to the left on the last column so it never overflows
-    const left = i === n - 1 && n > 1;
-    parts.push(`<text x="${x + (left ? -9 : 9)}" y="${yM + 3.5}" text-anchor="${left ? "end" : "start"}" font-size="11" font-weight="600" style="fill:${col}">${signed(d.mean_effect)}</text>`);
+    // direct value label, always to the right of the dot (same direction for every dose)
+    parts.push(`<text x="${x + 9}" y="${yM + 3.5}" text-anchor="start" font-size="11" font-weight="600" style="fill:${col}">${signed(d.mean_effect)}</text>`);
     // x tick
     parts.push(`<text x="${x}" y="${pB + 15}" text-anchor="middle" font-size="10.5" style="fill:var(--muted)">${esc(String(doseTick(iv, d.dose)))}</text>`);
   });
@@ -697,7 +994,7 @@ function doseChart(iv, rows, r, showRec) {
 // of doseChart, shown beside the big "any option vs skipping" hero numbers.
 function optionChart(iv, rows, r) {
   const n = rows.length;
-  const W = Math.max(230, 54 + n * 84), H = 152;
+  const W = Math.max(CHART_MIN_W, 54 + n * 84), H = 170;
   const mL = 42, mR = 16, mT = 16, mB = 32;
   const pL = mL, pR = W - mR, pT = mT, pB = H - mB, pH = pB - pT, pW = pR - pL;
 
@@ -783,7 +1080,7 @@ function hrvTrendCard(t) {
   range.appendChild(btnRecent); range.appendChild(btnAll);
   const head = el("div", "chart-head");
   head.appendChild(el("p", "chart-cap",
-    '<span class="mk-avg">━</span> 7-day avg · <span class="mk-band">▮</span> ' +
+    '<span class="mk-avg">━</span> 7-day avg · <span class="mk-peak">─</span> its peak in view · <span class="mk-band">▮</span> ' +
     `${t.window_days}-day μ ± 0.5σ band (of ln RMSSD) · <span class="mk-night">●</span> nightly`));
   head.appendChild(range);
   card.appendChild(head);
@@ -875,6 +1172,18 @@ function hrvTrendChart(days, windowDays, appStart) {
   for (const [a, b] of runs("avg7")) {
     const seg = days.slice(a, b + 1);
     parts.push(`<polyline points="${seg.map((d, j) => `${px(a + j)},${py(d.avg7)}`).join(" ")}" fill="none" stroke-width="2.5" stroke-linejoin="round" style="stroke:var(--accent)"/>`);
+  }
+
+  // thin, dim reference line through the period's highest 7-day average, labelled
+  // at the left edge; a quiet "how far from my best" cue for the shown range
+  let iPeak = -1;
+  days.forEach((d, i) => { if (d.avg7 != null && (iPeak < 0 || d.avg7 > days[iPeak].avg7)) iPeak = i; });
+  if (iPeak >= 0) {
+    const yP = py(days[iPeak].avg7);
+    parts.push(`<line x1="${pL}" y1="${yP}" x2="${pR}" y2="${yP}" stroke-width="1" ` +
+      `style="stroke:var(--accent);opacity:.6"/>`);
+    parts.push(`<text x="${pL + 5}" y="${yP - 3}" font-size="9.3" style="fill:var(--accent);opacity:.85">` +
+      `peak 7-day avg ${avg1(days[iPeak].avg7)}</text>`);
   }
 
   // latest-value labels on the right edge, nudged apart if they'd collide
@@ -1148,10 +1457,14 @@ window.addEventListener("hashchange", () => switchView(location.hash.replace("#"
 let editingId = null;
 function syncKind() {
   const k = $("#iv-kind").value;
-  $("#dose-fields").hidden = k !== "dose";
-  $("#choice-fields").hidden = k !== "choice";
+  const dosed = k === "dose" || k === "choice_dose", choice = k === "choice" || k === "choice_dose";
+  $("#dose-fields").hidden = !dosed;
+  $("#choice-fields").hidden = !choice;
+  // the open-ended arm is a plain-dose feature
+  $("#open-arm-label").hidden = k !== "dose";
+  if (k !== "dose") { $("#iv-form").open_arm.checked = false; $("#open-arm-name").hidden = true; }
   // the prior drives the on/off draw; a multiple choice only has one if it also tests skipping
-  $("#prior-field").hidden = k === "choice" && !$("#iv-form").test_skip.checked;
+  $("#prior-field").hidden = choice && !$("#iv-form").test_skip.checked;
 }
 $("#iv-kind").addEventListener("change", syncKind);
 $("#iv-form").test_skip.addEventListener("change", syncKind);
@@ -1183,6 +1496,37 @@ $("#iv-form").max_dose.addEventListener("input", syncDelay);
 // ---- multiple-choice options editor (each option keeps a stable id) ----
 let modalOptions = [];  // [{id: number|null, label}]
 
+// Effective prior over the options (fraction each): assigned values as given, the
+// blank ones sharing the remaining mass equally (mirrors bandit.effective_option_probs).
+function effectiveOptionPriors(opts) {
+  const given = opts.map((o) => (o.prior > 0 ? o.prior : null));
+  const s = given.reduce((a, p) => a + (p || 0), 0);
+  const blanks = given.filter((p) => p == null).length;
+  return given.map((p) => p != null ? p : (blanks && s < 1 ? (1 - s) / blanks : 0));
+}
+
+function refreshPriorPlaceholders() {
+  const eff = effectiveOptionPriors(modalOptions);
+  $$("#options-list .opt-prior").forEach((inp, i) => {
+    inp.placeholder = Math.round(eff[i] * 100) + "%";
+    inp.title = modalOptions[i].prior > 0 ? "Your prior that this option is the best"
+      : `Blank — gets an equal share of what's left: ${Math.round(eff[i] * 100)}%`;
+  });
+  const s = modalOptions.reduce((a, o) => a + (o.prior > 0 ? o.prior : 0), 0);
+  const blanks = modalOptions.filter((o) => !(o.prior > 0)).length;
+  const bad = s > 1 + 1e-9 || (!blanks && modalOptions.length && Math.abs(s - 1) > 1e-9);
+  const hint = $("#prior-sum-hint");
+  if (hint) {
+    hint.hidden = !modalOptions.length;
+    hint.textContent = bad
+      ? (s > 1 ? `Priors add up to ${Math.round(s * 100)}% — they can't exceed 100%.`
+               : `Priors add up to ${Math.round(s * 100)}% — with every option assigned they must total 100%.`)
+      : (blanks ? `Assigned ${Math.round(s * 100)}% · the ${blanks} blank option${blanks === 1 ? "" : "s"} share${blanks === 1 ? "s" : ""} the remaining ${Math.round((1 - s) * 100)}%.`
+                : "Priors total 100%.");
+    hint.classList.toggle("bad", bad);
+  }
+}
+
 function renderOptions() {
   const list = $("#options-list");
   list.innerHTML = "";
@@ -1192,6 +1536,18 @@ function renderOptions() {
   modalOptions.forEach((o, i) => {
     const row = el("div", "opt-row");
     row.appendChild(el("span", "opt-label", esc(o.label)));
+    // optional prior that THIS option is the best, as a percent (blank = equal share of the rest)
+    const pri = document.createElement("input");
+    pri.type = "number"; pri.min = "1"; pri.max = "100"; pri.step = "1"; pri.inputMode = "numeric";
+    pri.className = "opt-prior";
+    pri.value = o.prior > 0 ? String(Math.round(o.prior * 100)) : "";
+    pri.addEventListener("input", () => {
+      const v = parseFloat(pri.value);
+      modalOptions[i] = { ...modalOptions[i], prior: v > 0 ? Math.min(v, 100) / 100 : null };
+      refreshPriorPlaceholders();
+    });
+    row.appendChild(pri);
+    row.appendChild(el("span", "opt-pct", "%"));
     const ren = el("button", "ghost opt-btn", "Rename");
     ren.type = "button";
     ren.addEventListener("click", () => renameOption(i));
@@ -1203,13 +1559,14 @@ function renderOptions() {
     row.appendChild(del);
     list.appendChild(row);
   });
+  refreshPriorPlaceholders();
 }
 
 function addOptionFromInput() {
   const inp = $("#new-option");
   const v = inp.value.trim();
   if (!v) return;
-  modalOptions.push({ id: null, label: v });   // id minted server-side on save
+  modalOptions.push({ id: null, label: v, prior: null });   // id minted server-side on save
   inp.value = "";
   renderOptions();
   inp.focus();
@@ -1235,12 +1592,73 @@ $("#new-option").addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); addOptionFromInput(); }
 });
 
+// ---- completion-input editor -----------------------------------------------
+// How a night's cell is marked done: checkbox (default), mutually exclusive
+// buttons, or a number. Radio buttons keep stable ids exactly like choice
+// options, so recorded nights survive renames.
+const INPUT_TYPES = ["checkbox", "radio", "quantity"];
+let inputOptions = [];  // [{id: number|null, label}]
+
+function renderInputOptions() {
+  const list = $("#input-options-list");
+  list.innerHTML = "";
+  if (!inputOptions.length) {
+    list.appendChild(el("p", "field-hint", "No buttons yet — add at least one below."));
+  }
+  inputOptions.forEach((o, i) => {
+    const row = el("div", "opt-row");
+    row.appendChild(el("span", "opt-label", esc(o.label)));
+    const ren = el("button", "ghost opt-btn", "Rename");
+    ren.type = "button";
+    ren.addEventListener("click", () => {
+      const next = window.prompt(`Rename “${o.label}”?\nIts recorded nights stay attached.`, o.label);
+      if (next == null) return;
+      const t = next.trim();
+      if (t && t !== o.label) { inputOptions[i] = { ...o, label: t }; renderInputOptions(); }
+    });
+    const del = el("button", "ghost opt-btn opt-del", "✕");
+    del.type = "button";
+    del.title = "Remove button";
+    del.addEventListener("click", () => {
+      if (window.confirm(`Remove “${o.label}”?\nPast nights recorded with it are kept.`)) {
+        inputOptions.splice(i, 1);
+        renderInputOptions();
+      }
+    });
+    row.appendChild(ren);
+    row.appendChild(del);
+    list.appendChild(row);
+  });
+}
+
+function addInputOptionFromInput() {
+  const inp = $("#new-input-option");
+  const v = inp.value.trim();
+  if (!v) return;
+  inputOptions.push({ id: null, label: v });   // id minted server-side on save
+  inp.value = "";
+  renderInputOptions();
+  inp.focus();
+}
+
+$("#add-input-option-btn").addEventListener("click", addInputOptionFromInput);
+$("#new-input-option").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); addInputOptionFromInput(); }
+});
+
+function syncInputType() {
+  const t = $("#iv-input-type").value;
+  $("#input-radio-fields").hidden = t !== "radio";
+  $("#input-qty-field").hidden = t !== "quantity";
+}
+$("#iv-input-type").addEventListener("change", syncInputType);
+
 function openModal(iv) {
   editingId = iv ? iv.id : null;
   $("#modal-title").textContent = iv ? "Edit intervention" : "Add intervention";
   const f = $("#iv-form");
   f.name.value = iv ? iv.name : "";
-  f.category.value = iv && iv.category === "behavioral" ? "behavioral" : "supplement";
+  f.category.value = iv && CATEGORY_ORDER.includes(iv.category) ? iv.category : "supplement";
   f.kind.value = iv ? iv.kind : "dose";
   f.unit.value = iv ? iv.unit : "";
   f.default_dose.value = iv ? iv.default_dose : 1;
@@ -1257,9 +1675,15 @@ function openModal(iv) {
   f.test_skip.checked = iv ? !!iv.test_skip : false;
   f.prior_helps.value = String(iv && iv.prior_helps ? priorPct(iv.prior_helps) : 50);
   f.note.value = iv ? iv.note : "";
-  modalOptions = iv && iv.kind === "choice" ? (iv.options || []).map((o) => ({ id: o.id, label: o.label })) : [];
+  modalOptions = iv && isChoiceKind(iv) ? (iv.options || []).map((o) => ({ id: o.id, label: o.label, prior: o.prior > 0 ? o.prior : null })) : [];
   $("#new-option").value = "";
   renderOptions();
+  f.input_type.value = iv && INPUT_TYPES.includes(iv.input_type) ? iv.input_type : "checkbox";
+  f.input_label.value = iv ? (iv.input_label || "") : "";
+  inputOptions = iv ? (iv.input_options || []).map((o) => ({ id: o.id, label: o.label })) : [];
+  $("#new-input-option").value = "";
+  renderInputOptions();
+  syncInputType();
   syncKind();
   const del = $("#iv-delete");
   del.hidden = !iv;
@@ -1292,14 +1716,27 @@ async function deleteIv(iv) {
 $("#iv-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target;
-  const kind = ["choice", "boolean"].includes(f.kind.value) ? f.kind.value : "dose";
+  const kind = ["choice", "boolean", "choice_dose"].includes(f.kind.value) ? f.kind.value : "dose";
   const prPct = Math.min(80, Math.max(1, parseFloat(f.prior_helps.value) || 50));  // capped at 80%
   const payload = { name: f.name.value.trim(), kind, category: f.category.value, note: f.note.value.trim(),
                     prior_helps: prPct / 100 };
-  if (kind === "choice") {
+  payload.input_type = INPUT_TYPES.includes(f.input_type.value) ? f.input_type.value : "checkbox";
+  payload.input_options = inputOptions;
+  payload.input_label = f.input_label.value.trim();
+  if (payload.input_type === "radio" && !inputOptions.length) {
+    alert("Add at least one button label (or switch the completion input back to a checkbox).");
+    return;
+  }
+  if (kind === "choice" || kind === "choice_dose") {
+    if (!modalOptions.length) { alert("Add at least one option."); return; }
+    const ps = modalOptions.reduce((a, o) => a + (o.prior > 0 ? o.prior : 0), 0);
+    const blanks = modalOptions.filter((o) => !(o.prior > 0)).length;
+    if (ps > 1 + 1e-9) { alert("The option priors add up to more than 100%."); return; }
+    if (!blanks && Math.abs(ps - 1) > 1e-9) { alert("With every option given a prior, they must add up to exactly 100%."); return; }
     payload.options = modalOptions;
     payload.test_skip = f.test_skip.checked;
-  } else if (kind === "dose") {
+  }
+  if (kind === "dose" || kind === "choice_dose") {
     payload.unit = f.unit.value.trim();
     payload.default_dose = parseFloat(f.default_dose.value) || 1;
     payload.unit_dose = parseFloat(f.unit_dose.value) || 0;
@@ -1308,7 +1745,7 @@ $("#iv-form").addEventListener("submit", async (e) => {
     payload.noun_amount = per > 0 ? per : null;
     payload.explore_doses = f.explore_doses.checked;
     payload.delay_explore = f.delay_explore.checked;
-    payload.open_arm = f.open_arm.checked && !f.open_arm.disabled;
+    payload.open_arm = kind === "dose" && f.open_arm.checked && !f.open_arm.disabled;
     payload.open_arm_label = f.open_arm_label.value.trim();
     // optional bounds: blank -> null (no bound). Keep the standard dose inside them.
     const lo = parseFloat(f.min_dose.value), hi = parseFloat(f.max_dose.value);
@@ -1335,6 +1772,7 @@ $("#iv-cancel").addEventListener("click", closeModal);
 $("#modal-backdrop").addEventListener("click", (e) => { if (e.target === $("#modal-backdrop")) closeModal(); });
 // row-label click opens the editor for that intervention
 $("#grid").addEventListener("click", (e) => {
+  if (READ_ONLY) return;
   const lab = e.target.closest(".rowlab");
   if (!lab) return;
   const id = lab.parentElement.dataset.ivId;   // group/HRV rows have none
@@ -1445,15 +1883,52 @@ $("#oura-disconnect").addEventListener("click", async () => {
 function handleOuraReturn() {
   const m = location.hash.match(/^#oura=(\w+)/);
   if (!m) return;
-  history.replaceState(null, "", "/#grid");
+  history.replaceState(null, "", SB.base + "#grid");
   if (m[1] === "connected") openOuraModal();   // ouraAutoSync() follows in the init chain
   else alert(m[1] === "denied" ? "Oura connection was declined." : "Oura connection failed — try connecting again.");
 }
 
-loadGrid()
-  .then(() => {
-    handleOuraReturn();
-    switchView(location.hash.replace("#", "") || "grid");
-    ouraAutoSync();
-  })
-  .catch((e) => { document.body.innerHTML = `<pre style="padding:40px;color:#ff7a7a">Failed to load: ${e.message}</pre>`; });
+// ---- hosted mode: what each face of the site shows -------------------------
+if (READ_ONLY) {
+  // public view: no editing controls anywhere (and no way to reach the admin page)
+  $("#add-btn").hidden = true;
+  $("#oura-btn").hidden = true;
+  const exp = $('.toolbar a[href="/api/export"]'); if (exp) exp.hidden = true;
+  const hint = $("#view-grid .hint");
+  if (hint) hint.textContent = "Each night the app chooses which interventions to run (and at what dose/option), weighted toward what's raised HRV so far. Highlighted cells were done; the bottom rows are each morning's measurements.";
+}
+if (SB.mode === "admin") {
+  $("#logout-btn").hidden = false;
+  $("#logout-btn").addEventListener("click", async () => {
+    try { await post("/api/logout", {}); } catch (e) { /* cookie clears anyway */ }
+    location.href = "/";
+  });
+}
+if (SB.hosted) {
+  // the Oura redirect URI shown in the setup text is the site's, not localhost
+  $$("#oura-backdrop code").forEach((c) => { if (c.textContent.includes("/oura/callback")) c.textContent = SB.redirect_uri; });
+}
+
+if (SB.mode === "login") {
+  // admin path, not signed in: only the sign-in form; nothing else loads
+  $("#login-backdrop").hidden = false;
+  $("#login-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = $("#login-error"); err.hidden = true;
+    try {
+      await post("/api/login", { password: e.target.password.value });
+      location.reload();
+    } catch (ex) {
+      err.textContent = ex.message || "Sign-in failed."; err.hidden = false;
+    }
+  });
+  $("#login-form").password.focus();
+} else {
+  loadGrid()
+    .then(() => {
+      handleOuraReturn();
+      switchView(location.hash.replace("#", "") || "grid");
+      if (!READ_ONLY) ouraAutoSync();
+    })
+    .catch((e) => { document.body.innerHTML = `<pre style="padding:40px;color:#ff7a7a">Failed to load: ${e.message}</pre>`; });
+}

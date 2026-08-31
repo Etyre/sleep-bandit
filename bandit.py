@@ -132,7 +132,8 @@ FAST_PRIOR_WEIGHT = 0.25
 # scheduling probability is held within [10%, 90%]; under 30, within [5%, 95%]; from
 # 30 up it is unclamped. Between the bounds the decision is the ordinary Thompson
 # draw; the clamp only bites at the extremes. The efficacy read-outs are not
-# affected -- this is scheduling only.
+# affected -- this is scheduling only. An intervention with no_lockin set opts out
+# of the guard entirely (toggled from the Reports page cap indicator).
 LOCKIN_TIERS = ((15, 0.90), (30, 0.95))   # (smaller arm has fewer than N nights, cap)
 LOCKIN_P_SAMPLES = 400     # posterior draws used to estimate P(helps) for the clamp
 
@@ -185,6 +186,38 @@ def _d(x):
     return round(float(x), DOSE_ROUND)
 
 
+# "Multiple choice + dose" (kind 'choice_dose'): each night picks BOTH an option and
+# a dose, and every (option, dose) pair is its own arm with its own dose-response
+# point -- the model treats levels as unrelated categories, so no structure is
+# assumed between options. A pair is stored as ONE level number so the rest of the
+# pipeline (assignments, contrasts, read-outs) is untouched:
+#     level = option_id * COMBO_BASE + dose
+# Doses are far below COMBO_BASE and option ids far below OPEN_ARM_DOSE / COMBO_BASE,
+# so the encoding is unambiguous and never collides with the open-arm sentinel.
+# Mirrored in public/app.js (COMBO_BASE).
+COMBO_BASE = 1e6
+
+
+def combo_encode(opt_id, dose):
+    return _d(int(opt_id) * COMBO_BASE + float(dose))
+
+
+def combo_decode(level):
+    """level -> (option_id, dose)."""
+    level = float(level)
+    opt = int(level // COMBO_BASE)
+    return opt, _d(level - opt * COMBO_BASE)
+
+
+def candidate_levels(iv):
+    """The intervention's candidate arms as level numbers: its dose levels, or for a
+    choice+dose every option x dose pair (encoded)."""
+    doses = [_d(x) for x in iv.get("dose_levels") or [] if x and float(x) > 0]
+    if iv.get("kind") == "choice_dose":
+        return [combo_encode(o["id"], d) for o in (iv.get("options") or []) for d in doses]
+    return doses
+
+
 # ---------------------------------------------------------------------------
 # User prior: converting a PRIOR PROBABILITY that an intervention helps into the
 # prior MEAN on its "does it help" effect alpha.
@@ -198,6 +231,67 @@ def _d(x):
 # ---------------------------------------------------------------------------
 _PRIOR_T_DOF = 2.0 * SIGMA2_PRIOR_A
 _PRIOR_T_SCALE = math.sqrt((SIGMA2_PRIOR_B / SIGMA2_PRIOR_A) * ON_PRIOR_VAR)
+# same idea for a per-option prior: the prior sd of one option's deviation
+_DEV_PRIOR_SCALE = math.sqrt((SIGMA2_PRIOR_B / SIGMA2_PRIOR_A) * DOSE_DEV_PRIOR_VAR)
+
+
+def effective_option_probs(options):
+    """Prior probability per option id that it is the best one. Options carry an
+    optional 'prior' in (0,1); the ones left blank share the remaining mass equally.
+    If everything is assigned (or over-assigned) the numbers are renormalised to sum
+    to one. Returns {} unless there are 2+ options."""
+    opts = [o for o in (options or []) if o.get("id") is not None]
+    if len(opts) < 2:
+        return {}
+    given = {}
+    for o in opts:
+        try:
+            p = float(o.get("prior")) if o.get("prior") is not None else None
+        except (TypeError, ValueError):
+            p = None
+        if p is not None and p > 0:
+            given[int(o["id"])] = p
+    rest = [int(o["id"]) for o in opts if int(o["id"]) not in given]
+    s = sum(given.values())
+    out = dict(given)
+    if rest and s < 1.0:
+        for oid in rest:
+            out[oid] = (1.0 - s) / len(rest)
+    else:
+        for oid in rest:
+            out[oid] = 0.0
+    tot = sum(out.values())
+    if tot <= 0:
+        return {}
+    return {oid: p / tot for oid, p in out.items()}
+
+
+def option_prior_means(iv):
+    """Prior MEANS on each option's deviation (from the 'any option' effect) that
+    encode the user's prior over which option is best: proportional to the log of
+    the option's probability, centred so they sum to zero, on the deviation-prior
+    scale. A uniform prior (or none) gives {} -- no prior. Scheduling only."""
+    probs = effective_option_probs(iv.get("options"))
+    if not probs:
+        return {}
+    floor = 1e-3
+    logs = {oid: math.log(max(p, floor)) for oid, p in probs.items()}
+    mean = sum(logs.values()) / len(logs)
+    out = {oid: _DEV_PRIOR_SCALE * (v - mean) for oid, v in logs.items()}
+    if max(abs(v) for v in out.values()) < 1e-9:
+        return {}
+    return out
+
+
+def scheduling_priors(iv):
+    """Everything the planner's prior-inclusive fit needs for one intervention:
+    {'on': prior mean on the on-effect, 'options': {option_id: deviation mean}}, or
+    None if the intervention carries no prior at all."""
+    on = prior_mean_for_prob(iv.get("prior_helps") or 0)
+    opts = option_prior_means(iv) if iv.get("kind") in ("choice", "choice_dose") else {}
+    if not on and not opts:
+        return None
+    return {"on": on, "options": opts}
 
 
 def _betacf(a, b, x):
@@ -360,7 +454,7 @@ def build_columns(interventions, history_doses):
     cols = {}
     idx = 1  # column 0 is the intercept
     for iv in interventions:
-        levels = set(_d(x) for x in iv["dose_levels"] if x and float(x) > 0)
+        levels = set(candidate_levels(iv))
         for x in history_doses.get(iv["id"], ()):
             if x and float(x) > 0:
                 levels.add(_d(x))
@@ -511,13 +605,14 @@ def p_on_estimate(post, on_col, samples=LOCKIN_P_SAMPLES):
     return hits / float(samples)
 
 
-def _decide_on(beta, post, entry, n_on, n_off):
+def _decide_on(beta, post, entry, n_on, n_off, no_lockin=False):
     """Stage 1 of planning: is the intervention ON tonight? The ordinary Thompson
     rule is 'on iff the sampled alpha > 0'. While the lock-in guard applies, P(on) is
     estimated and, if it lies outside the tier's [1 - cap, cap], the decision is a
-    coin at the clamped probability instead; inside the bounds the sample decides."""
+    coin at the clamped probability instead; inside the bounds the sample decides.
+    no_lockin (the per-intervention override) skips the guard entirely."""
     on = beta[entry["on"]] > 0.0
-    if not lockin_active(n_on, n_off):
+    if no_lockin or not lockin_active(n_on, n_off):
         return on
     p = p_on_estimate(post, entry["on"])
     pc = clamp_p_on(p, n_on, n_off)
@@ -597,18 +692,20 @@ def _fast_grid(std, step, lo, hi, open_pos=None):
     return sorted(rungs)
 
 
-def _fast_pick(grid, beta, entry, counts, real, step, noise_sd):
+def _fast_pick(grid, beta, entry, counts, real, step, noise_sd, center=None):
     """The fast sweep's choice: one Thompson draw over the grid. Each rung's value is
         smoothed sampled effect + N(0, dev_sd / sqrt(1 + n_eff)),
     where the smoothed effect is a Gaussian-kernel blend (bandwidth FAST_KERNEL_STEPS
     unit doses) of the SAMPLED effects at measured rungs, shrunk toward the sampled
     plain "on" effect with pseudo-weight FAST_PRIOR_WEIGHT; dev_sd is the model's
     prior sd for one dose's deviation (sqrt(DOSE_DEV_PRIOR_VAR) x noise sd); n_eff is
-    the kernel-weighted count of readings near the rung. Returns the rung with the
-    highest draw. counts/real: position -> readings / real dose (the open-arm rung's
-    real dose is the sentinel)."""
+    the kernel-weighted count of readings near the rung. Returns (rung, draw) for the
+    rung with the highest draw. counts/real: position -> readings / the level to
+    evaluate the model at (the open-arm rung's sentinel, or an encoded option+dose)."""
     h = FAST_KERNEL_STEPS * step
-    alpha = beta[entry["on"]]
+    # what a rung with no nearby data shrinks toward: the sampled plain "on" effect,
+    # or a caller-supplied centre (e.g. an option's own sampled effect)
+    alpha = beta[entry["on"]] if center is None else center
     dev_sd = math.sqrt(DOSE_DEV_PRIOR_VAR) * noise_sd
     measured = [(p, _effect(beta, entry, real[p]), counts[p]) for p in counts if counts[p] > 0]
     best, best_val = None, None
@@ -622,7 +719,48 @@ def _fast_pick(grid, beta, entry, counts, real, step, noise_sd):
         val = esum / wsum + random.gauss(0.0, dev_sd / math.sqrt(1.0 + n_eff))
         if best_val is None or val > best_val:
             best, best_val = r, val
-    return best
+    return best, best_val
+
+
+def _plan_combo(iv, beta, entry, measured, noise_sd):
+    """Choice+dose, once it's ON: one Thompson draw over the whole option x dose grid.
+    Each option gets the fast sweep's smoothed draw over its dose grid (its own
+    measured pairs inform it; rungs with no nearby data shrink toward the shared
+    'any option' effect plus a sampled deviation), and the option whose best rung
+    drew highest wins. Untried options and untried doses therefore keep a real chance
+    while anything measured bad fades. Returns the encoded level (0 if no options)."""
+    std = _d(iv.get("default_dose") or 0)
+    lo, hi = _bounds(iv)
+    step = _dose_step(iv)
+    if not iv.get("explore_doses", True) or step <= 0:
+        grid = [std]
+    elif lo is not None and hi is not None:
+        grid = _fast_grid(std, step, lo, hi)
+    else:
+        grid = sorted({x for x in (std, _d(std - step), _d(std + step)) if x > 0})
+    best_level, best_val = 0.0, None
+    for o in iv.get("options") or []:
+        oid = int(o["id"])
+        counts, real = {}, {}
+        for x in measured:
+            xo, xd = combo_decode(x)
+            if xo != oid or xd <= 0:
+                continue
+            counts[xd] = counts.get(xd, 0) + 1
+            real[xd] = _d(x)
+        g = sorted(set(grid) | set(counts))     # measured doses stay exploitable
+        # this option's own sampled effect (its candidate levels carry its prior and
+        # any of its data) is what its untried rungs shrink toward -- so a favoured
+        # option stays favoured until its nights say otherwise
+        lv = [combo_encode(oid, d) for d in (iv.get("dose_levels") or []) if d and float(d) > 0]
+        lv = [x for x in lv if x in entry["contrast"]] or None
+        centre = (sum(_effect(beta, entry, x) for x in lv) / len(lv)) if lv else None
+        dose, val = _fast_pick(g, beta, entry, counts, real, step if step > 0 else 1.0, noise_sd, center=centre)
+        if dose is None:
+            continue
+        if best_val is None or val > best_val:
+            best_level, best_val = combo_encode(oid, dose), val
+    return best_level
 
 
 def _in_bounds(d, lo, hi):
@@ -716,13 +854,25 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
             plan[iv["id"]] = 0.0
             continue
 
+        if iv.get("kind") == "choice_dose":
+            # Multiple choice + dose: same on/off rule as a choice (always on unless it
+            # tests skipping), then a joint search over option x dose.
+            if iv.get("test_skip") and not _decide_on(beta, post, entry,
+                                                      n_on.get(iv["id"], 0), n_off.get(iv["id"], 0),
+                                                      iv.get("no_lockin", False)):
+                plan[iv["id"]] = 0.0
+                continue
+            plan[iv["id"]] = _plan_combo(iv, beta, entry, measured.get(iv["id"], ()), math.sqrt(sigma2))
+            continue
+
         if iv.get("kind") == "choice":
             # By default a choice always lands on some option. If it also tests the
             # "skip" option, run stage 1 first: skip when a sampled alpha <= 0, which
             # sprinkles in control nights so the average effect of doing ANY option vs
             # nothing becomes measurable.
             if iv.get("test_skip") and not _decide_on(beta, post, entry,
-                                                      n_on.get(iv["id"], 0), n_off.get(iv["id"], 0)):
+                                                      n_on.get(iv["id"], 0), n_off.get(iv["id"], 0),
+                                                      iv.get("no_lockin", False)):
                 plan[iv["id"]] = 0.0
                 continue
             best_dose, _ = _best_dose(beta, entry, iv["dose_levels"])
@@ -731,7 +881,8 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
 
         # Stage 1: on/off from the "does it help at all" effect alone (unbiased),
         # with the early lock-in guard clamping the extremes while data is thin.
-        if not _decide_on(beta, post, entry, n_on.get(iv["id"], 0), n_off.get(iv["id"], 0)):
+        if not _decide_on(beta, post, entry, n_on.get(iv["id"], 0), n_off.get(iv["id"], 0),
+                          iv.get("no_lockin", False)):
             plan[iv["id"]] = 0.0
             continue
 
@@ -809,7 +960,7 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
             # smoothed across neighbouring rungs, with an optimism bonus where data is
             # thin -- see FAST_* above.
             grid = _fast_grid(std, step, lo, hi, open_pos)
-            dose = _fast_pick(grid, beta, entry, counts, real, step, math.sqrt(sigma2)) if grid else std
+            dose = _fast_pick(grid, beta, entry, counts, real, step, math.sqrt(sigma2))[0] if grid else std
             dose = unpos(dose) if dose and dose > 0 else 0.0
             plan[iv["id"]] = dose if dose and dose > 0 else 0.0
             continue
@@ -865,7 +1016,7 @@ def readouts(interventions, betas, cols, observed=None):
             # even if it was never in the original candidate list.
             levels = sorted(_d(x) for x in observed.get(iv["id"], ()) if x and float(x) > 0)
         else:
-            levels = sorted(set(_d(x) for x in iv["dose_levels"] if x and float(x) > 0))
+            levels = sorted(set(candidate_levels(iv)))
 
         on_samples = [betas[s][entry["on"]] for s in range(S)]
         helps = sum(1 for a in on_samples if a > 0.0)
@@ -899,7 +1050,18 @@ def readouts(interventions, betas, cols, observed=None):
         # reaches ~95% of the peak wins over a bigger one at the peak. Fall back to
         # "off" (0) if no dose beats skipping on average. recommended_p is that dose's
         # P(best), reported for display.
-        rec_dose = _min_viable_dose({row["dose"]: row["mean_effect"] for row in dose_rows}) or 0.0
+        if iv.get("kind") == "choice_dose" and dose_rows:
+            # choice+dose: pick the option whose best pair has the highest mean effect,
+            # then the minimum viable dose WITHIN that option.
+            by_opt = {}
+            for row in dose_rows:
+                o, dd = combo_decode(row["dose"])
+                by_opt.setdefault(o, {})[dd] = row["mean_effect"]
+            best_opt = max(by_opt, key=lambda o: max(by_opt[o].values()))
+            mv = _min_viable_dose(by_opt[best_opt])
+            rec_dose = combo_encode(best_opt, mv) if mv is not None else 0.0
+        else:
+            rec_dose = _min_viable_dose({row["dose"]: row["mean_effect"] for row in dose_rows}) or 0.0
         rec_p = best_counts.get(rec_dose, 0) / S
 
         on_sorted = sorted(on_samples)
@@ -1006,8 +1168,23 @@ def fit_model(interventions, completed_nights, priors=None):
         m0 = [0.0] * p
         for iv in interventions:
             pm = priors.get(iv["id"])
-            if pm:
-                m0[cols[iv["id"]]["on"]] = float(pm)   # prior mean on the "on" effect
+            if not pm:
+                continue
+            entry = cols[iv["id"]]
+            # a bare number is a prior mean on the "on" effect; a dict may also carry
+            # per-option deviation means (see scheduling_priors)
+            on = pm.get("on") if isinstance(pm, dict) else pm
+            if on:
+                m0[entry["on"]] = float(on)
+            opt_means = pm.get("options") if isinstance(pm, dict) else None
+            if opt_means and entry["dev"]:
+                # level deviation means -> contrast-column means (C is orthonormal
+                # across levels and the means are centred, so beta_dev = C^T m)
+                def level_mean(level):
+                    oid = combo_decode(level)[0] if iv.get("kind") == "choice_dose" else int(round(level))
+                    return float(opt_means.get(oid, 0.0))
+                for j, col in enumerate(entry["dev"]):
+                    m0[col] = sum(crow[j] * level_mean(level) for level, crow in entry["contrast"].items())
     post = fit(X, y, p, V0, m0)
     return {"post": post, "cols": cols, "n": post["n"]}
 

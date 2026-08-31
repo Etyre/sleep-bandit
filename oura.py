@@ -41,15 +41,17 @@ class OuraError(Exception):
     """Anything that should surface to the UI as a readable message."""
 
 
-def redirect_uri(port):
-    return f"http://localhost:{port}/oura/callback"
+def redirect_uri(port, base=None):
+    """The OAuth redirect: localhost when running on your own machine, the site's
+    public URL (SB_BASE_URL) when hosted. Must match the URI registered with Oura."""
+    return f"{base.rstrip('/')}/oura/callback" if base else f"http://localhost:{port}/oura/callback"
 
 
-def authorize_url(client_id, state, port):
+def authorize_url(client_id, state, port, base=None):
     return AUTH_URL + "?" + urllib.parse.urlencode({
         "response_type": "code",
         "client_id": client_id,
-        "redirect_uri": redirect_uri(port),
+        "redirect_uri": redirect_uri(port, base),
         "scope": SCOPES,
         "state": state,
     })
@@ -86,12 +88,12 @@ def _save_tokens(conn, tok):
     store.set_setting(conn, "oura_expires_at", expires_at.isoformat(timespec="seconds"))
 
 
-def exchange_code(conn, code, port):
+def exchange_code(conn, code, port, base=None):
     """Trade the callback's authorization code for tokens and store them."""
     tok = _http_json(TOKEN_URL, data={
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": redirect_uri(port),
+        "redirect_uri": redirect_uri(port, base),
         "client_id": store.get_setting(conn, "oura_client_id", ""),
         "client_secret": store.get_setting(conn, "oura_client_secret", ""),
     })
@@ -226,6 +228,8 @@ def sync(conn, current_night, force=False):
             for metric, value in (("hrv", _hrv_value(doc)),
                                   ("lrhr", _lrhr_5min(doc)),
                                   ("lrhr_30s", doc.get("lowest_heart_rate")),
+                                  ("tst", _tst_hours(doc)),
+                                  ("lat", _latency_min(doc)),
                                   ("eff", doc.get("efficiency"))):
                 wrote = store.set_metric_from_oura(conn, night["date"], metric, value)
                 if wrote:
@@ -233,6 +237,20 @@ def sync(conn, current_night, force=False):
     store.set_setting(conn, "oura_last_sync", datetime.now().isoformat(timespec="seconds"))
     store.set_setting(conn, "oura_last_result", json.dumps(result))
     return result
+
+
+def _tst_hours(doc):
+    """Total sleep time in hours (two decimals) from the sleep doc's
+    total_sleep_duration (seconds); None if absent."""
+    s = doc.get("total_sleep_duration")
+    return round(float(s) / 3600.0, 2) if s else None
+
+
+def _latency_min(doc):
+    """Sleep-onset latency in minutes (one decimal) from the sleep doc's latency
+    (seconds); None if absent."""
+    s = doc.get("latency")
+    return round(float(s) / 60.0, 1) if s is not None else None
 
 
 def backfill(conn, first_night, last_night):
@@ -250,6 +268,8 @@ def backfill(conn, first_night, last_night):
         for metric, value in (("hrv", _hrv_value(doc)),
                               ("lrhr", _lrhr_5min(doc)),
                               ("lrhr_30s", doc.get("lowest_heart_rate")),
+                              ("tst", _tst_hours(doc)),
+                              ("lat", _latency_min(doc)),
                               ("eff", doc.get("efficiency"))):
             wrote = store.set_metric_from_oura(conn, night, metric, value)
             if wrote:

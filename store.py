@@ -11,7 +11,8 @@ import os
 import sqlite3
 from datetime import date, datetime
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "sleep_bandit.db")
+# SB_DB_PATH overrides the location (used by tests and optionally by the hosted setup)
+DB_PATH = os.environ.get("SB_DB_PATH") or os.path.join(os.path.dirname(__file__), "data", "sleep_bandit.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS interventions (
@@ -31,9 +32,9 @@ CREATE TABLE IF NOT EXISTS interventions (
     dose_levels  TEXT NOT NULL DEFAULT '[]',   -- JSON array of candidate ON doses
     active       INTEGER NOT NULL DEFAULT 1,
     note         TEXT NOT NULL DEFAULT '',
-    kind         TEXT NOT NULL DEFAULT 'dose',  -- 'dose' | 'choice'
+    kind         TEXT NOT NULL DEFAULT 'dose',  -- 'dose' | 'choice' | 'boolean' | 'choice_dose'
     options      TEXT NOT NULL DEFAULT '[]',    -- JSON array of choice labels (choice kind)
-    category     TEXT NOT NULL DEFAULT 'supplement',  -- 'supplement' | 'behavioral'
+    category     TEXT NOT NULL DEFAULT 'supplement',  -- see CATEGORIES
     created_at   TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS nights (
@@ -44,6 +45,7 @@ CREATE TABLE IF NOT EXISTS nights (
     note       TEXT NOT NULL DEFAULT '',
     excl_behavioral INTEGER NOT NULL DEFAULT 0, -- drop this night from BEHAVIORAL analysis
     excl_supplement INTEGER NOT NULL DEFAULT 0, -- drop this night from SUPPLEMENT analysis
+    excl_environmental INTEGER NOT NULL DEFAULT 0, -- drop this night from ENVIRONMENTAL analysis
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS assignments (
@@ -140,6 +142,24 @@ def connect():
         # bandit.prior_mean_for_prob); it never enters the efficacy numbers and washes
         # out as real nights accumulate.
         conn.execute("ALTER TABLE interventions ADD COLUMN prior_helps REAL NOT NULL DEFAULT 0")
+    if "no_lockin" not in cols:
+        # per-intervention override: skip the early lock-in scheduling guard
+        # (bandit.LOCKIN_TIERS), letting Thompson sampling run unclamped even while
+        # an arm is thin. Toggled from the Reports page cap indicator; reversible
+        # and audit-logged. Scheduling only -- efficacy read-outs are unaffected.
+        conn.execute("ALTER TABLE interventions ADD COLUMN no_lockin INTEGER NOT NULL DEFAULT 0")
+    if "input_type" not in cols:
+        # how a night's completion is recorded for this intervention: 'checkbox'
+        # (the default tick), 'radio' (one of several labeled mutually exclusive
+        # buttons -- clicking any of them marks the night done) or 'quantity' (a
+        # number, or '-' for done-but-not-measured). Radio labels live in
+        # input_options (same stable-id shape as choice options); the quantity's
+        # label in input_label. What was recorded is kept per cell in
+        # assignments.input_value for later analysis; completion itself still
+        # drives taken_dose exactly as the checkbox does.
+        conn.execute("ALTER TABLE interventions ADD COLUMN input_type TEXT NOT NULL DEFAULT 'checkbox'")
+        conn.execute("ALTER TABLE interventions ADD COLUMN input_options TEXT NOT NULL DEFAULT '[]'")
+        conn.execute("ALTER TABLE interventions ADD COLUMN input_label TEXT NOT NULL DEFAULT ''")
     ncols = {r["name"] for r in conn.execute("PRAGMA table_info(nights)")}
     if "lrhr" not in ncols:
         conn.execute("ALTER TABLE nights ADD COLUMN lrhr REAL")
@@ -151,6 +171,9 @@ def connect():
         conn.execute("ALTER TABLE nights ADD COLUMN excl_behavioral INTEGER NOT NULL DEFAULT 0")
     if "excl_supplement" not in ncols:
         conn.execute("ALTER TABLE nights ADD COLUMN excl_supplement INTEGER NOT NULL DEFAULT 0")
+    if "excl_environmental" not in ncols:
+        # third category (room temperature, light, noise ...) split out of 'behavioral'
+        conn.execute("ALTER TABLE nights ADD COLUMN excl_environmental INTEGER NOT NULL DEFAULT 0")
     if "hrv_src" not in ncols:
         # where each metric's current value came from: 'manual' (typed in) or 'oura'
         # (synced). NULL on legacy rows means manual.
@@ -161,6 +184,15 @@ def connect():
         # Oura's `efficiency` field, whole percent; tracked as a third outcome metric
         conn.execute("ALTER TABLE nights ADD COLUMN eff REAL")
         conn.execute("ALTER TABLE nights ADD COLUMN eff_src TEXT")
+    if "tst" not in ncols:
+        # total sleep time in HOURS (Oura's total_sleep_duration / 3600, higher is
+        # better) -- a fourth outcome metric, listed above sleep efficiency
+        conn.execute("ALTER TABLE nights ADD COLUMN tst REAL")
+        conn.execute("ALTER TABLE nights ADD COLUMN tst_src TEXT")
+    if "lat" not in ncols:
+        # sleep-onset latency in MINUTES (Oura's latency / 60, lower is better)
+        conn.execute("ALTER TABLE nights ADD COLUMN lat REAL")
+        conn.execute("ALTER TABLE nights ADD COLUMN lat_src TEXT")
     if "lrhr_30s" not in ncols:
         # Oura reports lowest sleeping HR two ways: from 5-minute aggregate samples
         # (what its app displays -- the basis of every hand-typed lrhr here) and from
@@ -175,6 +207,11 @@ def connect():
         # anyway (no longer a valid control), or the cell's data is otherwise invalid.
         # Reversible and audit-logged; the frozen assignment record is never touched.
         conn.execute("ALTER TABLE assignments ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0")
+    if "input_value" not in acols:
+        # the recorded completion detail for interventions with a non-checkbox
+        # input type: a radio option's stable id (as text), or the quantity as
+        # typed ('-' = done but not measured). NULL when nothing is recorded.
+        conn.execute("ALTER TABLE assignments ADD COLUMN input_value TEXT")
     conn.commit()
     return conn
 
@@ -205,6 +242,10 @@ def _iv_to_dict(row):
         "category": row["category"],
         "test_skip": bool(row["test_skip"]),
         "prior_helps": row["prior_helps"],
+        "no_lockin": bool(row["no_lockin"]),
+        "input_type": row["input_type"],
+        "input_options": _read_options(row["input_options"]),
+        "input_label": row["input_label"] or "",
     }
 
 
@@ -258,10 +299,23 @@ def _read_options(raw):
     out = []
     for i, o in enumerate(json.loads(raw)):
         if isinstance(o, dict) and "label" in o:
-            out.append({"id": int(o.get("id", i + 1)), "label": str(o["label"])})
+            d = {"id": int(o.get("id", i + 1)), "label": str(o["label"])}
+            if _opt_prior(o.get("prior")) is not None:
+                d["prior"] = _opt_prior(o.get("prior"))
+            out.append(d)
         else:
             out.append({"id": i + 1, "label": str(o)})
     return out
+
+
+def _opt_prior(v):
+    """An option's optional prior probability of being best: a float in (0, 1], else
+    None (unset). Stored as a fraction; the form edits it as a percent."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if 0 < f <= 1 else None
 
 
 def _norm_choice_options(options):
@@ -274,20 +328,51 @@ def _norm_choice_options(options):
     out = []
     for o in options:
         if isinstance(o, dict):
-            label, oid = str(o.get("label", "")).strip(), o.get("id")
+            label, oid, prior = str(o.get("label", "")).strip(), o.get("id"), _opt_prior(o.get("prior"))
         else:
-            label, oid = str(o).strip(), None
+            label, oid, prior = str(o).strip(), None, None
         if not label:
             continue
         if oid is None:
             oid = nxt
             nxt += 1
-        out.append({"id": int(oid), "label": label})
+        d = {"id": int(oid), "label": label}
+        if prior is not None:
+            d["prior"] = prior
+        out.append(d)
     return out
 
 
+# Intervention kinds. 'choice_dose' = multiple choice + dose: the app picks an option
+# AND a dose each night (shared dose scale; every option x dose pair is its own arm).
+KINDS = ("dose", "choice", "boolean", "choice_dose")
+
+# Intervention categories, in display order. Each has a per-night exclusion column
+# on `nights` named excl_<category>. Unknown values fall back to 'supplement'.
+CATEGORIES = ("supplement", "behavioral", "environmental")
+
+
 def _norm_category(category):
-    return "behavioral" if category == "behavioral" else "supplement"
+    return category if category in CATEGORIES else "supplement"
+
+
+# Completion input types: how a night's cell is marked done. 'checkbox' is the
+# default tick; 'radio' offers labeled mutually exclusive buttons (any one = done);
+# 'quantity' takes a number (or '-' for done-but-not-measured). The recorded value
+# is stored on the cell (assignments.input_value) for later analysis.
+INPUT_TYPES = ("checkbox", "radio", "quantity")
+
+
+def _norm_input(input_type, input_options, input_label):
+    """Normalize an intervention's completion-input settings. Radio options reuse
+    the stable-id machinery of choice options (history keys on the id, so a button
+    survives renames); a radio with no options falls back to a checkbox."""
+    t = input_type if input_type in INPUT_TYPES else "checkbox"
+    opts = _norm_choice_options(input_options) if t == "radio" else []
+    if t == "radio" and not opts:
+        t = "checkbox"
+    lab = (input_label or "").strip() if t == "quantity" else ""
+    return t, opts, lab
 
 
 # Prior probability that an intervention helps is capped: beyond this the scheduler
@@ -307,17 +392,19 @@ def create_intervention(conn, name, unit="", default_dose=1.0, unit_dose=0.0,
                         dose_levels=None, note="", kind="dose", options=None,
                         category="supplement", dose_noun="", explore_doses=True,
                         test_skip=False, prior_helps=0.0, min_dose=None, max_dose=None,
-                        noun_amount=None, delay_explore=True, open_arm=False, open_arm_label=""):
-    kind = kind if kind in ("choice", "boolean") else "dose"
+                        noun_amount=None, delay_explore=True, open_arm=False, open_arm_label="",
+                        input_type="checkbox", input_options=None, input_label=""):
+    kind = kind if kind in KINDS else "dose"
     explore_doses = bool(explore_doses)
     delay_explore = bool(delay_explore)
     min_dose, max_dose, noun_amount = _opt_dose(min_dose), _opt_dose(max_dose), _opt_dose(noun_amount)
     # the open-ended arm needs a max to sit above (and exploration to reach it)
     open_arm = bool(open_arm) and max_dose is not None and explore_doses
     open_arm_label = (open_arm_label or "").strip()
-    if kind != "dose":
+    if kind not in ("dose", "choice_dose"):
         min_dose = max_dose = noun_amount = None
-        open_arm = False
+    if kind != "dose":
+        open_arm = False                       # the open-ended arm is dose-only
     category = _norm_category(category)
     if kind == "choice":
         options = _norm_choice_options(options)
@@ -329,20 +416,23 @@ def create_intervention(conn, name, unit="", default_dose=1.0, unit_dose=0.0,
         options, dose_levels = [], [1]
         unit, default_dose, unit_dose, dose_noun = "", 1.0, 0.0, ""
     else:
-        options = []
+        # dose, or choice+dose (options AND a shared dose scale; arms = option x dose)
+        options = _norm_choice_options(options) if kind == "choice_dose" else []
         if not dose_levels:
             dose_levels = dose_levels_from(default_dose, unit_dose, explore_doses, min_dose, max_dose)
-    ts = 1 if (kind == "choice" and test_skip) else 0
+    ts = 1 if (kind in ("choice", "choice_dose") and test_skip) else 0
+    in_t, in_opts, in_lab = _norm_input(input_type, input_options, input_label)
     cur = conn.execute(
         "INSERT INTO interventions (name, unit, default_dose, unit_dose, dose_noun, explore_doses, "
         "delay_explore, min_dose, max_dose, open_arm, open_arm_label, noun_amount, dose_levels, "
-        "active, note, kind, options, category, test_skip, prior_helps, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)",
+        "active, note, kind, options, category, test_skip, prior_helps, "
+        "input_type, input_options, input_label, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?)",
         (name.strip(), unit.strip(), float(default_dose), float(unit_dose or 0),
          (dose_noun or "").strip(), 1 if explore_doses else 0, 1 if delay_explore else 0,
          min_dose, max_dose, 1 if open_arm else 0, open_arm_label, noun_amount,
          json.dumps(dose_levels), note.strip(), kind, json.dumps(options), category, ts,
-         _clamp_prior(prior_helps), _now()),
+         _clamp_prior(prior_helps), in_t, json.dumps(in_opts), in_lab, _now()),
     )
     _audit(conn, "create_intervention", intervention_id=cur.lastrowid,
            name=name.strip(), kind=kind, category=category)
@@ -370,9 +460,19 @@ def update_intervention(conn, iid, **fields):
         setcol("category", _norm_category(fields["category"]))
     if fields.get("prior_helps") is not None:
         setcol("prior_helps", _clamp_prior(fields["prior_helps"]))
+    if fields.get("no_lockin") is not None:
+        setcol("no_lockin", 1 if fields["no_lockin"] else 0)
+    if any(k in fields for k in ("input_type", "input_options", "input_label")):
+        in_t, in_opts, in_lab = _norm_input(
+            fields.get("input_type", iv["input_type"]),
+            fields.get("input_options", iv["input_options"]),
+            fields.get("input_label", iv["input_label"]))
+        setcol("input_type", in_t)
+        setcol("input_options", json.dumps(in_opts))
+        setcol("input_label", in_lab)
 
     kind = fields.get("kind", iv["kind"])
-    kind = kind if kind in ("choice", "boolean") else "dose"
+    kind = kind if kind in KINDS else "dose"
     setcol("kind", kind)
     if kind == "choice":
         opts = _norm_choice_options(fields.get("options", iv["options"]))
@@ -400,8 +500,14 @@ def update_intervention(conn, iid, **fields):
         setcol("open_arm", 0)
         setcol("test_skip", 0)
     else:
-        setcol("test_skip", 0)
-        setcol("options", "[]")
+        if kind == "choice_dose":
+            opts = _norm_choice_options(fields.get("options", iv["options"]))
+            setcol("options", json.dumps(opts))
+            ts = fields["test_skip"] if fields.get("test_skip") is not None else iv.get("test_skip")
+            setcol("test_skip", 1 if ts else 0)
+        else:
+            setcol("test_skip", 0)
+            setcol("options", "[]")
         std = float(fields["default_dose"]) if fields.get("default_dose") is not None else iv["default_dose"]
         udose = float(fields["unit_dose"]) if fields.get("unit_dose") is not None else (iv.get("unit_dose") or 0)
         explore = bool(fields["explore_doses"]) if fields.get("explore_doses") is not None \
@@ -423,7 +529,7 @@ def update_intervention(conn, iid, **fields):
         setcol("max_dose", hi)
         # open-ended arm above the max: needs a max (and exploration) to exist
         oa = bool(fields["open_arm"]) if fields.get("open_arm") is not None else bool(iv.get("open_arm"))
-        setcol("open_arm", 1 if (oa and hi is not None and explore) else 0)
+        setcol("open_arm", 1 if (oa and hi is not None and explore and kind == "dose") else 0)
         if fields.get("open_arm_label") is not None:
             setcol("open_arm_label", str(fields["open_arm_label"]).strip())
         setcol("noun_amount", _opt_dose(fields["noun_amount"]) if "noun_amount" in fields
@@ -563,24 +669,31 @@ def record_night(conn, d, hrv, taken, note=""):
     return get_night(conn, d)
 
 
-def set_taken(conn, d, iid, done):
+def set_taken(conn, d, iid, done, input_value=None):
     """Tick/untick the 'did it' checkmark for one cell. Done => took the assigned
-    dose; not done => 0."""
+    dose; not done => 0. input_value is the recorded completion detail for a
+    non-checkbox input type (a radio option's stable id as text, or the quantity
+    as typed -- '-' = done but not measured); it is stored when done and cleared
+    when not."""
     row = conn.execute(
-        "SELECT assigned_dose, taken_dose FROM assignments WHERE night_date=? AND intervention_id=?",
+        "SELECT assigned_dose, taken_dose, input_value FROM assignments "
+        "WHERE night_date=? AND intervention_id=?",
         (d, iid)).fetchone()
     if not row:
         return
     new_taken = row["assigned_dose"] if done else 0.0
+    new_val = str(input_value).strip() if (done and input_value is not None
+                                           and str(input_value).strip() != "") else None
     conn.execute(
-        "UPDATE assignments SET taken_dose=? WHERE night_date=? AND intervention_id=?",
-        (new_taken, d, iid))
+        "UPDATE assignments SET taken_dose=?, input_value=? WHERE night_date=? AND intervention_id=?",
+        (new_taken, new_val, d, iid))
     _audit(conn, "set_taken", d, iid, done=bool(done),
-           taken_before=row["taken_dose"], taken_after=new_taken)
+           taken_before=row["taken_dose"], taken_after=new_taken,
+           input_before=row["input_value"], input_after=new_val)
     conn.commit()
 
 
-METRICS = ("hrv", "lrhr", "eff")  # hrv/eff: higher is better; lrhr: lower is better
+METRICS = ("hrv", "lrhr", "tst", "lat", "eff")  # hrv/tst/eff: higher is better; lrhr/lat: lower is better
 
 
 def set_metric(conn, d, metric, value):
@@ -674,7 +787,7 @@ def set_exclusion(conn, d, category, excluded):
     touches an assignment -- it's a reversible, audit-logged flag that only changes which
     nights the engine counts for interventions in that category."""
     category = _norm_category(category)
-    col = "excl_behavioral" if category == "behavioral" else "excl_supplement"
+    col = "excl_" + category
     ensure_night(conn, d)
     conn.execute(f"UPDATE nights SET {col}=? WHERE date=?", (1 if excluded else 0, d))
     _audit(conn, "set_exclusion", d, category=category, excluded=bool(excluded))
@@ -735,8 +848,9 @@ def analysis_nights(conn):
     can apply the compliance rule: on-assigned counts only if the box was checked;
     off-assigned always counts as a control."""
     rows = conn.execute(
-        "SELECT date, hrv, lrhr, eff, excl_behavioral, excl_supplement FROM nights "
-        "WHERE hrv IS NOT NULL OR lrhr IS NOT NULL OR eff IS NOT NULL ORDER BY date").fetchall()
+        "SELECT date, hrv, lrhr, tst, lat, eff, excl_behavioral, excl_supplement, excl_environmental FROM nights "
+        "WHERE hrv IS NOT NULL OR lrhr IS NOT NULL OR tst IS NOT NULL OR lat IS NOT NULL OR eff IS NOT NULL "
+        "ORDER BY date").fetchall()
     out = []
     for r in rows:
         assigns = {}
@@ -746,16 +860,17 @@ def analysis_nights(conn):
             assigns[a["intervention_id"]] = {"assigned": a["assigned_dose"],
                                              "taken": a["taken_dose"],
                                              "excluded": bool(a["excluded"])}
-        out.append({"date": r["date"], "hrv": r["hrv"], "lrhr": r["lrhr"], "eff": r["eff"],
+        out.append({"date": r["date"], "hrv": r["hrv"], "lrhr": r["lrhr"], "tst": r["tst"], "lat": r["lat"], "eff": r["eff"],
                     "excl_behavioral": bool(r["excl_behavioral"]),
-                    "excl_supplement": bool(r["excl_supplement"]), "assigns": assigns})
+                    "excl_supplement": bool(r["excl_supplement"]),
+                    "excl_environmental": bool(r["excl_environmental"]), "assigns": assigns})
     return out
 
 
 def recent_nights(conn, limit=30):
     rows = conn.execute(
-        "SELECT date, hrv, lrhr, lrhr_30s, eff, hrv_src, lrhr_src, eff_src, status, note, "
-        "excl_behavioral, excl_supplement FROM nights ORDER BY date DESC LIMIT ?",
+        "SELECT date, hrv, lrhr, lrhr_30s, tst, lat, eff, hrv_src, lrhr_src, tst_src, lat_src, eff_src, status, note, "
+        "excl_behavioral, excl_supplement, excl_environmental FROM nights ORDER BY date DESC LIMIT ?",
         (limit,)).fetchall()
     out = []
     for r in rows:
