@@ -662,7 +662,7 @@ function reportCard(iv) {
       // side chart is a bar graph comparing each option against skipping.
       const body = el("div", "iv-2col");
       const left = el("div", "iv-metrics");
-      left.appendChild(hrvMetric(r, dataNote));
+      left.appendChild(hrvMetric(r, dataNote, iv));
       left.appendChild(rhrMetric(iv));
       lrhrHandled = true;
       body.appendChild(left);
@@ -701,7 +701,7 @@ function reportCard(iv) {
       // headline effect is what matters; dose response is the secondary detail.
       const body = el("div", "iv-2col");
       const left = el("div", "iv-metrics");
-      left.appendChild(hrvMetric(r, dataNote));
+      left.appendChild(hrvMetric(r, dataNote, iv));
       left.appendChild(rhrMetric(iv));
       lrhrHandled = true;
       body.appendChild(left);
@@ -807,7 +807,7 @@ function appendEff(card, iv) {
 }
 
 // Big "does HRV improve?" hero number for a dose intervention (left column).
-function hrvMetric(r, dataNote) {
+function hrvMetric(r, dataNote, iv) {
   const cls = r.on_effect >= 0 ? "pos" : "neg";
   const sizable = r.p_meaningful >= 0.85 ? ' · <span class="metric-flag">likely sizable</span>' : "";
   const b = el("div", "metric-big");
@@ -819,8 +819,36 @@ function hrvMetric(r, dataNote) {
   if (r.on_mean != null && r.off_mean != null)
     b.appendChild(el("div", "metric-avgs",
       `Avg HRV <b>${avg1(r.on_mean)}</b> on nights · <b>${avg1(r.off_mean)}</b> off`));
+  const rec = iv ? recHero(iv, r) : null;
+  if (rec) b.appendChild(rec);
   b.appendChild(el("div", "metric-note", `Based on ${dataNote}`));
   return b;
+}
+
+// Second hero: the effect AT the recommended dose (or best option). The main
+// headline is the dose-AVERAGED "does it help at all" effect, where every
+// measured level counts equally — so when the level counts are lopsided it can
+// disagree with your actual experience. This line shows the modeled effect at
+// the level you'd actually keep using. Shown only once the recommendation crown
+// is earned (enoughForDoseRec: ≥8 on-nights across ≥2 tried levels).
+function recHero(iv, r) {
+  if (!enoughForDoseRec(r) || !(r.recommended_dose > 0)) return null;
+  const row = (r.doses || []).find((d) => sameLevel(d.dose, r.recommended_dose));
+  if (!row || row.mean_effect == null) return null;
+  // doseAmount() returns already-escaped HTML; optLabel() returns plain text
+  const label = isChoiceKind(iv)
+    ? (optLabel(iv, row.dose) != null ? esc(optLabel(iv, row.dose)) : null)
+    : doseAmount(iv, row.dose);
+  if (!label) return null;
+  const cls = row.mean_effect >= 0 ? "pos" : "neg";
+  const n = row.n_nights || 0;
+  const d = el("div", "metric-rec");
+  d.innerHTML =
+    `<span class="metric-rec-val ${cls}">${signed(row.mean_effect)}</span> ` +
+    `at the recommended ${isChoiceKind(iv) ? "option" : "dose"}, <b>${label}</b> ` +
+    `<span class="ci">[${signed(row.ci_low)}, ${signed(row.ci_high)}]</span> · ` +
+    `${n} night${n === 1 ? "" : "s"} at it`;
+  return d;
 }
 
 // Big resting-HR hero number (left column). LRHR fit is on -LRHR, so flip back to

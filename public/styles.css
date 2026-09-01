@@ -327,6 +327,13 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .metric-sub { color: var(--muted); font-size: 12.5px; line-height: 1.35; }
 .metric-sub b { color: var(--text); }
 .metric-note { color: var(--muted); font-size: 11.5px; opacity: .8; margin-top: 3px; }
+/* second hero: the modeled effect AT the recommended dose / best option (the big
+   number above averages all measured levels equally, so the two can differ) */
+.metric-rec { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+.metric-rec b { color: var(--text); }
+.metric-rec-val { font-size: 21px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.metric-rec-val.pos { color: var(--good); }
+.metric-rec-val.neg { color: var(--bad); }
 .metric-flag { color: var(--accent-2); font-weight: 600; }
 
 /* ---- reports sub-tabs + interactions page ---- */
