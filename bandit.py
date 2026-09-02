@@ -475,7 +475,11 @@ def build_columns(interventions, history_doses):
 
 
 def build_design(completed_nights, cols, p):
-    X, y = [], []
+    """Design matrix, outcomes, and per-night weights. A night may carry "w" (the
+    recency weight, 1 = full strength); it scales that night's contribution to the
+    likelihood -- both its pull on the coefficients and its share of the effective
+    sample size."""
+    X, y, w = [], [], []
     for nt in completed_nights:
         if nt.get("hrv") is None:
             continue
@@ -495,7 +499,8 @@ def build_design(completed_nights, cols, p):
                     row[col] = c
         X.append(row)
         y.append(float(nt["hrv"]))
-    return X, y
+        w.append(float(nt.get("w", 1.0)))
+    return X, y, w
 
 
 def prior_variances(p, cols):
@@ -517,11 +522,16 @@ def prior_variances(p, cols):
 # ---------------------------------------------------------------------------
 # Posterior fit (closed form) and sampling.
 # ---------------------------------------------------------------------------
-def fit(X, y, p, V0_diag, m0=None):
+def fit(X, y, p, V0_diag, m0=None, w=None):
     """Conjugate Normal-Inverse-Gamma posterior. m0 is the prior MEAN vector (default
     zeros -> the uninformative centered-on-zero prior). A non-zero m0 shifts the
     posterior mean toward the prior and adds the m0^T Lambda0 m0 term to bN; it does
-    NOT change the precision A (so the covariance and sampling are unaffected)."""
+    NOT change the precision A (so the covariance and sampling are unaffected).
+
+    w: optional per-night weights (power likelihood -- each night's log-likelihood
+    is scaled by its weight, as if it were w nights). Weighted rows enter X'X and
+    X'y scaled by w, and the effective sample size Sum(w) replaces n in the noise
+    posterior, so decayed evidence both pulls less and certifies less."""
     n = len(X)
     A = [[0.0] * p for _ in range(p)]
     for k in range(p):
@@ -529,10 +539,11 @@ def fit(X, y, p, V0_diag, m0=None):
     XtY = [0.0] * p
     for r in range(n):
         xr = X[r]
+        wr = 1.0 if w is None else w[r]
         yr = y[r]
         nz = [a for a in range(p) if xr[a] != 0.0]
         for a in nz:
-            xa = xr[a]
+            xa = xr[a] * wr
             XtY[a] += xa * yr
             Aa = A[a]
             for b in nz:
@@ -543,7 +554,7 @@ def fit(X, y, p, V0_diag, m0=None):
             A[b][a] = A[a][b]
 
     L = cholesky(A)
-    # posterior mean solves A mN = X^T y + Lambda0 m0  (Lambda0 = diag(1/V0))
+    # posterior mean solves A mN = X^T W y + Lambda0 m0  (Lambda0 = diag(1/V0))
     if m0 is None:
         rhs, m0Lam0m0 = XtY, 0.0
     else:
@@ -551,9 +562,10 @@ def fit(X, y, p, V0_diag, m0=None):
         rhs = [XtY[k] + lam0m0[k] for k in range(p)]
         m0Lam0m0 = sum(m0[k] * lam0m0[k] for k in range(p))
     mN = spd_solve(L, rhs)
-    yty = sum(yi * yi for yi in y)
+    yty = sum(yi * yi for yi in y) if w is None else sum(w[i] * y[i] * y[i] for i in range(n))
+    n_eff = float(n) if w is None else sum(w)
     mAm = sum(rhs[i] * mN[i] for i in range(p))   # mN^T A mN = mN . rhs
-    aN = SIGMA2_PRIOR_A + n / 2.0
+    aN = SIGMA2_PRIOR_A + n_eff / 2.0
     bN = SIGMA2_PRIOR_B + 0.5 * (yty + m0Lam0m0 - mAm)
     if bN < 1e-9:
         bN = 1e-9
@@ -1095,16 +1107,17 @@ def pair_interaction(nights):
     None if there are no nights."""
     if not nights:
         return None
-    X, y = [], []
-    cells = {(0, 0): [], (1, 0): [], (0, 1): [], (1, 1): []}
+    X, y, w = [], [], []
+    cells = {(0, 0): [], (1, 0): [], (0, 1): [], (1, 1): []}   # [(weight, y)]
     for n in nights:
         a, b = (1 if n["a"] else 0), (1 if n["b"] else 0)
-        yv = float(n["y"])
+        yv, wv = float(n["y"]), float(n.get("w", 1.0))
         X.append([1.0, float(a), float(b), float(a * b)])
         y.append(yv)
-        cells[(a, b)].append(yv)
+        w.append(wv)
+        cells[(a, b)].append((wv, yv))
     V0 = [INTERCEPT_PRIOR_VAR, ON_PRIOR_VAR, ON_PRIOR_VAR, INTERACTION_PRIOR_VAR]
-    post = fit(X, y, 4, V0)
+    post = fit(X, y, 4, V0, w=(w if any(x != 1.0 for x in w) else None))
     state = random.getstate()
     random.seed(READOUT_SEED)
     try:
@@ -1125,13 +1138,19 @@ def pair_interaction(nights):
         sv = sorted(v)
         return {"mean": sum(sv) / S, "ci_low": _percentile(sv, 0.05), "ci_high": _percentile(sv, 0.95)}
 
+    # weighted cell counts (= plain counts when unweighted) and weighted raw means
+    def wcount(v):
+        s = sum(wv for wv, _ in v)
+        return int(round(s)) if abs(s - round(s)) < 1e-9 else round(s, 1)
+
     def mean_or_none(v):
-        return (sum(v) / len(v)) if v else None
+        s = sum(wv for wv, _ in v)
+        return (sum(wv * yv for wv, yv in v) / s) if s > 0 else None
 
     return {
-        "n": len(nights),
-        "n_neither": len(cells[(0, 0)]), "n_a_only": len(cells[(1, 0)]),
-        "n_b_only": len(cells[(0, 1)]), "n_both": len(cells[(1, 1)]),
+        "n": wcount([(n.get("w", 1.0), 0) for n in nights]),
+        "n_neither": wcount(cells[(0, 0)]), "n_a_only": wcount(cells[(1, 0)]),
+        "n_b_only": wcount(cells[(0, 1)]), "n_both": wcount(cells[(1, 1)]),
         "raw_neither": mean_or_none(cells[(0, 0)]), "raw_a_only": mean_or_none(cells[(1, 0)]),
         "raw_b_only": mean_or_none(cells[(0, 1)]), "raw_both": mean_or_none(cells[(1, 1)]),
         "effect_a": summ(ga), "effect_b": summ(gb),
@@ -1161,7 +1180,7 @@ def fit_model(interventions, completed_nights, priors=None):
                 history.setdefault(int(iid), set()).add(_d(dose))
 
     cols, p = build_columns(interventions, history)
-    X, y = build_design(completed_nights, cols, p)
+    X, y, w = build_design(completed_nights, cols, p)
     V0 = prior_variances(p, cols)
     m0 = None
     if priors:
@@ -1185,7 +1204,7 @@ def fit_model(interventions, completed_nights, priors=None):
                     return float(opt_means.get(oid, 0.0))
                 for j, col in enumerate(entry["dev"]):
                     m0[col] = sum(crow[j] * level_mean(level) for level, crow in entry["contrast"].items())
-    post = fit(X, y, p, V0, m0)
+    post = fit(X, y, p, V0, m0, w=(w if any(x != 1.0 for x in w) else None))
     return {"post": post, "cols": cols, "n": post["n"]}
 
 

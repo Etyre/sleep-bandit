@@ -334,6 +334,21 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .metric-rec-val { font-size: 21px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .metric-rec-val.pos { color: var(--good); }
 .metric-rec-val.neg { color: var(--bad); }
+
+/* recency-weighting toggle (top of Reports) + "adjusted" flags */
+.recency-row { margin: 2px 0 10px; }
+.recency-label { font-size: 13px; color: var(--text); cursor: pointer; }
+.recency-label .recency-hint { color: var(--muted); font-size: 11.5px; margin-left: 6px; }
+.recency-badge {
+  display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 11px;
+  font-weight: 600; letter-spacing: .03em; color: var(--muted);
+  border: 1px dashed rgba(154,162,192,.55); cursor: help;
+}
+.adj-flag {
+  display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 3px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--warn); border: 1px dashed var(--warn); vertical-align: 1px;
+}
 .metric-flag { color: var(--accent-2); font-weight: 600; }
 
 /* ---- reports sub-tabs + interactions page ---- */

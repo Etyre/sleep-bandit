@@ -479,17 +479,30 @@ function verdict(r) {
   return ["v-maybe", "… inconclusive"];
 }
 
+// Whether recency weighting is on (mirrors the server-side setting; set by the
+// last reports/interactions payload). When on, night counts shown on this page
+// are effective (decayed) counts and are flagged as adjusted.
+let RECENCY_ON = false;
+
 async function loadReports() {
   const box = $("#reports-body");
   box.innerHTML = `<p class="empty">Crunching the numbers…</p>`;
   let data;
   try { data = await api("/api/reports"); }
   catch (e) { box.innerHTML = `<p class="empty">Error: ${esc(e.message)}</p>`; return; }
+  renderReports(data);
+}
 
+function renderReports(data) {
+  const box = $("#reports-body");
+  RECENCY_ON = !!(data.recency && data.recency.enabled);
   box.innerHTML = "";
+  box.appendChild(recencyToggle(data));
   box.appendChild(el("p", "rep-stat", data.n_completed === 0
     ? "No nights logged yet — reports fill in as you enter your HRV on the Tracker."
-    : `Based on <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}. “Effect” is the change in HRV from taking the intervention, in your HRV units. Anything reliably positive is worth keeping — even a small effect.`));
+    : `Based on <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}` +
+      (RECENCY_ON ? ` <span class="adj-flag">recency-weighted — counts shown are adjusted</span>` : "") +
+      `. “Effect” is the change in HRV from taking the intervention, in your HRV units. Anything reliably positive is worth keeping — even a small effect.`));
   if (data.hrv_trend) box.appendChild(hrvTrendCard(data.hrv_trend));
   if (!data.interventions.length) {
     box.appendChild(el("p", "empty", "No interventions yet."));
@@ -504,6 +517,45 @@ async function loadReports() {
     for (const iv of sorted) box.appendChild(reportCard(iv));
   }
 }
+
+// ---- recency-weighting toggle (top of the Reports page) ---------------------
+// Server-wide mode: when on, every night is weighted by 0.5^(age/half-life) in
+// BOTH the read-outs and the live bandit (Thompson planning, warm-up, lock-in
+// guard). Values become weighted means, sample sizes become effective counts.
+function recencyToggle(data) {
+  const on = !!(data.recency && data.recency.enabled);
+  const hl = Math.round((data.recency && data.recency.half_life_days) || 30);
+  const tip = `Each night's datapoint — on- and off-nights alike — is weighted by how recent it is, ` +
+    `halving every ${hl} days (yesterday ≈ 1, a month ago ≈ ½, two months ≈ ¼). The weights scale both ` +
+    `the measured values and the effective sample sizes (shown as adjusted counts), and the nightly ` +
+    `planner schedules from the same weighted evidence. Ages count back from the most recent logged night.`;
+  const wrap = el("div", "recency-row");
+  if (READ_ONLY) {
+    if (on) wrap.innerHTML = `<span class="recency-badge" title="${esc(tip)}">⏳ recency weighting on · ${hl}-day half-life</span>`;
+    else wrap.hidden = true;
+    return wrap;
+  }
+  wrap.innerHTML =
+    `<label class="check-label recency-label" title="${esc(tip)}">` +
+    `<input type="checkbox" id="recency-toggle"${on ? " checked" : ""}> ` +
+    `⏳ Weight recent nights more ` +
+    `<span class="recency-hint">${hl}-day half-life · affects these numbers and nightly planning</span></label>`;
+  wrap.querySelector("#recency-toggle").addEventListener("change", async (e) => {
+    const enabled = e.target.checked;
+    e.target.disabled = true;
+    try {
+      renderReports(await post("/api/recency", { enabled }));
+    } catch (err) {
+      alert("Could not switch recency weighting: " + err.message);
+      e.target.checked = !enabled;
+      e.target.disabled = false;
+    }
+  });
+  return wrap;
+}
+
+// a night count, flagged when it's a recency-adjusted effective count
+function adjNote() { return RECENCY_ON ? " (adjusted)" : ""; }
 
 // ---- early lock-in guard modal (opened from a report card's cap indicator) --
 // Lets the user switch the scheduling clamp (bandit.LOCKIN_TIERS) off for one
@@ -645,7 +697,7 @@ function reportCard(iv) {
 
   let lrhrHandled = false;
   if (nObs > 0) {
-    const dataNote = `${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off.`;
+    const dataNote = `${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off${adjNote()}.`;
     // The hero "any option vs skipping" numbers need an on/off contrast, exactly like
     // a dose intervention; a plain choice (no skip) just needs enough option-nights.
     const skipChoice = isChoice && iv.test_skip;
@@ -740,7 +792,7 @@ function appendLat(card, iv) {
   const ready = isChoice ? (nOn >= MIN_ON && nOff >= MIN_OFF) : enough(nOn, nOff, false);
   if (!ready || re.on_effect == null) {
     card.appendChild(el("p", "iv-meta eff-line",
-      `⏱ <b>Sleep latency</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off.`));
+      `⏱ <b>Sleep latency</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off${adjNote()}.`));
     return;
   }
   const delta = -re.on_effect, lo = -re.on_ci_high, hi = -re.on_ci_low;   // minutes, real sign
@@ -765,7 +817,7 @@ function appendTst(card, iv) {
   const ready = isChoice ? (nOn >= MIN_ON && nOff >= MIN_OFF) : enough(nOn, nOff, false);
   if (!ready || re.on_effect == null) {
     card.appendChild(el("p", "iv-meta eff-line",
-      `🛌 <b>Total sleep</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off.`));
+      `🛌 <b>Total sleep</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off${adjNote()}.`));
     return;
   }
   const cls = re.on_effect >= 0 ? "pos" : "neg";
@@ -793,7 +845,7 @@ function appendEff(card, iv) {
   const ready = isChoice ? (nOn >= MIN_ON && nOff >= MIN_OFF) : enough(nOn, nOff, false);
   if (!ready || re.on_effect == null) {
     card.appendChild(el("p", "iv-meta eff-line",
-      `😴 <b>Sleep efficiency</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off.`));
+      `😴 <b>Sleep efficiency</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off${adjNote()}.`));
     return;
   }
   const cls = re.on_effect >= 0 ? "pos" : "neg";
@@ -847,7 +899,7 @@ function recHero(iv, r) {
     `<span class="metric-rec-val ${cls}">${signed(row.mean_effect)}</span> ` +
     `at the recommended ${isChoiceKind(iv) ? "option" : "dose"}, <b>${label}</b> ` +
     `<span class="ci">[${signed(row.ci_low)}, ${signed(row.ci_high)}]</span> · ` +
-    `${n} night${n === 1 ? "" : "s"} at it`;
+    `${n} night${n === 1 ? "" : "s"} at it${adjNote()}`;
   return d;
 }
 
@@ -862,7 +914,7 @@ function rhrMetric(iv) {
   // needs BOTH arms -- enough on AND enough off nights -- for either kind.
   if (nOn + nOff === 0 || !(nOn >= MIN_ON && nOff >= MIN_OFF) || rl.on_effect == null) {
     b.appendChild(el("div", "metric-val muted", "—"));
-    b.appendChild(el("div", "metric-sub", `gathering data — ${nOn} on, ${nOff} off`));
+    b.appendChild(el("div", "metric-sub", `gathering data — ${nOn} on, ${nOff} off${adjNote()}`));
     return b;
   }
   const effBpm = -rl.on_effect;
@@ -889,7 +941,7 @@ function appendLrhr(card, iv) {
   const ready = isChoice ? (nOn >= MIN_ON && nOff >= MIN_OFF) : enough(nOn, nOff, false);
   if (!ready || rl.on_effect == null) {
     card.appendChild(el("p", "iv-meta",
-      `🫀 <b>Resting HR</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off.`));
+      `🫀 <b>Resting HR</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off${adjNote()}.`));
     return;
   }
   const effBpm = -rl.on_effect;
@@ -1331,9 +1383,11 @@ async function loadInteractions() {
   catch (e) { box.innerHTML = `<p class="empty">Error: ${esc(e.message)}</p>`; return; }
 
   box.innerHTML = "";
+  RECENCY_ON = !!(data.recency && data.recency.enabled);
   const nPairs = data.pairs.length;
   box.appendChild(el("p", "rep-stat",
-    `Every pair of interventions that has shared a night, across <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}. ` +
+    `Every pair of interventions that has shared a night, across <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}` +
+    (RECENCY_ON ? ` <span class="adj-flag">recency-weighted — counts shown are adjusted</span>` : "") + `. ` +
     `For each pair the model asks whether the two did <em>better</em> together than their separate effects add up to (synergy), ` +
     `about as much as either alone (substitutes — their effects overlap), or <em>worse</em> than the better one alone (interference). ` +
     `A verdict needs ≥${MIN_BOTH} nights with both on. With ${nPairs} pair${nPairs === 1 ? "" : "s"} under test, expect the odd false flag — treat a flag as a lead to watch, not a conclusion.` +

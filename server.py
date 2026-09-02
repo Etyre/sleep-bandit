@@ -66,6 +66,47 @@ def today_str():
 
 
 # ---------------------------------------------------------------------------
+# Recency weighting (server-wide mode, toggled from the Reports page).
+# When on, every night's datapoint -- on and off arms alike -- is weighted by
+# w = 0.5^(age / half-life): the newest night counts fully, a month-old night
+# counts half, and so on. The weight scales BOTH the values (weighted means,
+# weighted likelihood in the model) and the sample sizes (effective counts,
+# shown as "adjusted"), and it drives the live bandit too: Thompson planning,
+# the warm-up ramp and the early lock-in guard all see the weighted evidence.
+# ---------------------------------------------------------------------------
+RECENCY_HALF_LIFE_DAYS = 30.0
+
+
+def recency_enabled(conn):
+    return store.get_setting(conn, "recency_weighting") == "1"
+
+
+def apply_recency(nights):
+    """Attach a recency weight to every analysis night. Age is measured from the
+    most recent night with any recorded metric (not the wall clock), so a logging
+    gap doesn't silently decay the whole dataset. Mutates and returns the list."""
+    if not nights:
+        return nights
+    anchor = date.fromisoformat(max(n["date"] for n in nights))
+    for n in nights:
+        age = (anchor - date.fromisoformat(n["date"])).days
+        n["w"] = 0.5 ** (age / RECENCY_HALF_LIFE_DAYS)
+    return nights
+
+
+def analysis_nights_weighted(conn):
+    """store.analysis_nights, with recency weights attached when the mode is on."""
+    nights = store.analysis_nights(conn)
+    return apply_recency(nights) if recency_enabled(conn) else nights
+
+
+def _nn(x):
+    """Display-friendly night count: exact int when integral (the unweighted
+    case), else one decimal (a recency-adjusted effective count)."""
+    return int(round(x)) if abs(x - round(x)) < 1e-9 else round(x, 1)
+
+
+# ---------------------------------------------------------------------------
 # Planning (Bayesian bandit / Thompson sampling)
 # ---------------------------------------------------------------------------
 def intervention_nights(iv_id, all_nights, metric, negate=False, category=None):
@@ -82,7 +123,7 @@ def intervention_nights(iv_id, all_nights, metric, negate=False, category=None):
     excluded for that category are dropped entirely (neither on nor off). A cell the
     user excluded individually (e.g. assigned OFF but done anyway) is likewise
     dropped -- for this intervention only."""
-    nights, n_on, n_off = [], 0, 0
+    nights, n_on, n_off = [], 0.0, 0.0
     for n in all_nights:
         if category and n.get("excl_" + category):   # user excluded this night's data
             continue
@@ -94,19 +135,22 @@ def intervention_nights(iv_id, all_nights, metric, negate=False, category=None):
             continue
         if a.get("excluded"):   # cell flagged invalid (e.g. done despite assigned OFF)
             continue
+        # recency weight (1.0 when the mode is off): the night's share of both the
+        # likelihood and the effective on/off counts
+        w = float(n.get("w", 1.0))
         assigned = a["assigned"] or 0
         taken = a["taken"]
         if assigned > 0:
             if taken is not None and taken > 0:  # ON and confirmed
                 dose = float(assigned)
-                n_on += 1
+                n_on += w
             else:                                # ON but not confirmed -> drop
                 continue
         else:                                    # OFF -> randomized control
             dose = 0.0
-            n_off += 1
+            n_off += w
         nights.append({"hrv": (-float(val) if negate else float(val)),
-                       "taken": {iv_id: dose}})
+                       "taken": {iv_id: dose}, "w": w})
     return nights, n_on, n_off
 
 
@@ -122,7 +166,7 @@ def ensure_tonight(conn):
     missing = [iv for iv in store.list_interventions(conn, active_only=True)
                if iv["id"] not in have]
     if missing:
-        all_nights = store.analysis_nights(conn)
+        all_nights = analysis_nights_weighted(conn)
         for iv in missing:
             nights, n_on, n_off = intervention_nights(iv["id"], all_nights, "hrv",
                                                       category=iv.get("category"))
@@ -243,30 +287,39 @@ def _readout(iv, all_nights, metric, negate):
                                               category=iv.get("category"))
     r = bandit.analyze([iv], nights)["readouts"].get(iv["id"], {}) if nights else {}
     r = dict(r)
-    r["n_on"], r["n_off"] = n_on, n_off
+    r["n_on"], r["n_off"] = _nn(n_on), _nn(n_off)
     # distinct non-zero doses actually tried -- you can't recommend a "best dose"
     # among doses you've never compared, so the UI gates the recommendation on this.
     r["n_doses_seen"] = len({round(n["taken"][iv["id"]], 6)
                              for n in nights if n["taken"].get(iv["id"], 0) > 0})
-    # Raw (non-modeled) average of the metric on ON- vs OFF-nights, in native units.
-    # intervention_nights stores the value as +val (HRV) or -val (LRHR, negated for the
-    # engine), so undo the negation here to report the real HRV / resting-HR numbers.
+    # Raw (non-modeled) average of the metric on ON- vs OFF-nights, in native units,
+    # recency-weighted when the mode is on. intervention_nights stores the value as
+    # +val (HRV) or -val (LRHR, negated for the engine), so undo the negation here
+    # to report the real HRV / resting-HR numbers.
     iid = iv["id"]
-    on_vals = [(-n["hrv"] if negate else n["hrv"]) for n in nights if n["taken"].get(iid, 0) > 0]
-    off_vals = [(-n["hrv"] if negate else n["hrv"]) for n in nights if n["taken"].get(iid, 0) == 0]
-    r["on_mean"] = (sum(on_vals) / len(on_vals)) if on_vals else None
-    r["off_mean"] = (sum(off_vals) / len(off_vals)) if off_vals else None
+
+    def wmean(pairs):
+        s = sum(w for w, _ in pairs)
+        return (sum(w * v for w, v in pairs) / s) if s > 0 else None
+
+    on_vals = [(n.get("w", 1.0), -n["hrv"] if negate else n["hrv"])
+               for n in nights if n["taken"].get(iid, 0) > 0]
+    off_vals = [(n.get("w", 1.0), -n["hrv"] if negate else n["hrv"])
+                for n in nights if n["taken"].get(iid, 0) == 0]
+    r["on_mean"] = wmean(on_vals)
+    r["off_mean"] = wmean(off_vals)
     # Same raw averages per dose/option (an always-on choice has no off baseline,
     # so its report shows these instead of a modeled effect).
     by_dose = {}
     for n in nights:
         dose = n["taken"].get(iid, 0)
         if dose > 0:
-            by_dose.setdefault(round(dose, 6), []).append(-n["hrv"] if negate else n["hrv"])
+            by_dose.setdefault(round(dose, 6), []).append(
+                (n.get("w", 1.0), -n["hrv"] if negate else n["hrv"]))
     for row in r.get("doses", []):
         vals = by_dose.get(round(row["dose"], 6), [])
-        row["raw_mean"] = (sum(vals) / len(vals)) if vals else None
-        row["n_nights"] = len(vals)
+        row["raw_mean"] = wmean(vals)
+        row["n_nights"] = _nn(sum(w for w, _ in vals))
     return r
 
 
@@ -304,7 +357,7 @@ def _sched_info(iv, all_nights):
         capped = raw is not None and p != raw
     return {"p_scheduled": p, "p_scheduled_raw": raw,
             "sched_cap": tier if capped else None, "sched_tier": tier,
-            "sched_n_on": n_on, "sched_n_off": n_off}
+            "sched_n_on": _nn(n_on), "sched_n_off": _nn(n_off)}
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +426,7 @@ def reports_payload(conn):
     Efficacy read-outs are PRIOR-FREE (purely measured). Separately, p_scheduled is the
     prior-INCLUSIVE probability the planner schedules the intervention tonight."""
     ivs = store.list_interventions(conn)
-    all_nights = store.analysis_nights(conn)
+    all_nights = analysis_nights_weighted(conn)
     n_hrv = sum(1 for n in all_nights if n["hrv"] is not None)
     out = []
     for iv in ivs:
@@ -387,7 +440,9 @@ def reports_payload(conn):
             **_sched_info(iv, all_nights),
         })
     return {"n_completed": n_hrv, "interventions": out,
-            "hrv_trend": hrv_trend_payload(conn)}
+            "hrv_trend": hrv_trend_payload(conn),
+            "recency": {"enabled": recency_enabled(conn),
+                        "half_life_days": RECENCY_HALF_LIFE_DAYS}}
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +472,8 @@ def _pair_nights(iv_a, iv_b, all_nights, metric, negate):
         sa, sb = _on_state(n, iv_a["id"]), _on_state(n, iv_b["id"])
         if sa is None or sb is None:
             continue
-        out.append({"y": (-float(val) if negate else float(val)), "a": sa, "b": sb})
+        out.append({"y": (-float(val) if negate else float(val)), "a": sa, "b": sb,
+                    "w": float(n.get("w", 1.0))})
     return out
 
 
@@ -426,7 +482,7 @@ def interactions_payload(conn):
     with both on, with its interaction read-out on HRV (primary) and resting HR.
     Pairs that have never co-occurred are only counted."""
     ivs = store.list_interventions(conn)
-    all_nights = store.analysis_nights(conn)
+    all_nights = analysis_nights_weighted(conn)
     n_hrv = sum(1 for n in all_nights if n["hrv"] is not None)
     pairs, no_overlap = [], 0
     for i in range(len(ivs)):
@@ -441,7 +497,9 @@ def interactions_payload(conn):
                                 "kind": iv["kind"], "active": iv["active"]}
             pairs.append({"a": brief(a), "b": brief(b), "hrv": r_hrv, "lrhr": r_lrhr})
     return {"n_completed": n_hrv, "n_interventions": len(ivs), "pairs": pairs,
-            "n_pairs_no_overlap": no_overlap}
+            "n_pairs_no_overlap": no_overlap,
+            "recency": {"enabled": recency_enabled(conn),
+                        "half_life_days": RECENCY_HALF_LIFE_DAYS}}
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +773,15 @@ class Handler(BaseHTTPRequestHandler):
                                          int(body["intervention_id"]),
                                          bool(body.get("excluded")))
                 return self._send_json(state_payload(conn))
+
+            if path == "/api/recency":
+                # server-wide mode: recency weighting drives the Reports numbers
+                # AND the live bandit, so it lives in the DB, not the browser
+                on = bool(body.get("enabled"))
+                store.set_setting(conn, "recency_weighting", "1" if on else None)
+                store._audit(conn, "set_recency", enabled=on)
+                conn.commit()
+                return self._send_json(reports_payload(conn))
 
             if path == "/api/oura/config":
                 store.set_setting(conn, "oura_client_id", (body.get("client_id") or "").strip() or None)
