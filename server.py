@@ -277,7 +277,9 @@ def state_payload(conn):
             }
         cells[n["date"]] = cmap
 
-    return {"today": d_today, "interventions": ivs, "nights": nights, "cells": cells}
+    return {"today": d_today, "interventions": ivs, "nights": nights, "cells": cells,
+            "recency": {"enabled": recency_enabled(conn),
+                        "half_life_days": RECENCY_HALF_LIFE_DAYS}}
 
 
 def _readout(iv, all_nights, metric, negate):

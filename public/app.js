@@ -145,6 +145,7 @@ function ivMeta(iv) {
 // =====================================================================
 async function loadGrid() {
   STATE = await api("/api/state");
+  renderRecencySlot(STATE.recency);
   renderGrid();
 }
 
@@ -483,6 +484,7 @@ function verdict(r) {
 // last reports/interactions payload). When on, night counts shown on this page
 // are effective (decayed) counts and are flagged as adjusted.
 let RECENCY_ON = false;
+let RECENCY_BUSY = false;   // a toggle request is in flight; ignore re-clicks until it lands
 
 async function loadReports() {
   const box = $("#reports-body");
@@ -496,8 +498,8 @@ async function loadReports() {
 function renderReports(data) {
   const box = $("#reports-body");
   RECENCY_ON = !!(data.recency && data.recency.enabled);
+  renderRecencySlot(data.recency);
   box.innerHTML = "";
-  box.appendChild(recencyToggle(data));
   box.appendChild(el("p", "rep-stat", data.n_completed === 0
     ? "No nights logged yet — reports fill in as you enter your HRV on the Tracker."
     : `Based on <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}` +
@@ -518,40 +520,51 @@ function renderReports(data) {
   }
 }
 
-// ---- recency-weighting toggle (top of the Reports page) ---------------------
+// ---- recency-weighting toggle (in the header, under the Tracker/Reports
+// buttons) --------------------------------------------------------------------
 // Server-wide mode: when on, every night is weighted by 0.5^(age/half-life) in
 // BOTH the read-outs and the live bandit (Thompson planning, warm-up, lock-in
 // guard). Values become weighted means, sample sizes become effective counts.
-function recencyToggle(data) {
-  const on = !!(data.recency && data.recency.enabled);
-  const hl = Math.round((data.recency && data.recency.half_life_days) || 30);
+function renderRecencySlot(recency) {
+  if (recency) RECENCY_ON = !!recency.enabled;
+  const slot = $("#recency-slot");
+  if (!slot) return;
+  const hl = Math.round((recency && recency.half_life_days) || 30);
   const tip = `Each night's datapoint — on- and off-nights alike — is weighted by how recent it is, ` +
     `halving every ${hl} days (yesterday ≈ 1, a month ago ≈ ½, two months ≈ ¼). The weights scale both ` +
-    `the measured values and the effective sample sizes (shown as adjusted counts), and the nightly ` +
-    `planner schedules from the same weighted evidence. Ages count back from the most recent logged night.`;
-  const wrap = el("div", "recency-row");
+    `the measured values and the effective sample sizes (shown as adjusted counts on the Reports page), ` +
+    `and the nightly planner schedules from the same weighted evidence. Ages count back from the most ` +
+    `recent logged night.`;
   if (READ_ONLY) {
-    if (on) wrap.innerHTML = `<span class="recency-badge" title="${esc(tip)}">⏳ recency weighting on · ${hl}-day half-life</span>`;
-    else wrap.hidden = true;
-    return wrap;
+    slot.innerHTML = RECENCY_ON
+      ? `<span class="recency-badge" title="${esc(tip)}">⏳ recency weighting on · ${hl}-day half-life</span>` : "";
+    return;
   }
-  wrap.innerHTML =
-    `<label class="check-label recency-label" title="${esc(tip)}">` +
-    `<input type="checkbox" id="recency-toggle"${on ? " checked" : ""}> ` +
-    `⏳ Weight recent nights more ` +
-    `<span class="recency-hint">${hl}-day half-life · affects these numbers and nightly planning</span></label>`;
-  wrap.querySelector("#recency-toggle").addEventListener("change", async (e) => {
+  slot.innerHTML =
+    `<label class="recency-label" title="${esc(tip)}">` +
+    `<span>⏳ Weight recent nights more</span>` +
+    `<span class="switch"><input type="checkbox" id="recency-toggle"${RECENCY_ON ? " checked" : ""}>` +
+    `<span class="knob"></span></span></label>`;
+  $("#recency-toggle").addEventListener("change", async (e) => {
+    if (RECENCY_BUSY) { e.target.checked = RECENCY_ON; return; }   // a switch is already in flight
+    RECENCY_BUSY = true;
     const enabled = e.target.checked;
     e.target.disabled = true;
     try {
-      renderReports(await post("/api/recency", { enabled }));
+      const fresh = await post("/api/recency", { enabled });   // returns the reports payload
+      renderRecencySlot(fresh.recency);
+      // if a reports subview is open it shows adjusted numbers — refresh it
+      if (!$("#view-reports").hidden) {
+        if (!$("#reports-body").hidden) renderReports(fresh);
+        else loadInteractions();
+      }
     } catch (err) {
       alert("Could not switch recency weighting: " + err.message);
-      e.target.checked = !enabled;
-      e.target.disabled = false;
+      renderRecencySlot({ enabled: RECENCY_ON, half_life_days: hl });
+    } finally {
+      RECENCY_BUSY = false;
     }
   });
-  return wrap;
 }
 
 // a night count, flagged when it's a recency-adjusted effective count
@@ -1384,6 +1397,7 @@ async function loadInteractions() {
 
   box.innerHTML = "";
   RECENCY_ON = !!(data.recency && data.recency.enabled);
+  renderRecencySlot(data.recency);
   const nPairs = data.pairs.length;
   box.appendChild(el("p", "rep-stat",
     `Every pair of interventions that has shared a night, across <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}` +

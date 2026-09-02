@@ -335,10 +335,27 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 .metric-rec-val.pos { color: var(--good); }
 .metric-rec-val.neg { color: var(--bad); }
 
-/* recency-weighting toggle (top of Reports) + "adjusted" flags */
-.recency-row { margin: 2px 0 10px; }
-.recency-label { font-size: 13px; color: var(--text); cursor: pointer; }
-.recency-label .recency-hint { color: var(--muted); font-size: 11.5px; margin-left: 6px; }
+/* recency-weighting toggle (header, under the Tracker/Reports buttons) */
+.nav-col { display: flex; flex-direction: column; align-items: flex-end; gap: 7px; }
+.recency-label {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--muted); cursor: pointer; user-select: none;
+}
+.recency-label:hover { color: var(--text); }
+/* iOS-style switch: a hidden checkbox driving a track + sliding knob */
+.switch { position: relative; display: inline-block; width: 34px; height: 19px; flex: none; }
+.switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.switch .knob {
+  position: absolute; inset: 0; border-radius: 10px; background: #2c3352;
+  transition: background .15s; pointer-events: none;
+}
+.switch .knob::before {
+  content: ""; position: absolute; width: 15px; height: 15px; left: 2px; top: 2px;
+  border-radius: 50%; background: #9aa2c0; transition: transform .15s, background .15s;
+}
+.switch input:checked + .knob { background: var(--accent); }
+.switch input:checked + .knob::before { transform: translateX(15px); background: #fff; }
+.switch input:disabled + .knob { opacity: .5; }
 .recency-badge {
   display: inline-block; padding: 1px 8px; border-radius: 3px; font-size: 11px;
   font-weight: 600; letter-spacing: .03em; color: var(--muted);
