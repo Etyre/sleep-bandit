@@ -531,10 +531,11 @@ function renderRecencySlot(recency) {
   if (!slot) return;
   const hl = Math.round((recency && recency.half_life_days) || 30);
   const tip = `Each night's datapoint — on- and off-nights alike — is weighted by how recent it is, ` +
-    `halving every ${hl} days (yesterday ≈ 1, a month ago ≈ ½, two months ≈ ¼). The weights scale both ` +
-    `the measured values and the effective sample sizes (shown as adjusted counts on the Reports page), ` +
-    `and the nightly planner schedules from the same weighted evidence. Ages count back from the most ` +
-    `recent logged night.`;
+    `halving every ${hl} days. The weights scale both the measured values and the effective sample sizes ` +
+    `(shown as adjusted counts on the Reports page), and the nightly planner schedules from the same ` +
+    `weighted evidence. The early lock-in guard is off in this mode — decayed counts can't reach its ` +
+    `night-count tiers, and fading evidence keeps the on/off contrast alive on its own. Ages count back ` +
+    `from the most recent logged night.`;
   if (READ_ONLY) {
     slot.innerHTML = RECENCY_ON
       ? `<span class="recency-badge" title="${esc(tip)}">⏳ recency weighting on · ${hl}-day half-life</span>` : "";

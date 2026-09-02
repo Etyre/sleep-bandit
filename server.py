@@ -66,15 +66,18 @@ def today_str():
 
 
 # ---------------------------------------------------------------------------
-# Recency weighting (server-wide mode, toggled from the Reports page).
+# Recency weighting (server-wide mode, toggled from the header switch).
 # When on, every night's datapoint -- on and off arms alike -- is weighted by
-# w = 0.5^(age / half-life): the newest night counts fully, a month-old night
-# counts half, and so on. The weight scales BOTH the values (weighted means,
-# weighted likelihood in the model) and the sample sizes (effective counts,
-# shown as "adjusted"), and it drives the live bandit too: Thompson planning,
-# the warm-up ramp and the early lock-in guard all see the weighted evidence.
+# w = 0.5^(age / half-life): the newest night counts fully, a half-life-old
+# night counts half, and so on. The weight scales BOTH the values (weighted
+# means, weighted likelihood in the model) and the sample sizes (effective
+# counts, shown as "adjusted"), and it drives the live bandit too: Thompson
+# planning and the warm-up ramp see the weighted evidence. The early lock-in
+# guard is DISABLED in this mode -- see ensure_tonight.
+# With nightly logging, decay caps total effective evidence at about
+# half-life / ln 2 (~1.44 x half-life) nights, however long the history.
 # ---------------------------------------------------------------------------
-RECENCY_HALF_LIFE_DAYS = 30.0
+RECENCY_HALF_LIFE_DAYS = 60.0
 
 
 def recency_enabled(conn):
@@ -167,7 +170,16 @@ def ensure_tonight(conn):
                if iv["id"] not in have]
     if missing:
         all_nights = analysis_nights_weighted(conn)
+        # Recency mode disables the early lock-in guard entirely: its night-count
+        # tiers (15/30 on the smaller arm) are barely reachable under decayed
+        # counts (an arm's effective count tops out near 1.44 x half-life x its
+        # scheduling rate), so the clamp would rarely -- for a decisive
+        # intervention, never -- release. Weighted mode already keeps the contrast
+        # alive by design: old evidence fades, so P(helps) can't lock in for good.
+        lockin_off = recency_enabled(conn)
         for iv in missing:
+            if lockin_off:
+                iv = dict(iv, no_lockin=True)
             nights, n_on, n_off = intervention_nights(iv["id"], all_nights, "hrv",
                                                       category=iv.get("category"))
             # doses actually recorded so far (with repeats) -- the points the dose-
@@ -330,7 +342,7 @@ def _p_scheduled(iv, all_nights):
     return _sched_info(iv, all_nights)["p_scheduled"]
 
 
-def _sched_info(iv, all_nights):
+def _sched_info(iv, all_nights, lockin_off=False):
     """Probability tonight's planner assigns this intervention ON. The on/off draw takes
     it iff a sampled 'does it help' effect > 0, so this is P(alpha > 0) under the
     PRIOR-INCLUSIVE posterior on the HRV nights (scheduling uses the prior). With no
@@ -339,7 +351,10 @@ def _sched_info(iv, all_nights):
     scheduled. Kept SEPARATE from the efficacy read-outs, which stay prior-free.
     While the smaller arm is thin the value is clamped by tier (bandit.LOCKIN_TIERS:
     <15 nights -> [10%, 90%], <30 -> [5%, 95%]), exactly as the planner does -- unless
-    the intervention's no_lockin override is set, in which case the raw value is used.
+    the intervention's no_lockin override is set, or lockin_off says the guard is
+    globally disabled (recency mode: decayed counts can't reach the tiers, and
+    fading evidence keeps the contrast alive anyway), in which case the raw value
+    is used and no tier is reported.
     Returns {p_scheduled (clamped), p_scheduled_raw, sched_cap (the tier's cap if the
     clamp changed the value, else None), sched_tier (the tier cap in force for these
     arm sizes whether or not it bit -- None once both arms are big enough),
@@ -351,8 +366,8 @@ def _sched_info(iv, all_nights):
     pri = bandit.scheduling_priors(iv)
     res = bandit.analyze([iv], nights, priors=({iv["id"]: pri} if pri else None))
     raw = res["readouts"].get(iv["id"], {}).get("p_helps")
-    tier = bandit.lockin_cap(n_on, n_off)
-    if iv.get("no_lockin"):
+    tier = None if lockin_off else bandit.lockin_cap(n_on, n_off)
+    if lockin_off or iv.get("no_lockin"):
         p, capped = raw, False
     else:
         p = bandit.clamp_p_on(raw, n_on, n_off)
@@ -429,6 +444,7 @@ def reports_payload(conn):
     prior-INCLUSIVE probability the planner schedules the intervention tonight."""
     ivs = store.list_interventions(conn)
     all_nights = analysis_nights_weighted(conn)
+    recency_on = recency_enabled(conn)   # recency mode also disables the lock-in guard
     n_hrv = sum(1 for n in all_nights if n["hrv"] is not None)
     out = []
     for iv in ivs:
@@ -439,7 +455,7 @@ def reports_payload(conn):
             "readout_tst": _readout(iv, all_nights, "tst", negate=False),
             "readout_lat": _readout(iv, all_nights, "lat", negate=True),
             "readout_eff": _readout(iv, all_nights, "eff", negate=False),
-            **_sched_info(iv, all_nights),
+            **_sched_info(iv, all_nights, lockin_off=recency_on),
         })
     return {"n_completed": n_hrv, "interventions": out,
             "hrv_trend": hrv_trend_payload(conn),
