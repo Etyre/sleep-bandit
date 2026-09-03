@@ -736,7 +736,7 @@ function reportCard(iv) {
       const right = el("div", "iv-graph");
       if ((r.doses || []).length) {
         right.appendChild(el("p", "chart-cap",
-          'Option → HRV change vs skipping · <span class="mk-dot">●</span> mean · <span class="mk-ci">│</span> 90% CI'));
+          'Option → HRV change vs skipping · <span class="mk-dot">●</span> raw mean · <span class="mk-ci">│</span> model 90% CI'));
         right.appendChild(optionChart(iv, r.doses, r));
       }
       body.appendChild(right);
@@ -776,7 +776,7 @@ function reportCard(iv) {
       if ((r.doses || []).length) {
         const showRec = enoughForDoseRec(r);
         right.appendChild(el("p", "chart-cap",
-          'Dose → HRV change over baseline · <span class="mk-dot">●</span> mean · <span class="mk-ci">│</span> 90% CI'));
+          'Dose → HRV change over baseline · <span class="mk-dot">●</span> raw mean · <span class="mk-ci">│</span> model 90% CI'));
         right.appendChild(doseChart(iv, r.doses, r, showRec));
         if (!showRec) {
           right.appendChild(el("p", "iv-meta",
@@ -809,14 +809,16 @@ function appendLat(card, iv) {
       `⏱ <b>Sleep latency</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off${adjNote()}.`));
     return;
   }
-  const delta = -re.on_effect, lo = -re.on_ci_high, hi = -re.on_ci_low;   // minutes, real sign
+  const delta = (re.on_mean != null && re.off_mean != null)
+    ? re.on_mean - re.off_mean : -re.on_effect;                            // minutes, real sign
+  const lo = -re.on_ci_high, hi = -re.on_ci_low;
   const cls = delta <= 0 ? "pos" : "neg";
   const label = isChoice ? "Sleep latency — any option vs skipping" : "Sleep latency";
   const avgs = (re.on_mean != null && re.off_mean != null)
     ? ` Avg <b>${avg1(re.on_mean)} min</b> on / <b>${avg1(re.off_mean)} min</b> off.` : "";
   card.appendChild(el("p", "iv-meta eff-line",
     `⏱ <b>${label}</b>: <span class="effect ${cls}">${signed(delta)}</span> min ` +
-    `<span class="ci">[${signed(lo)}, ${signed(hi)}]</span> on average ` +
+    `model CI <span class="ci">[${signed(lo)}, ${signed(hi)}]</span> ` +
     `(lower is better) — <b>${pct(re.p_helps)}</b> chance it shortens time to fall asleep.` + avgs));
 }
 
@@ -834,15 +836,16 @@ function appendTst(card, iv) {
       `🛌 <b>Total sleep</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off${adjNote()}.`));
     return;
   }
-  const cls = re.on_effect >= 0 ? "pos" : "neg";
+  const eff = rawEff(re);
+  const cls = eff >= 0 ? "pos" : "neg";
   const label = isChoice ? "Total sleep — any option vs skipping" : "Total sleep";
   const hm = (h) => { const m = Math.round(h * 60); return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`; };
   const mins = (h) => (h >= 0 ? "+" : "−") + Math.round(Math.abs(h) * 60) + " min";
   const avgs = (re.on_mean != null && re.off_mean != null)
     ? ` Avg <b>${hm(re.on_mean)}</b> on / <b>${hm(re.off_mean)}</b> off.` : "";
   card.appendChild(el("p", "iv-meta eff-line",
-    `🛌 <b>${label}</b>: <span class="effect ${cls}">${mins(re.on_effect)}</span> ` +
-    `<span class="ci">[${mins(re.on_ci_low)}, ${mins(re.on_ci_high)}]</span> on average ` +
+    `🛌 <b>${label}</b>: <span class="effect ${cls}">${mins(eff)}</span> ` +
+    `model CI <span class="ci">[${mins(re.on_ci_low)}, ${mins(re.on_ci_high)}]</span> ` +
     `(higher is better) — <b>${pct(re.p_helps)}</b> chance it lengthens your sleep.` + avgs));
 }
 
@@ -862,25 +865,38 @@ function appendEff(card, iv) {
       `😴 <b>Sleep efficiency</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off${adjNote()}.`));
     return;
   }
-  const cls = re.on_effect >= 0 ? "pos" : "neg";
+  const eff = rawEff(re);
+  const cls = eff >= 0 ? "pos" : "neg";
   const label = isChoice ? "Sleep efficiency — any option vs skipping" : "Sleep efficiency";
   const avgs = (re.on_mean != null && re.off_mean != null)
     ? ` Avg <b>${avg1(re.on_mean)}%</b> on / <b>${avg1(re.off_mean)}%</b> off.` : "";
   card.appendChild(el("p", "iv-meta eff-line",
-    `😴 <b>${label}</b>: <span class="effect ${cls}">${signed(re.on_effect)}</span> pp ` +
-    `<span class="ci">[${signed(re.on_ci_low)}, ${signed(re.on_ci_high)}]</span> on average ` +
+    `😴 <b>${label}</b>: <span class="effect ${cls}">${signed(eff)}</span> pp ` +
+    `model CI <span class="ci">[${signed(re.on_ci_low)}, ${signed(re.on_ci_high)}]</span> ` +
     `(higher is better) — <b>${pct(re.p_helps)}</b> chance it improves your sleep efficiency.` + avgs));
 }
 
+// Displayed effects are RAW on-vs-off differences (unbiased under randomized
+// assignment; no prior/shrinkage). The model still runs underneath: CIs,
+// P(helps), verdicts, recommendations and scheduling are all posterior-based,
+// so a raw number can sit outside its model CI — that gap IS the model's
+// skepticism about thin data. Falls back to the modeled effect if a raw mean
+// is missing (shouldn't happen where these render).
+const rawEff = (r) => (r && r.on_mean != null && r.off_mean != null)
+  ? r.on_mean - r.off_mean : (r ? r.on_effect : null);
+const rawDoseEff = (d, r) => (d.raw_mean != null && r.off_mean != null)
+  ? d.raw_mean - r.off_mean : d.mean_effect;
+
 // Big "does HRV improve?" hero number for a dose intervention (left column).
 function hrvMetric(r, dataNote, iv) {
-  const cls = r.on_effect >= 0 ? "pos" : "neg";
+  const eff = rawEff(r);
+  const cls = eff >= 0 ? "pos" : "neg";
   const sizable = r.p_meaningful >= 0.85 ? ' · <span class="metric-flag">likely sizable</span>' : "";
   const b = el("div", "metric-big");
   b.appendChild(el("div", "metric-label", '📈 HRV <span class="metric-hint">higher is better</span>'));
-  b.appendChild(el("div", "metric-val " + cls, signed(r.on_effect)));
+  b.appendChild(el("div", "metric-val " + cls, signed(eff)));
   b.appendChild(el("div", "metric-sub",
-    `<span class="ci">[${signed(r.on_ci_low)}, ${signed(r.on_ci_high)}]</span> on average · ` +
+    `model 90% CI <span class="ci">[${signed(r.on_ci_low)}, ${signed(r.on_ci_high)}]</span> · ` +
     `<b>${pct(r.p_helps)}</b> chance of a real benefit${sizable}`));
   if (r.on_mean != null && r.off_mean != null)
     b.appendChild(el("div", "metric-avgs",
@@ -906,13 +922,14 @@ function recHero(iv, r) {
     ? (optLabel(iv, row.dose) != null ? esc(optLabel(iv, row.dose)) : null)
     : doseAmount(iv, row.dose);
   if (!label) return null;
-  const cls = row.mean_effect >= 0 ? "pos" : "neg";
+  const eff = rawDoseEff(row, r);
+  const cls = eff >= 0 ? "pos" : "neg";
   const n = row.n_nights || 0;
   const d = el("div", "metric-rec");
   d.innerHTML =
-    `<span class="metric-rec-val ${cls}">${signed(row.mean_effect)}</span> ` +
+    `<span class="metric-rec-val ${cls}">${signed(eff)}</span> ` +
     `at the recommended ${isChoiceKind(iv) ? "option" : "dose"}, <b>${label}</b> ` +
-    `<span class="ci">[${signed(row.ci_low)}, ${signed(row.ci_high)}]</span> · ` +
+    `model CI <span class="ci">[${signed(row.ci_low)}, ${signed(row.ci_high)}]</span> · ` +
     `${n} night${n === 1 ? "" : "s"} at it${adjNote()}`;
   return d;
 }
@@ -931,11 +948,13 @@ function rhrMetric(iv) {
     b.appendChild(el("div", "metric-sub", `gathering data — ${nOn} on, ${nOff} off${adjNote()}`));
     return b;
   }
-  const effBpm = -rl.on_effect;
+  // raw difference in real bpm (on_mean/off_mean are un-negated real values)
+  const effBpm = (rl.on_mean != null && rl.off_mean != null)
+    ? rl.on_mean - rl.off_mean : -rl.on_effect;
   const cls = effBpm <= 0 ? "pos" : "neg";
   b.appendChild(el("div", "metric-val " + cls, `${signed(effBpm)}<span class="metric-unit"> bpm</span>`));
   b.appendChild(el("div", "metric-sub",
-    `<span class="ci">[${signed(-rl.on_ci_high)}, ${signed(-rl.on_ci_low)}]</span> on average · ` +
+    `model 90% CI <span class="ci">[${signed(-rl.on_ci_high)}, ${signed(-rl.on_ci_low)}]</span> · ` +
     `<b>${pct(rl.p_helps)}</b> chance it lowers`));
   if (rl.on_mean != null && rl.off_mean != null)
     b.appendChild(el("div", "metric-avgs",
@@ -958,14 +977,15 @@ function appendLrhr(card, iv) {
       `🫀 <b>Resting HR</b>: gathering data — ${nOn} night${nOn === 1 ? "" : "s"} on, ${nOff} off${adjNote()}.`));
     return;
   }
-  const effBpm = -rl.on_effect;
+  const effBpm = (rl.on_mean != null && rl.off_mean != null)
+    ? rl.on_mean - rl.off_mean : -rl.on_effect;
   const cls = effBpm <= 0 ? "pos" : "neg";  // lower resting HR is good -> green
   const label = isChoice ? "Resting HR — any option vs skipping" : "Resting HR";
   const avgs = (rl.on_mean != null && rl.off_mean != null)
     ? ` Avg <b>${avg1(rl.on_mean)}</b> on / <b>${avg1(rl.off_mean)}</b> off bpm.` : "";
   card.appendChild(el("p", "iv-meta",
     `🫀 <b>${label}</b>: <span class="effect ${cls}">${signed(effBpm)}</span> bpm ` +
-    `<span class="ci">[${signed(-rl.on_ci_high)}, ${signed(-rl.on_ci_low)}]</span> on average ` +
+    `model CI <span class="ci">[${signed(-rl.on_ci_high)}, ${signed(-rl.on_ci_low)}]</span> ` +
     `(lower is better) — <b>${pct(rl.p_helps)}</b> chance it lowers your resting HR.` + avgs));
 }
 
@@ -1024,8 +1044,12 @@ function doseChart(iv, rows, r, showRec) {
   const mL = 42, mR = 44, mT = 16, mB = 30;   // right margin fits the last value label
   const pL = mL, pR = W - mR, pT = mT, pB = H - mB, pH = pB - pT, pW = pR - pL;
 
+  // dots are the RAW per-dose difference vs the off-nights baseline; whiskers
+  // stay the model's 90% CI, so a thin dose's wild raw reading can sit outside
+  // its own whisker — that gap is the model's skepticism, on display
+  const eff = (d) => rawDoseEff(d, r);
   let lo = 0, hi = 0;
-  for (const d of rows) { lo = Math.min(lo, d.ci_low); hi = Math.max(hi, d.ci_high); }
+  for (const d of rows) { lo = Math.min(lo, d.ci_low, eff(d)); hi = Math.max(hi, d.ci_high, eff(d)); }
   if (hi - lo < 1) { hi += 1; lo -= 1; }
   const pad = (hi - lo) * 0.08; hi += pad; lo -= pad;
   const py = (v) => pT + (hi - v) / (hi - lo) * pH;
@@ -1054,8 +1078,9 @@ function doseChart(iv, rows, r, showRec) {
   parts.push(`<text x="${pL - 6}" y="${y0 + 3.5}" text-anchor="end" font-size="10" style="fill:var(--text)">0</text>`);
 
   rows.forEach((d, i) => {
-    const x = cx(i), col = d.mean_effect >= 0 ? "var(--good)" : "var(--bad)";
-    const yTop = py(d.ci_high), yBot = py(d.ci_low), yM = py(d.mean_effect);
+    const v = eff(d);
+    const x = cx(i), col = v >= 0 ? "var(--good)" : "var(--bad)";
+    const yTop = py(d.ci_high), yBot = py(d.ci_low), yM = py(v);
     // whisker + caps
     parts.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
     parts.push(`<line x1="${x - 5}" y1="${yTop}" x2="${x + 5}" y2="${yTop}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
@@ -1064,11 +1089,12 @@ function doseChart(iv, rows, r, showRec) {
     if (showRec && Math.abs(d.dose - r.recommended_dose) < 1e-6 && r.recommended_dose > 0) {
       parts.push(`<circle cx="${x}" cy="${yM}" r="8.5" fill="none" stroke-width="2" style="stroke:var(--accent-2)"/>`);
     }
-    // mean dot with a surface ring, plus a native hover tooltip
+    // raw-mean dot with a surface ring, plus a native hover tooltip
     parts.push(`<circle cx="${x}" cy="${yM}" r="5" stroke-width="2" style="fill:${col};stroke:var(--panel)">` +
-      `<title>${doseAmount(iv, d.dose)}: ${signed(d.mean_effect)} HRV [${signed(d.ci_low)}, ${signed(d.ci_high)}]</title></circle>`);
+      `<title>${doseAmount(iv, d.dose)}: ${signed(v)} raw over ${d.n_nights} night${d.n_nights === 1 ? "" : "s"}` +
+      ` · model ${signed(d.mean_effect)} [${signed(d.ci_low)}, ${signed(d.ci_high)}]</title></circle>`);
     // direct value label, always to the right of the dot (same direction for every dose)
-    parts.push(`<text x="${x + 9}" y="${yM + 3.5}" text-anchor="start" font-size="11" font-weight="600" style="fill:${col}">${signed(d.mean_effect)}</text>`);
+    parts.push(`<text x="${x + 9}" y="${yM + 3.5}" text-anchor="start" font-size="11" font-weight="600" style="fill:${col}">${signed(v)}</text>`);
     // x tick
     parts.push(`<text x="${x}" y="${pB + 15}" text-anchor="middle" font-size="10.5" style="fill:var(--muted)">${esc(String(doseTick(iv, d.dose)))}</text>`);
   });
@@ -1092,8 +1118,10 @@ function optionChart(iv, rows, r) {
   const mL = 42, mR = 16, mT = 16, mB = 32;
   const pL = mL, pR = W - mR, pT = mT, pB = H - mB, pH = pB - pT, pW = pR - pL;
 
+  // dots: raw per-option difference vs skipping; whiskers: model 90% CI (as in doseChart)
+  const eff = (d) => rawDoseEff(d, r);
   let lo = 0, hi = 0;
-  for (const d of rows) { lo = Math.min(lo, d.ci_low); hi = Math.max(hi, d.ci_high); }
+  for (const d of rows) { lo = Math.min(lo, d.ci_low, eff(d)); hi = Math.max(hi, d.ci_high, eff(d)); }
   if (hi - lo < 1) { hi += 1; lo -= 1; }
   const pad = (hi - lo) * 0.08; hi += pad; lo -= pad;
   const py = (v) => pT + (hi - v) / (hi - lo) * pH;
@@ -1111,8 +1139,9 @@ function optionChart(iv, rows, r) {
   parts.push(`<text x="${pL - 6}" y="${y0 + 3.5}" text-anchor="end" font-size="10" style="fill:var(--text)">0</text>`);
 
   rows.forEach((d, i) => {
-    const x = cx(i), col = d.mean_effect >= 0 ? "var(--good)" : "var(--bad)";
-    const yTop = py(d.ci_high), yBot = py(d.ci_low), yM = py(d.mean_effect);
+    const v = eff(d);
+    const x = cx(i), col = v >= 0 ? "var(--good)" : "var(--bad)";
+    const yTop = py(d.ci_high), yBot = py(d.ci_low), yM = py(v);
     // 90% CI whisker with caps (identical mark to doseChart)
     parts.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
     parts.push(`<line x1="${x - 5}" y1="${yTop}" x2="${x + 5}" y2="${yTop}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
@@ -1121,12 +1150,13 @@ function optionChart(iv, rows, r) {
     if (d.dose === bestId && bestP > 0) {
       parts.push(`<circle cx="${x}" cy="${yM}" r="8.5" fill="none" stroke-width="2" style="stroke:var(--accent-2)"/>`);
     }
-    // mean dot with a surface ring + hover tooltip
+    // raw-mean dot with a surface ring + hover tooltip
     parts.push(`<circle cx="${x}" cy="${yM}" r="5" stroke-width="2" style="fill:${col};stroke:var(--panel)">` +
-      `<title>${esc(optLabel(iv, d.dose) || "(removed)")}: ${signed(d.mean_effect)} HRV [${signed(d.ci_low)}, ${signed(d.ci_high)}], P(best)=${pct(d.p_best)}</title></circle>`);
+      `<title>${esc(optLabel(iv, d.dose) || "(removed)")}: ${signed(v)} raw over ${d.n_nights} night${d.n_nights === 1 ? "" : "s"}` +
+      ` · model ${signed(d.mean_effect)} [${signed(d.ci_low)}, ${signed(d.ci_high)}], P(best)=${pct(d.p_best)}</title></circle>`);
     // value label beside the dot, flipped left on the last column so it never overflows
     const left = i === n - 1 && n > 1;
-    parts.push(`<text x="${x + (left ? -9 : 9)}" y="${yM + 3.5}" text-anchor="${left ? "end" : "start"}" font-size="11" font-weight="600" style="fill:${col}">${signed(d.mean_effect)}</text>`);
+    parts.push(`<text x="${x + (left ? -9 : 9)}" y="${yM + 3.5}" text-anchor="${left ? "end" : "start"}" font-size="11" font-weight="600" style="fill:${col}">${signed(v)}</text>`);
     // option label tick (truncated, full text on hover); best option highlighted
     const raw = optLabel(iv, d.dose) || "(removed)";
     const isBest = d.dose === bestId;
