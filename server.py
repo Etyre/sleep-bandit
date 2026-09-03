@@ -495,6 +495,73 @@ def _pair_nights(iv_a, iv_b, all_nights, metric, negate):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Observational behavior states (Reports > Interactions).
+# Some hypotheses are about what ACTUALLY happened, not what was assigned --
+# e.g. "do Ketone Esters only help on nights I'm fasting?", where it doesn't
+# matter whether the fast was randomized or chosen (a "Huel only if hungry"
+# night that ended as a fast counts as a fast). Each state derives a per-night
+# yes / no / unknown from its source choice intervention: a confirmed option
+# decides it where the option pins the behavior, and the recorded completion
+# button (assignments.input_value) decides it where the option doesn't -- the
+# recorded button, when present, always wins. Unconfirmed nights, and nights
+# whose option leaves the behavior open with nothing recorded, are unknown and
+# drop out. These states are paired against every intervention on the
+# Interactions page, flagged "observed": the state side is NOT randomized, so
+# those rows are correlational -- a flag is a lead, not a causal verdict.
+# Option / button ids below are the stable ids in "Food and fasting":
+#   options: 1 = fast (no eating 4h), 2 = Huel/Soylent, 3 = banana (ate,
+#            not Huel), 4 = Huel only if hungry (behavior open -> button);
+#   buttons: 1 = "Huel/Soylent", 2 = "Fast".
+BEHAVIOR_STATES = [
+    {"key": "fasted", "name": "Fasting (actual)", "iv_name": "Food and fasting",
+     "yes_options": (1,), "no_options": (2, 3), "yes_input": "2", "no_input": "1"},
+    {"key": "huel", "name": "Huel/Soylent before bed (actual)", "iv_name": "Food and fasting",
+     "yes_options": (2,), "no_options": (1, 3), "yes_input": "1", "no_input": "2"},
+]
+
+
+def _behavior_state(night, iv_id, spec):
+    """1 / 0 / None: did this behavior actually happen on this night?"""
+    a = night["assigns"].get(iv_id)
+    if not a or a.get("excluded"):
+        return None
+    taken = a.get("taken")
+    if taken is None or taken <= 0:          # option not confirmed -> unknown
+        return None
+    val = a.get("input")
+    if val is not None:                       # recorded button is ground truth
+        if str(val) == spec["yes_input"]:
+            return 1
+        if str(val) == spec["no_input"]:
+            return 0
+    opt = int(round(taken))
+    if opt in spec["yes_options"]:
+        return 1
+    if opt in spec["no_options"]:
+        return 0
+    return None
+
+
+def _pair_nights_state(iv_a, src_iv, spec, all_nights, metric, negate):
+    """Nights where intervention A is determined (randomized on/off) AND the
+    behavior state is known -- shaped for bandit.pair_interaction."""
+    out = []
+    for n in all_nights:
+        val = n.get(metric)
+        if val is None:
+            continue
+        if n.get("excl_" + (iv_a.get("category") or "")) or n.get("excl_" + (src_iv.get("category") or "")):
+            continue
+        sa = _on_state(n, iv_a["id"])
+        sb = _behavior_state(n, src_iv["id"], spec)
+        if sa is None or sb is None:
+            continue
+        out.append({"y": (-float(val) if negate else float(val)), "a": sa, "b": sb,
+                    "w": float(n.get("w", 1.0))})
+    return out
+
+
 def interactions_payload(conn):
     """Every pair of (non-archived) interventions that has shared at least one night
     with both on, with its interaction read-out on HRV (primary) and resting HR.
@@ -503,6 +570,8 @@ def interactions_payload(conn):
     all_nights = analysis_nights_weighted(conn)
     n_hrv = sum(1 for n in all_nights if n["hrv"] is not None)
     pairs, no_overlap = [], 0
+    brief = lambda iv: {"id": iv["id"], "name": iv["name"], "category": iv["category"],
+                        "kind": iv["kind"], "active": iv["active"]}
     for i in range(len(ivs)):
         for j in range(i + 1, len(ivs)):
             a, b = ivs[i], ivs[j]
@@ -511,9 +580,26 @@ def interactions_payload(conn):
             if not ((r_hrv and r_hrv["n_both"]) or (r_lrhr and r_lrhr["n_both"])):
                 no_overlap += 1
                 continue
-            brief = lambda iv: {"id": iv["id"], "name": iv["name"], "category": iv["category"],
-                                "kind": iv["kind"], "active": iv["active"]}
             pairs.append({"a": brief(a), "b": brief(b), "hrv": r_hrv, "lrhr": r_lrhr})
+    # observational behavior states x every intervention except their own source
+    # (that pair is confounded by construction). The randomized rows above are
+    # untouched -- these are ADDITIONAL, correlational rows.
+    for spec in BEHAVIOR_STATES:
+        src = next((x for x in ivs if x["name"] == spec["iv_name"]), None)
+        if not src:
+            continue
+        for a in ivs:
+            if a["id"] == src["id"]:
+                continue
+            r_hrv = bandit.pair_interaction(_pair_nights_state(a, src, spec, all_nights, "hrv", False))
+            r_lrhr = bandit.pair_interaction(_pair_nights_state(a, src, spec, all_nights, "lrhr", True))
+            if not ((r_hrv and r_hrv["n_both"]) or (r_lrhr and r_lrhr["n_both"])):
+                no_overlap += 1
+                continue
+            pairs.append({"a": brief(a),
+                          "b": {"id": "state:" + spec["key"], "name": spec["name"],
+                                "category": src["category"], "kind": "state", "active": True},
+                          "observational": True, "hrv": r_hrv, "lrhr": r_lrhr})
     return {"n_completed": n_hrv, "n_interventions": len(ivs), "pairs": pairs,
             "n_pairs_no_overlap": no_overlap,
             "recency": {"enabled": recency_enabled(conn),

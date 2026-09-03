@@ -855,11 +855,12 @@ def analysis_nights(conn):
     for r in rows:
         assigns = {}
         for a in conn.execute(
-                "SELECT intervention_id, assigned_dose, taken_dose, excluded FROM assignments "
-                "WHERE night_date=?", (r["date"],)):
+                "SELECT intervention_id, assigned_dose, taken_dose, excluded, input_value "
+                "FROM assignments WHERE night_date=?", (r["date"],)):
             assigns[a["intervention_id"]] = {"assigned": a["assigned_dose"],
                                              "taken": a["taken_dose"],
-                                             "excluded": bool(a["excluded"])}
+                                             "excluded": bool(a["excluded"]),
+                                             "input": a["input_value"]}
         out.append({"date": r["date"], "hrv": r["hrv"], "lrhr": r["lrhr"], "tst": r["tst"], "lat": r["lat"], "eff": r["eff"],
                     "excl_behavioral": bool(r["excl_behavioral"]),
                     "excl_supplement": bool(r["excl_supplement"]),

@@ -1433,6 +1433,19 @@ async function loadInteractions() {
 
 const pairName = (p) => `${p.a.name} + ${p.b.name}`;
 
+// Marker for pairs whose second side is OBSERVED behavior (e.g. "Fasting
+// (actual)") rather than a randomized assignment: nights count whether the
+// behavior was assigned or chosen, so these rows are correlational.
+const obsTip = (p) => `“${p.b.name}” is what actually happened each night — assigned or chosen — not a ` +
+  `randomized arm. Nights are included regardless of why the behavior occurred, so this row is ` +
+  `correlational: a flag here is a lead worth probing, not a causal verdict.`;
+const obsBadgeHtml = (p) => ` <span class="obs-flag" title="${esc(obsTip(p))}">👁 observed</span>`;
+function obsBadge(p) {
+  const b = el("span", "obs-flag", "👁 observed");
+  b.title = obsTip(p);
+  return b;
+}
+
 // the raw-average story: "together X, vs Y if the two effects simply added"
 function additiveExpected(r) {
   if (r.raw_neither == null || r.raw_a_only == null || r.raw_b_only == null) return null;
@@ -1446,6 +1459,7 @@ function pairCard(p) {
   const top = el("div", "iv-top");
   top.appendChild(el("span", "pair-name", `${esc(p.a.name)}<span class="plus">+</span>${esc(p.b.name)}`));
   top.appendChild(el("span", "verdict " + vc, vt));
+  if (p.observational) top.appendChild(obsBadge(p));
   top.appendChild(el("span", "iv-meta", `${r.n_both || 0} night${r.n_both === 1 ? "" : "s"} with both · ${r.n || 0} comparable`));
   card.appendChild(top);
 
@@ -1510,7 +1524,7 @@ function pairTable(pairs) {
     const tr = el("tr", "clickable");
     const g = r.interaction;
     tr.innerHTML =
-      `<td>${esc(pairName(p))}</td>` +
+      `<td>${esc(pairName(p))}${p.observational ? obsBadgeHtml(p) : ""}</td>` +
       `<td><span class="verdict ${vc}">${vt}</span></td>` +
       `<td class="num">${r.n_both || 0}</td>` +
       `<td class="num">${g ? `<span class="effect ${g.mean >= 0 ? "pos" : "neg"}">${signed(g.mean)}</span> <span class="ci">[${signed(g.ci_low)}, ${signed(g.ci_high)}]</span>` : "—"}</td>` +

@@ -361,6 +361,13 @@ button:hover, .ghost:hover { border-color: var(--accent); }
   font-weight: 600; letter-spacing: .03em; color: var(--muted);
   border: 1px dashed rgba(154,162,192,.55); cursor: help;
 }
+/* interactions: the pair's second side is observed behavior, not a randomized arm */
+.obs-flag {
+  display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 3px;
+  font-size: 10.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--muted); border: 1px dashed rgba(154,162,192,.55); cursor: help;
+  vertical-align: 1px; white-space: nowrap;
+}
 .adj-flag {
   display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 3px;
   font-size: 10.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
