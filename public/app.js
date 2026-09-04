@@ -887,20 +887,20 @@ const rawEff = (r) => (r && r.on_mean != null && r.off_mean != null)
 const rawDoseEff = (d, r) => (d.raw_mean != null && r.off_mean != null)
   ? d.raw_mean - r.off_mean : d.mean_effect;
 
-// Big "does HRV improve?" hero number for a dose intervention (left column).
+// HRV block for a dose intervention (left column). No pooled headline number:
+// the pooled on-vs-off effect mixes whatever doses happened to run, so the card
+// leads with the raw averages and the recommended-dose line carries the big
+// figure (recHero). The model's confidence rides alongside.
 function hrvMetric(r, dataNote, iv) {
-  const eff = rawEff(r);
-  const cls = eff >= 0 ? "pos" : "neg";
   const sizable = r.p_meaningful >= 0.85 ? ' · <span class="metric-flag">likely sizable</span>' : "";
   const b = el("div", "metric-big");
   b.appendChild(el("div", "metric-label", '📈 HRV <span class="metric-hint">higher is better</span>'));
-  b.appendChild(el("div", "metric-val " + cls, signed(eff)));
-  b.appendChild(el("div", "metric-sub",
-    `model 90% CI <span class="ci">[${signed(r.on_ci_low)}, ${signed(r.on_ci_high)}]</span> · ` +
-    `<b>${pct(r.p_helps)}</b> chance of a real benefit${sizable}`));
   if (r.on_mean != null && r.off_mean != null)
     b.appendChild(el("div", "metric-avgs",
       `Avg HRV <b>${avg1(r.on_mean)}</b> on nights · <b>${avg1(r.off_mean)}</b> off`));
+  b.appendChild(el("div", "metric-sub",
+    `model 90% CI <span class="ci">[${signed(r.on_ci_low)}, ${signed(r.on_ci_high)}]</span> · ` +
+    `<b>${pct(r.p_helps)}</b> chance of a real benefit${sizable}`));
   const rec = iv ? recHero(iv, r) : null;
   if (rec) b.appendChild(rec);
   b.appendChild(el("div", "metric-note", `Based on ${dataNote}`));
