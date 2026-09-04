@@ -995,6 +995,29 @@ function doseRow(d, label, rec, isOff) {
   return tr;
 }
 
+// Custom chart tooltip. Native SVG <title> tooltips proved unreliable, so any
+// chart mark group carrying data-tip gets a floating div that appears instantly
+// on hover and follows the cursor.
+const chartTip = el("div", "chart-tip");
+chartTip.hidden = true;
+document.body.appendChild(chartTip);
+document.addEventListener("mouseover", (e) => {
+  const g = e.target.closest && e.target.closest("[data-tip]");
+  if (!g) { chartTip.hidden = true; return; }
+  chartTip.textContent = g.getAttribute("data-tip");
+  chartTip.hidden = false;
+});
+document.addEventListener("mousemove", (e) => {
+  if (chartTip.hidden) return;
+  const pad = 14;
+  const r = chartTip.getBoundingClientRect();
+  let x = e.clientX + pad, y = e.clientY + pad;
+  if (x + r.width > window.innerWidth - 8) x = e.clientX - r.width - pad;
+  if (y + r.height > window.innerHeight - 8) y = e.clientY - r.height - pad;
+  chartTip.style.left = x + "px";
+  chartTip.style.top = y + "px";
+});
+
 // Dose axis tick + unit caption, in the native unit (mg/g/…), never pills.
 function doseTick(iv, dose) {
   return isOpenDose(dose) ? "∞" : numLabel(dose);
@@ -1058,7 +1081,7 @@ function doseChart(iv, rows, r, showRec) {
     // shares one tooltip, so hovering anywhere near the datapoint shows it
     const tip = `${doseTextPlain(iv, d.dose)}: ${signed(v)} raw over ${d.n_nights} night${d.n_nights === 1 ? "" : "s"}` +
       ` · model ${signed(d.mean_effect)} [${signed(d.ci_low)}, ${signed(d.ci_high)}]`;
-    parts.push(`<g><title>${esc(tip)}</title>`);
+    parts.push(`<g data-tip="${esc(tip)}">`);
     parts.push(`<rect x="${x - 12}" y="${Math.min(yTop, yM) - 10}" width="24" height="${Math.abs(yBot - yTop) + 20}" fill="transparent"/>`);
     // whisker + caps
     parts.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
@@ -1123,7 +1146,7 @@ function optionChart(iv, rows, r) {
     // one tooltip for the whole mark group, with a widened invisible hit strip
     const tip = `${optLabel(iv, d.dose) || "(removed)"}: ${signed(v)} raw over ${d.n_nights} night${d.n_nights === 1 ? "" : "s"}` +
       ` · model ${signed(d.mean_effect)} [${signed(d.ci_low)}, ${signed(d.ci_high)}], P(best)=${pct(d.p_best)}`;
-    parts.push(`<g><title>${esc(tip)}</title>`);
+    parts.push(`<g data-tip="${esc(tip)}">`);
     parts.push(`<rect x="${x - 12}" y="${Math.min(yTop, yM) - 10}" width="24" height="${Math.abs(yBot - yTop) + 20}" fill="transparent"/>`);
     // 90% CI whisker with caps (identical mark to doseChart)
     parts.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);

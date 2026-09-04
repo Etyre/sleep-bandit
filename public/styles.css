@@ -353,6 +353,14 @@ button:hover, .ghost:hover { border-color: var(--accent); }
   font-weight: 600; letter-spacing: .03em; color: var(--muted);
   border: 1px dashed rgba(154,162,192,.55); cursor: help;
 }
+/* floating tooltip for chart datapoints (shown for any [data-tip] mark group) */
+.chart-tip {
+  position: fixed; z-index: 90; pointer-events: none; max-width: 340px;
+  background: var(--panel, #1c2240); border: 1px solid var(--line);
+  border-radius: 6px; padding: 6px 9px; font-size: 12px; line-height: 1.45;
+  color: var(--text); box-shadow: 0 4px 14px rgba(0, 0, 0, .45);
+}
+
 /* interactions: the pair's second side is observed behavior, not a randomized arm */
 .obs-flag {
   display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 3px;
