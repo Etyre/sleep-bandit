@@ -1054,6 +1054,12 @@ function doseChart(iv, rows, r, showRec) {
     const v = eff(d);
     const x = cx(i), col = v >= 0 ? "var(--good)" : "var(--bad)";
     const yTop = py(d.ci_high), yBot = py(d.ci_low), yM = py(v);
+    // the whole mark group (whisker + dot + label + an invisible hit strip)
+    // shares one tooltip, so hovering anywhere near the datapoint shows it
+    const tip = `${doseTextPlain(iv, d.dose)}: ${signed(v)} raw over ${d.n_nights} night${d.n_nights === 1 ? "" : "s"}` +
+      ` · model ${signed(d.mean_effect)} [${signed(d.ci_low)}, ${signed(d.ci_high)}]`;
+    parts.push(`<g><title>${esc(tip)}</title>`);
+    parts.push(`<rect x="${x - 12}" y="${Math.min(yTop, yM) - 10}" width="24" height="${Math.abs(yBot - yTop) + 20}" fill="transparent"/>`);
     // whisker + caps
     parts.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
     parts.push(`<line x1="${x - 5}" y1="${yTop}" x2="${x + 5}" y2="${yTop}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
@@ -1062,12 +1068,11 @@ function doseChart(iv, rows, r, showRec) {
     if (showRec && Math.abs(d.dose - r.recommended_dose) < 1e-6 && r.recommended_dose > 0) {
       parts.push(`<circle cx="${x}" cy="${yM}" r="8.5" fill="none" stroke-width="2" style="stroke:var(--accent-2)"/>`);
     }
-    // raw-mean dot with a surface ring, plus a native hover tooltip
-    parts.push(`<circle cx="${x}" cy="${yM}" r="5" stroke-width="2" style="fill:${col};stroke:var(--panel)">` +
-      `<title>${doseAmount(iv, d.dose)}: ${signed(v)} raw over ${d.n_nights} night${d.n_nights === 1 ? "" : "s"}` +
-      ` · model ${signed(d.mean_effect)} [${signed(d.ci_low)}, ${signed(d.ci_high)}]</title></circle>`);
+    // raw-mean dot with a surface ring
+    parts.push(`<circle cx="${x}" cy="${yM}" r="5" stroke-width="2" style="fill:${col};stroke:var(--panel)"/>`);
     // direct value label, always to the right of the dot (same direction for every dose)
     parts.push(`<text x="${x + 9}" y="${yM + 3.5}" text-anchor="start" font-size="11" font-weight="600" style="fill:${col}">${signed(v)}</text>`);
+    parts.push(`</g>`);
     // x tick
     parts.push(`<text x="${x}" y="${pB + 15}" text-anchor="middle" font-size="10.5" style="fill:var(--muted)">${esc(String(doseTick(iv, d.dose)))}</text>`);
   });
@@ -1115,6 +1120,11 @@ function optionChart(iv, rows, r) {
     const v = eff(d);
     const x = cx(i), col = v >= 0 ? "var(--good)" : "var(--bad)";
     const yTop = py(d.ci_high), yBot = py(d.ci_low), yM = py(v);
+    // one tooltip for the whole mark group, with a widened invisible hit strip
+    const tip = `${optLabel(iv, d.dose) || "(removed)"}: ${signed(v)} raw over ${d.n_nights} night${d.n_nights === 1 ? "" : "s"}` +
+      ` · model ${signed(d.mean_effect)} [${signed(d.ci_low)}, ${signed(d.ci_high)}], P(best)=${pct(d.p_best)}`;
+    parts.push(`<g><title>${esc(tip)}</title>`);
+    parts.push(`<rect x="${x - 12}" y="${Math.min(yTop, yM) - 10}" width="24" height="${Math.abs(yBot - yTop) + 20}" fill="transparent"/>`);
     // 90% CI whisker with caps (identical mark to doseChart)
     parts.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
     parts.push(`<line x1="${x - 5}" y1="${yTop}" x2="${x + 5}" y2="${yTop}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
@@ -1123,13 +1133,12 @@ function optionChart(iv, rows, r) {
     if (d.dose === bestId && bestP > 0) {
       parts.push(`<circle cx="${x}" cy="${yM}" r="8.5" fill="none" stroke-width="2" style="stroke:var(--accent-2)"/>`);
     }
-    // raw-mean dot with a surface ring + hover tooltip
-    parts.push(`<circle cx="${x}" cy="${yM}" r="5" stroke-width="2" style="fill:${col};stroke:var(--panel)">` +
-      `<title>${esc(optLabel(iv, d.dose) || "(removed)")}: ${signed(v)} raw over ${d.n_nights} night${d.n_nights === 1 ? "" : "s"}` +
-      ` · model ${signed(d.mean_effect)} [${signed(d.ci_low)}, ${signed(d.ci_high)}], P(best)=${pct(d.p_best)}</title></circle>`);
+    // raw-mean dot with a surface ring
+    parts.push(`<circle cx="${x}" cy="${yM}" r="5" stroke-width="2" style="fill:${col};stroke:var(--panel)"/>`);
     // value label beside the dot, flipped left on the last column so it never overflows
     const left = i === n - 1 && n > 1;
     parts.push(`<text x="${x + (left ? -9 : 9)}" y="${yM + 3.5}" text-anchor="${left ? "end" : "start"}" font-size="11" font-weight="600" style="fill:${col}">${signed(v)}</text>`);
+    parts.push(`</g>`);
     // option label tick (truncated, full text on hover); best option highlighted
     const raw = optLabel(iv, d.dose) || "(removed)";
     const isBest = d.dose === bestId;
