@@ -1079,9 +1079,7 @@ function doseChart(iv, rows, r, showRec) {
     const yTop = py(d.ci_high), yBot = py(d.ci_low), yM = py(v);
     // the whole mark group (whisker + dot + label + an invisible hit strip)
     // shares one tooltip, so hovering anywhere near the datapoint shows it
-    const tip = `${doseTextPlain(iv, d.dose)}: ${signed(v)} raw over ${d.n_nights} night${d.n_nights === 1 ? "" : "s"}` +
-      ` · model ${signed(d.mean_effect)} [${signed(d.ci_low)}, ${signed(d.ci_high)}]`;
-    parts.push(`<g data-tip="${esc(tip)}">`);
+    parts.push(`<g data-tip="n=${d.n_nights}">`);
     parts.push(`<rect x="${x - 12}" y="${Math.min(yTop, yM) - 10}" width="24" height="${Math.abs(yBot - yTop) + 20}" fill="transparent"/>`);
     // whisker + caps
     parts.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
@@ -1144,9 +1142,7 @@ function optionChart(iv, rows, r) {
     const x = cx(i), col = v >= 0 ? "var(--good)" : "var(--bad)";
     const yTop = py(d.ci_high), yBot = py(d.ci_low), yM = py(v);
     // one tooltip for the whole mark group, with a widened invisible hit strip
-    const tip = `${optLabel(iv, d.dose) || "(removed)"}: ${signed(v)} raw over ${d.n_nights} night${d.n_nights === 1 ? "" : "s"}` +
-      ` · model ${signed(d.mean_effect)} [${signed(d.ci_low)}, ${signed(d.ci_high)}], P(best)=${pct(d.p_best)}`;
-    parts.push(`<g data-tip="${esc(tip)}">`);
+    parts.push(`<g data-tip="n=${d.n_nights}">`);
     parts.push(`<rect x="${x - 12}" y="${Math.min(yTop, yM) - 10}" width="24" height="${Math.abs(yBot - yTop) + 20}" fill="transparent"/>`);
     // 90% CI whisker with caps (identical mark to doseChart)
     parts.push(`<line x1="${x}" y1="${yTop}" x2="${x}" y2="${yBot}" stroke-width="2" style="stroke:var(--muted);opacity:.5"/>`);
