@@ -887,51 +887,24 @@ const rawEff = (r) => (r && r.on_mean != null && r.off_mean != null)
 const rawDoseEff = (d, r) => (d.raw_mean != null && r.off_mean != null)
   ? d.raw_mean - r.off_mean : d.mean_effect;
 
-// HRV block for a dose intervention (left column). No pooled headline number:
-// the pooled on-vs-off effect mixes whatever doses happened to run, so the card
-// leads with the raw averages and the recommended-dose line carries the big
-// figure (recHero). The model's confidence rides alongside.
+// Big "does HRV improve?" number for a dose intervention (left column): the raw
+// on-vs-off difference. (The per-dose story, including the recommended dose's
+// own raw effect, lives in the chart beside it — its ringed dot.)
 function hrvMetric(r, dataNote, iv) {
+  const eff = rawEff(r);
+  const cls = eff >= 0 ? "pos" : "neg";
   const sizable = r.p_meaningful >= 0.85 ? ' · <span class="metric-flag">likely sizable</span>' : "";
   const b = el("div", "metric-big");
   b.appendChild(el("div", "metric-label", '📈 HRV <span class="metric-hint">higher is better</span>'));
-  if (r.on_mean != null && r.off_mean != null)
-    b.appendChild(el("div", "metric-avgs",
-      `Avg HRV <b>${avg1(r.on_mean)}</b> on nights · <b>${avg1(r.off_mean)}</b> off`));
+  b.appendChild(el("div", "metric-val " + cls, signed(eff)));
   b.appendChild(el("div", "metric-sub",
     `model 90% CI <span class="ci">[${signed(r.on_ci_low)}, ${signed(r.on_ci_high)}]</span> · ` +
     `<b>${pct(r.p_helps)}</b> chance of a real benefit${sizable}`));
-  const rec = iv ? recHero(iv, r) : null;
-  if (rec) b.appendChild(rec);
+  if (r.on_mean != null && r.off_mean != null)
+    b.appendChild(el("div", "metric-avgs",
+      `Avg HRV <b>${avg1(r.on_mean)}</b> on nights · <b>${avg1(r.off_mean)}</b> off`));
   b.appendChild(el("div", "metric-note", `Based on ${dataNote}`));
   return b;
-}
-
-// Second hero: the effect AT the recommended dose (or best option). The main
-// headline is the dose-AVERAGED "does it help at all" effect, where every
-// measured level counts equally — so when the level counts are lopsided it can
-// disagree with your actual experience. This line shows the modeled effect at
-// the level you'd actually keep using. Shown only once the recommendation crown
-// is earned (enoughForDoseRec: ≥8 on-nights across ≥2 tried levels).
-function recHero(iv, r) {
-  if (!enoughForDoseRec(r) || !(r.recommended_dose > 0)) return null;
-  const row = (r.doses || []).find((d) => sameLevel(d.dose, r.recommended_dose));
-  if (!row || row.mean_effect == null) return null;
-  // doseAmount() returns already-escaped HTML; optLabel() returns plain text
-  const label = isChoiceKind(iv)
-    ? (optLabel(iv, row.dose) != null ? esc(optLabel(iv, row.dose)) : null)
-    : doseAmount(iv, row.dose);
-  if (!label) return null;
-  const eff = rawDoseEff(row, r);
-  const cls = eff >= 0 ? "pos" : "neg";
-  const n = row.n_nights || 0;
-  const d = el("div", "metric-rec");
-  d.innerHTML =
-    `<span class="metric-rec-val ${cls}">${signed(eff)}</span> ` +
-    `at the recommended ${isChoiceKind(iv) ? "option" : "dose"}, <b>${label}</b> ` +
-    `model CI <span class="ci">[${signed(row.ci_low)}, ${signed(row.ci_high)}]</span> · ` +
-    `${n} night${n === 1 ? "" : "s"} at it${adjNote()}`;
-  return d;
 }
 
 // Big resting-HR hero number (left column). LRHR fit is on -LRHR, so flip back to
