@@ -1002,7 +1002,9 @@ const chartTip = el("div", "chart-tip");
 chartTip.hidden = true;
 document.body.appendChild(chartTip);
 document.addEventListener("mouseover", (e) => {
-  const g = e.target.closest && e.target.closest("[data-tip]");
+  // SVG mark groups only -- the form's ⓘ hints also carry data-tip but render
+  // their own CSS bubble (.tip::after), so matching them here would double up
+  const g = e.target.closest && e.target.closest("g[data-tip]");
   if (!g) { chartTip.hidden = true; return; }
   chartTip.textContent = g.getAttribute("data-tip");
   chartTip.hidden = false;
