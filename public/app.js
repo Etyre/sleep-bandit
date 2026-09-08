@@ -1021,8 +1021,10 @@ document.addEventListener("mousemove", (e) => {
 });
 
 // Dose axis tick + unit caption, in the native unit (mg/g/…), never pills.
+// The open-ended arm reads as "[max]+" (e.g. "30+"): beyond the max, unbounded.
 function doseTick(iv, dose) {
-  return isOpenDose(dose) ? "∞" : numLabel(dose);
+  if (isOpenDose(dose)) return iv.max_dose > 0 ? numLabel(iv.max_dose) + "+" : "∞";
+  return numLabel(dose);
 }
 function doseUnitCaption(iv) {
   return iv.unit || "";
@@ -1101,7 +1103,7 @@ function doseChart(iv, rows, r, showRec) {
   });
 
   let cap = doseUnitCaption(iv);
-  if (hasOpen) cap = (cap ? cap + " · " : "") + "∞ = " + openLabel(iv);
+  if (hasOpen) cap = (cap ? cap + " · " : "") + doseTick(iv, OPEN_ARM_DOSE) + " = " + openLabel(iv);
   if (cap) parts.push(`<text x="${(pL + pR) / 2}" y="${H - 2}" text-anchor="middle" font-size="9.5" style="fill:var(--muted)">${esc(cap)}</text>`);
 
   const svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img" ` +
