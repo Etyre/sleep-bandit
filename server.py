@@ -511,13 +511,19 @@ def _pair_nights(iv_a, iv_b, all_nights, metric, negate):
 # those rows are correlational -- a flag is a lead, not a causal verdict.
 # Option / button ids below are the stable ids in "Food and fasting":
 #   options: 1 = fast (no eating 4h), 2 = Huel/Soylent, 3 = banana (ate,
-#            not Huel), 4 = Huel only if hungry (behavior open -> button);
-#   buttons: 1 = "Huel/Soylent", 2 = "Fast".
+#            not Huel, not a meal-state signal), 4 = Huel only if hungry
+#            (behavior open -> button);
+#   buttons: 1 = "Huel/Soylent", 2 = "Fast", 3 = "Meal close to bedtime".
 BEHAVIOR_STATES = [
     {"key": "fasted", "name": "Fasting (actual)", "iv_name": "Food and fasting",
-     "yes_options": (1,), "no_options": (2, 3), "yes_input": "2", "no_input": "1"},
+     "yes_options": (1,), "no_options": (2, 3), "yes_inputs": ("2",), "no_inputs": ("1", "3")},
     {"key": "huel", "name": "Huel/Soylent before bed (actual)", "iv_name": "Food and fasting",
-     "yes_options": (2,), "no_options": (1, 3), "yes_input": "1", "no_input": "2"},
+     "yes_options": (2,), "no_options": (1, 3), "yes_inputs": ("1",), "no_inputs": ("2", "3")},
+    # A real meal near bedtime only ever comes from the recorded button; the
+    # protocol options themselves all preclude one (fast / Huel / banana), and
+    # banana deliberately stays out of the yes-side -- it's a snack, not a meal.
+    {"key": "meal", "name": "Meal close to bedtime (actual)", "iv_name": "Food and fasting",
+     "yes_options": (), "no_options": (1, 2), "yes_inputs": ("3",), "no_inputs": ("1", "2")},
 ]
 
 
@@ -531,9 +537,9 @@ def _behavior_state(night, iv_id, spec):
         return None
     val = a.get("input")
     if val is not None:                       # recorded button is ground truth
-        if str(val) == spec["yes_input"]:
+        if str(val) in spec["yes_inputs"]:
             return 1
-        if str(val) == spec["no_input"]:
+        if str(val) in spec["no_inputs"]:
             return 0
     opt = int(round(taken))
     if opt in spec["yes_options"]:
