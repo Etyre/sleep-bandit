@@ -1091,6 +1091,43 @@ def readouts(interventions, betas, cols, observed=None):
     return out
 
 
+def group_best(groups, negate=False):
+    """P(best) across OBSERVED groups of nights -- e.g. the behavior states in a
+    report card's observed section. groups: {key: [(w, y)]}, each night in exactly
+    one group. Fits one mean per group (flat prior, shared noise posterior -- the
+    same conjugate machinery as the randomized read-outs) and counts, over
+    posterior draws, how often each group's mean is the highest. negate=True for a
+    lower-is-better metric (resting HR). Returns {key: p_best} for groups with
+    nights; groups without nights are omitted. Purely descriptive: the groups are
+    not randomized, so this ranks averages, not causal effects."""
+    keys = [k for k, v in groups.items() if v]
+    if not keys:
+        return {}
+    if len(keys) == 1:
+        return {keys[0]: 1.0}
+    idx = {k: i for i, k in enumerate(keys)}
+    X, y, w = [], [], []
+    for k in keys:
+        for wv, yv in groups[k]:
+            row = [0.0] * len(keys)
+            row[idx[k]] = 1.0
+            X.append(row)
+            y.append(-float(yv) if negate else float(yv))
+            w.append(float(wv))
+    post = fit(X, y, len(keys), [INTERCEPT_PRIOR_VAR] * len(keys),
+               w=(w if any(x != 1.0 for x in w) else None))
+    state = random.getstate()
+    random.seed(READOUT_SEED)
+    try:
+        wins = [0] * len(keys)
+        for _ in range(READOUT_SAMPLES):
+            beta = sample_beta(post)[0]
+            wins[max(range(len(keys)), key=lambda i: beta[i])] += 1
+    finally:
+        random.setstate(state)
+    return {k: wins[idx[k]] / READOUT_SAMPLES for k in keys}
+
+
 def pair_interaction(nights):
     """Interaction read-out for one pair. nights: [{"y": metric (higher = better),
     "a": 0/1, "b": 0/1}] -- only nights where both A and B are determined.

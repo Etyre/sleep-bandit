@@ -806,15 +806,29 @@ function reportCard(iv) {
     head.appendChild(flag);
     card.appendChild(head);
     const t = el("table", "dose-table");
-    t.innerHTML = `<tr><th>Behavior</th><th>Avg HRV</th><th>Avg resting HR</th></tr>`;
+    t.innerHTML = `<tr><th>Behavior</th><th>Avg HRV</th><th>Avg resting HR</th><th>P(best)</th><th></th></tr>`;
+    t.querySelectorAll("th")[3].title = "Chance this behavior has the highest average HRV of the " +
+      "behaviors listed, given the night-to-night noise in your data. Ranks averages only — " +
+      "it inherits the correlational caveat above.";
     const nN = (n) => ` <span class="ci">(${n} night${n === 1 ? "" : "s"}${RECENCY_ON ? ", adj." : ""})</span>`;
-    for (const o of obs) {
+    // best-first, like the randomized table; behaviors with no HRV nights sink to the bottom
+    const rows = obs.slice().sort((a, b) => (b.hrv_p_best ?? -1) - (a.hrv_p_best ?? -1));
+    for (const o of rows) {
       const tr = el("tr");
       tr.appendChild(el("td", null, esc(o.name.replace(" (actual)", ""))));
       tr.appendChild(el("td", null, o.hrv_mean != null
         ? `<b>${avg1(o.hrv_mean)}</b>${nN(o.hrv_n)}` : '<span class="ci">—</span>'));
-      tr.appendChild(el("td", null, o.lrhr_mean != null
-        ? `<b>${avg1(o.lrhr_mean)}</b> bpm${nN(o.lrhr_n)}` : '<span class="ci">—</span>'));
+      const rhr = el("td", null, o.lrhr_mean != null
+        ? `<b>${avg1(o.lrhr_mean)}</b> bpm${nN(o.lrhr_n)}` : '<span class="ci">—</span>');
+      if (o.lrhr_p_best != null) rhr.title = `${pct(o.lrhr_p_best)} chance this is the lowest resting HR of the behaviors listed`;
+      tr.appendChild(rhr);
+      const barTd = el("td");
+      if (o.hrv_p_best != null) {
+        const bar = el("div", "bar"); const span = el("span"); span.style.width = Math.round(o.hrv_p_best * 100) + "%";
+        bar.appendChild(span); barTd.appendChild(bar);
+      }
+      tr.appendChild(barTd);
+      tr.appendChild(el("td", "pbest", o.hrv_p_best != null ? pct(o.hrv_p_best) : "—"));
       t.appendChild(tr);
     }
     card.appendChild(t);

@@ -580,24 +580,34 @@ def _observational_rows(iv, all_nights):
     if not specs:
         return None
     cat = iv.get("category")
-    out = []
-    for s in specs:
-        acc = {"hrv": [0.0, 0.0], "lrhr": [0.0, 0.0]}   # metric -> [sum w*val, sum w]
-        for n in all_nights:
-            if cat and n.get("excl_" + cat):
-                continue
+    # metric -> state key -> [(w, val)] : each night lands in at most one state
+    pts = {"hrv": {s["key"]: [] for s in specs}, "lrhr": {s["key"]: [] for s in specs}}
+    for n in all_nights:
+        if cat and n.get("excl_" + cat):
+            continue
+        for s in specs:
             if _behavior_state(n, iv["id"], s) != 1:
                 continue
             w = float(n.get("w", 1.0))
-            for m in acc:
+            for m in pts:
                 if n.get(m) is not None:
-                    acc[m][0] += w * float(n[m])
-                    acc[m][1] += w
-        out.append({"name": s["name"], "key": s["key"],
-                    "hrv_mean": (acc["hrv"][0] / acc["hrv"][1]) if acc["hrv"][1] else None,
-                    "hrv_n": _nn(acc["hrv"][1]),
-                    "lrhr_mean": (acc["lrhr"][0] / acc["lrhr"][1]) if acc["lrhr"][1] else None,
-                    "lrhr_n": _nn(acc["lrhr"][1])})
+                    pts[m][s["key"]].append((w, float(n[m])))
+    # P(best) among the states: chance this behavior has the highest average HRV
+    # (lowest resting HR), given the night-to-night noise. Ranks averages only --
+    # correlational, like the rest of the section.
+    p_hrv = bandit.group_best(pts["hrv"])
+    p_lrhr = bandit.group_best(pts["lrhr"], negate=True)
+    out = []
+    for s in specs:
+        row = {"name": s["name"], "key": s["key"]}
+        for m in ("hrv", "lrhr"):
+            v = pts[m][s["key"]]
+            sw = sum(w for w, _ in v)
+            row[m + "_mean"] = (sum(w * x for w, x in v) / sw) if sw else None
+            row[m + "_n"] = _nn(sw)
+        row["hrv_p_best"] = p_hrv.get(s["key"])
+        row["lrhr_p_best"] = p_lrhr.get(s["key"])
+        out.append(row)
     return out
 
 
