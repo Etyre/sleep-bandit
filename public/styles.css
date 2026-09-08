@@ -226,6 +226,8 @@ button:hover, .ghost:hover { border-color: var(--accent); }
   border: 1px solid rgba(154,162,192,.6); background: transparent; color: #b6bdd6;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* from the third button on, each gets its own line beneath the first pair */
+.cell .in-radio:nth-of-type(n+3) { display: block; margin-left: auto; margin-right: auto; }
 .cell .in-radio:hover { border-color: var(--accent); color: var(--text); }
 .cell .in-radio.on { border-color: var(--good); color: var(--accent-2); font-weight: 600; }
 .cell .in-qty {
