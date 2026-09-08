@@ -748,6 +748,11 @@ function reportCard(iv) {
       const doses = (r.doses || []).slice().sort((a, b) => b.p_best - a.p_best);
       const lrByOpt = new Map((iv.readout_lrhr?.doses || []).map((d) => [Number(d.dose).toFixed(6), d]));
       const best = optLabel(iv, r.recommended_dose);
+      // when the card also has an observed-behavior section below, label this
+      // one explicitly as the randomized comparison
+      if ((iv.observational || []).some((o) => o.hrv_n > 0 || o.lrhr_n > 0)) {
+        card.appendChild(el("p", "sec-head", "🎲 Randomized — by assigned option"));
+      }
       card.appendChild(el("p", "iv-meta",
         (best ? `📈 Best for HRV: <b>${esc(best)}</b> — each option's average across its nights. ` : "📈 ") +
         `Based on ${dataNote}`));
@@ -786,6 +791,33 @@ function reportCard(iv) {
       body.appendChild(right);
       card.appendChild(body);
     }
+  }
+
+  // Observed-behavior section: raw averages grouped by what ACTUALLY happened
+  // each night (recorded button first, behavior-pinning option otherwise) —
+  // assigned or chosen, so this section is correlational, not randomized.
+  const obs = (iv.observational || []);
+  if (obs.some((o) => o.hrv_n > 0 || o.lrhr_n > 0)) {
+    const head = el("p", "sec-head", "👁 Observed — by what actually happened");
+    const flag = el("span", "obs-flag", "correlational");
+    flag.title = "Nights are grouped by the behavior that actually occurred, whether it was " +
+      "assigned or your own choice — so differences here can reflect why you chose it (e.g. " +
+      "eating because it was a rough day), not just its effect. Treat gaps as leads, not verdicts.";
+    head.appendChild(flag);
+    card.appendChild(head);
+    const t = el("table", "dose-table");
+    t.innerHTML = `<tr><th>Behavior</th><th>Avg HRV</th><th>Avg resting HR</th></tr>`;
+    const nN = (n) => ` <span class="ci">(${n} night${n === 1 ? "" : "s"}${RECENCY_ON ? ", adj." : ""})</span>`;
+    for (const o of obs) {
+      const tr = el("tr");
+      tr.appendChild(el("td", null, esc(o.name.replace(" (actual)", ""))));
+      tr.appendChild(el("td", null, o.hrv_mean != null
+        ? `<b>${avg1(o.hrv_mean)}</b>${nN(o.hrv_n)}` : '<span class="ci">—</span>'));
+      tr.appendChild(el("td", null, o.lrhr_mean != null
+        ? `<b>${avg1(o.lrhr_mean)}</b> bpm${nN(o.lrhr_n)}` : '<span class="ci">—</span>'));
+      t.appendChild(tr);
+    }
+    card.appendChild(t);
   }
 
   if (!lrhrHandled) appendLrhr(card, iv);

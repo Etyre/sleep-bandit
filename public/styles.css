@@ -363,6 +363,12 @@ button:hover, .ghost:hover { border-color: var(--accent); }
   color: var(--text); box-shadow: 0 4px 14px rgba(0, 0, 0, .45);
 }
 
+/* report-card section headers (randomized vs observed split on choice cards) */
+.sec-head {
+  font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--muted); margin: 12px 0 2px;
+}
+
 /* interactions: the pair's second side is observed behavior, not a randomized arm */
 .obs-flag {
   display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 3px;

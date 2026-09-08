@@ -455,6 +455,7 @@ def reports_payload(conn):
             "readout_tst": _readout(iv, all_nights, "tst", negate=False),
             "readout_lat": _readout(iv, all_nights, "lat", negate=True),
             "readout_eff": _readout(iv, all_nights, "eff", negate=False),
+            "observational": _observational_rows(iv, all_nights),
             **_sched_info(iv, all_nights, lockin_off=recency_on),
         })
     return {"n_completed": n_hrv, "interventions": out,
@@ -566,6 +567,37 @@ def _pair_nights_state(iv_a, src_iv, spec, all_nights, metric, negate):
             continue
         out.append({"y": (-float(val) if negate else float(val)), "a": sa, "b": sb,
                     "w": float(n.get("w", 1.0))})
+    return out
+
+
+def _observational_rows(iv, all_nights):
+    """Raw per-behavior averages for the intervention's observational states
+    (BEHAVIOR_STATES): nights grouped by what ACTUALLY happened, whether it was
+    assigned or chosen. Purely descriptive and correlational -- shown in the
+    report card's observed section, never modeled. Respects the category
+    exclusion and recency weights. None if the intervention has no states."""
+    specs = [s for s in BEHAVIOR_STATES if s["iv_name"] == iv["name"]]
+    if not specs:
+        return None
+    cat = iv.get("category")
+    out = []
+    for s in specs:
+        acc = {"hrv": [0.0, 0.0], "lrhr": [0.0, 0.0]}   # metric -> [sum w*val, sum w]
+        for n in all_nights:
+            if cat and n.get("excl_" + cat):
+                continue
+            if _behavior_state(n, iv["id"], s) != 1:
+                continue
+            w = float(n.get("w", 1.0))
+            for m in acc:
+                if n.get(m) is not None:
+                    acc[m][0] += w * float(n[m])
+                    acc[m][1] += w
+        out.append({"name": s["name"], "key": s["key"],
+                    "hrv_mean": (acc["hrv"][0] / acc["hrv"][1]) if acc["hrv"][1] else None,
+                    "hrv_n": _nn(acc["hrv"][1]),
+                    "lrhr_mean": (acc["lrhr"][0] / acc["lrhr"][1]) if acc["lrhr"][1] else None,
+                    "lrhr_n": _nn(acc["lrhr"][1])})
     return out
 
 
