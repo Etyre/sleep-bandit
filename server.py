@@ -513,7 +513,8 @@ def _pair_nights(iv_a, iv_b, all_nights, metric, negate):
 #   options: 1 = fast (no eating 4h), 2 = Huel/Soylent, 3 = banana (ate,
 #            not Huel, not a meal-state signal), 4 = Huel only if hungry
 #            (behavior open -> button);
-#   buttons: 1 = "Huel/Soylent", 2 = "Fast", 3 = "Meal near bedtime".
+#   buttons: 1 = "Huel/Soylent", 2 = "Fast", 3 = "Full meal" (meaning: a full
+#            meal close to bedtime -- the button label is kept short for the cell).
 BEHAVIOR_STATES = [
     {"key": "fasted", "name": "Fasting (actual)", "iv_name": "Food and fasting",
      "yes_options": (1,), "no_options": (2, 3), "yes_inputs": ("2",), "no_inputs": ("1", "3")},
@@ -522,7 +523,7 @@ BEHAVIOR_STATES = [
     # A real meal near bedtime only ever comes from the recorded button; the
     # protocol options themselves all preclude one (fast / Huel / banana), and
     # banana deliberately stays out of the yes-side -- it's a snack, not a meal.
-    {"key": "meal", "name": "Meal near bedtime (actual)", "iv_name": "Food and fasting",
+    {"key": "meal", "name": "Full meal near bedtime (actual)", "iv_name": "Food and fasting",
      "yes_options": (), "no_options": (1, 2), "yes_inputs": ("3",), "no_inputs": ("1", "2")},
 ]
 
