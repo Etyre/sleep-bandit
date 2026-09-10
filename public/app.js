@@ -92,8 +92,17 @@ function pluralize(noun, n) {
 // how a dose amount is written: as a count ("3 pills") if the intervention names a
 // countable noun -- one noun = noun_amount of the unit (falls back to the unit dose) --
 // otherwise as the raw amount ("144 mg").
+// The open-ended arm is written as "[max]+" in the same terms as a normal dose
+// ("30+ minutes", "4+ pills"), never as an infinity symbol; the arm's label follows.
+function openDoseText(iv, native) {
+  const max = iv.max_dose || 0;
+  if (!(max > 0)) return "∞";
+  const u = iv.noun_amount || iv.unit_dose || 0, noun = (iv.dose_noun || "").trim();
+  if (!native && u > 0 && noun) return `${numLabel(max / u)}+ ${pluralize(noun, 2)}`;
+  return iv.unit ? `${numLabel(max)}+ ${iv.unit}` : `${numLabel(max)}+`;
+}
 function doseTextPlain(iv, amount) {
-  if (isOpenDose(amount)) return `∞ ${openLabel(iv)}`;
+  if (isOpenDose(amount)) return `${openDoseText(iv, false)} · ${openLabel(iv)}`;
   const u = iv.noun_amount || iv.unit_dose || 0, noun = (iv.dose_noun || "").trim();
   if (u > 0 && noun) {
     const count = amount / u;
@@ -106,7 +115,7 @@ const doseText = (iv, amount) => esc(doseTextPlain(iv, amount));
 // Reports page shows doses in the supplement's native unit (mg/g/mcg/minutes),
 // never as a pill count -- the Tracker keeps pills, but results read in mass.
 function doseAmount(iv, amount) {
-  if (isOpenDose(amount)) return `∞ ${esc(openLabel(iv))}`;
+  if (isOpenDose(amount)) return `${esc(openDoseText(iv, true))} · ${esc(openLabel(iv))}`;
   return iv.unit ? `${numLabel(amount)} ${esc(iv.unit)}` : "on";
 }
 
@@ -1069,7 +1078,7 @@ document.addEventListener("mousemove", (e) => {
 // Dose axis tick + unit caption, in the native unit (mg/g/…), never pills.
 // The open-ended arm reads as "[max]+" (e.g. "30+"): beyond the max, unbounded.
 function doseTick(iv, dose) {
-  if (isOpenDose(dose)) return iv.max_dose > 0 ? numLabel(iv.max_dose) + "+" : "∞";
+  if (isOpenDose(dose)) return iv.max_dose > 0 ? numLabel(iv.max_dose) + "+" : "∞";   // unit is in the caption
   return numLabel(dose);
 }
 function doseUnitCaption(iv) {
