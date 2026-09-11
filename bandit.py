@@ -124,6 +124,27 @@ TIME_MAX_JUMP = 4
 FAST_KERNEL_STEPS = 1.0
 FAST_PRIOR_WEIGHT = 0.25
 
+# COARSE-FIRST on big grids (a tree search over the dose range). A grid with MORE
+# than COARSE_MIN_RUNGS rungs is too big to map rung by rung, so exploration goes in
+# two levels. Level 1 is the COARSE set: every rung that is a multiple of
+# COARSE_EVERY unit doses (5, 10, 15, 20 ... when the unit dose is 1), plus the min,
+# the max, the standard dose and the open-ended arm if there is one. While a region
+# is unsurveyed its fine rungs are DEPRIORITIZED, not locked: on COARSE_SHARE of
+# probe nights only "open" rungs are eligible, the rest of the time the whole grid
+# is. A FINE rung between two coarse rungs opens once both of them have been
+# measured and at least one has MIN_PROBES readings -- i.e. the region has evidence
+# at both ends and one end is a rung the search is investing in, which Thompson
+# sampling only does for promising rungs. So refinement concentrates inside the
+# most effective regions while bad regions mostly stay coarse. Already-measured
+# rungs are always open (their data stays exploitable). The fast sweep's kernel
+# interpolates the coarse readings (its bandwidth widens to half the typical gap
+# between measured rungs), so a fine rung between two good coarse rungs draws high
+# and one next to a bad coarse rung draws low. Only the SWEEPS do this (the fast
+# sweep and the choice+dose sweep); the one-rung slow climb is untouched.
+COARSE_MIN_RUNGS = 10
+COARSE_EVERY = 5
+COARSE_SHARE = 0.8
+
 # Early lock-in guard for the on/off decision. Thompson sampling schedules an
 # intervention ON with probability P(it helps); a few noisy early nights can push
 # that near 1 (or near 0) and the intervention then gets (almost) always the same
@@ -704,6 +725,41 @@ def _fast_grid(std, step, lo, hi, open_pos=None):
     return sorted(rungs)
 
 
+def _coarse_rungs(grid, step, std, open_pos=None):
+    """The coarse subset of a dose grid (see COARSE_MIN_RUNGS): multiples of
+    COARSE_EVERY unit doses, plus the grid's min and max, the standard dose and the
+    open-arm rung. None if the grid is small enough to explore rung by rung."""
+    real = [r for r in grid if r != open_pos]
+    if len(real) <= COARSE_MIN_RUNGS or step <= 0:
+        return None
+    span = COARSE_EVERY * step
+    coarse = {r for r in real if abs(r / span - round(r / span)) < 1e-6}
+    if len(coarse) < 2:               # the grid misses those multiples: every 5th rung from the standard
+        coarse = {r for r in real if abs((r - std) / span - round((r - std) / span)) < 1e-6}
+    coarse.update((real[0], real[-1]))
+    if std in real:
+        coarse.add(std)
+    if open_pos is not None:
+        coarse.add(open_pos)
+    return coarse
+
+
+def _rung_open(r, coarse, counts):
+    """Is this rung open for probing? Coarse and already-measured rungs always; a fine
+    rung once the coarse rungs bracketing it are both measured and one is firm."""
+    if r in coarse or counts.get(r, 0) > 0:
+        return True
+    below = max((c for c in coarse if c < r), default=None)
+    above = min((c for c in coarse if c > r), default=None)
+    n = [counts.get(c, 0) for c in (below, above) if c is not None]
+    return len(n) == 2 and min(n) >= 1 and max(n) >= MIN_PROBES
+
+
+def _coarse_night(coarse):
+    """Tonight's probe is restricted to open rungs (COARSE_SHARE of the time)."""
+    return coarse is not None and random.random() < COARSE_SHARE
+
+
 def _fast_pick(grid, beta, entry, counts, real, step, noise_sd, center=None):
     """The fast sweep's choice: one Thompson draw over the grid. Each rung's value is
         smoothed sampled effect + N(0, dev_sd / sqrt(1 + n_eff)),
@@ -715,6 +771,12 @@ def _fast_pick(grid, beta, entry, counts, real, step, noise_sd, center=None):
     rung with the highest draw. counts/real: position -> readings / the level to
     evaluate the model at (the open-arm rung's sentinel, or an encoded option+dose)."""
     h = FAST_KERNEL_STEPS * step
+    # with sparse (coarse) data the kernel widens to half the typical gap between
+    # measured rungs, so untried rungs in between interpolate their neighbours
+    ps = sorted(p for p in counts if counts[p] > 0)
+    gaps = sorted(b - a for a, b in zip(ps, ps[1:]))
+    if gaps:
+        h = max(h, 0.5 * gaps[len(gaps) // 2])
     # what a rung with no nearby data shrinks toward: the sampled plain "on" effect,
     # or a caller-supplied centre (e.g. an option's own sampled effect)
     alpha = beta[entry["on"]] if center is None else center
@@ -761,6 +823,9 @@ def _plan_combo(iv, beta, entry, measured, noise_sd):
             counts[xd] = counts.get(xd, 0) + 1
             real[xd] = _d(x)
         g = sorted(set(grid) | set(counts))     # measured doses stay exploitable
+        coarse = _coarse_rungs(g, step, std)
+        if _coarse_night(coarse):
+            g = [r for r in g if _rung_open(r, coarse, counts)]
         # this option's own sampled effect (its candidate levels carry its prior and
         # any of its data) is what its untried rungs shrink toward -- so a favoured
         # option stays favoured until its nights say otherwise
@@ -845,9 +910,13 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
          MIN_VIABLE_FRAC of the best measured effect) or, PROBE_SHARE of the time, probes
          to map the curve -- supplements one unit dose at a time, time-based in bigger
          jumps -- so the search can reach an optimum far from the standard.
-         FAST SWEEP: with delay_explore off AND both min and max bounds set, probing
-         instead draws from the whole bounded grid, near-uniformly, favouring the
-         least-measured rungs (FAST_PROBE_SHARE of on-nights) -- see the constant.
+         FAST SWEEP: with delay_explore off AND both min and max bounds set, every
+         on-night is instead a Thompson draw over the whole bounded grid -- see the
+         FAST_* constants. On a big grid (more than COARSE_MIN_RUNGS rungs) the
+         sweep goes COARSE-FIRST: multiples of COARSE_EVERY unit doses (plus min,
+         max, standard) are mostly probed before the fine rungs between them,
+         which open region by region as the coarse rungs firm up. The slow climb
+         is untouched.
 
     Multiple-choice interventions skip stage 1 -- "off" is NOT an option and we take
     the best option even if all look weakly negative.
@@ -972,6 +1041,9 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
             # smoothed across neighbouring rungs, with an optimism bonus where data is
             # thin -- see FAST_* above.
             grid = _fast_grid(std, step, lo, hi, open_pos)
+            coarse = _coarse_rungs(grid, step, std, open_pos)
+            if _coarse_night(coarse):                    # big grid: coarse-first tree search
+                grid = [r for r in grid if _rung_open(r, coarse, counts)]
             dose = _fast_pick(grid, beta, entry, counts, real, step, math.sqrt(sigma2))[0] if grid else std
             dose = unpos(dose) if dose and dose > 0 else 0.0
             plan[iv["id"]] = dose if dose and dose > 0 else 0.0
