@@ -142,36 +142,13 @@ function cellLabel(iv, assigned) {
   return null;
 }
 
-// plain-text label for a planned cell (confirm dialogs)
-function planLabelPlain(iv, dose) {
-  if (!(dose > 0)) return "skip";
-  if (isChoiceKind(iv)) return optLabel(iv, dose) || "(removed option)";
-  if (iv.kind === "boolean") return "yes";
-  return doseTextPlain(iv, dose);
-}
-
-// Maximize-benefit toggle for tonight. ON: preview the all-exploit plan, confirm,
-// then override tonight's unticked cells (their randomized plan is parked server-
-// side). OFF: put the parked randomized plan back exactly -- nothing is re-rolled.
+// Maximize-benefit toggle for tonight. ON overrides tonight's unticked cells
+// with the all-exploit plan (their randomized plan is parked server-side); OFF
+// puts the parked randomized plan back exactly -- nothing is re-rolled.
 async function toggleMaximize() {
   const tonight = STATE.nights.find((n) => n.is_today);
   if (!tonight) return;
-  if (tonight.maximize) {
-    if (!confirm("Switch tonight back to its randomized plan?\n\nEvery cell goes back to exactly what was randomized before — nothing is re-rolled. Cells already ticked stay as done.")) return;
-    const res = await post("/api/maximize", { mode: "off" });
-    STATE = res.state; renderGrid();
-    return;
-  }
-  const prev = await post("/api/maximize", { mode: "preview" });
-  const byId = new Map(STATE.interventions.map((iv) => [iv.id, iv]));
-  const lines = prev.plan.map((p) => {
-    const iv = byId.get(p.id); if (!iv) return null;
-    const now = planLabelPlain(iv, p.current), best = planLabelPlain(iv, p.dose);
-    const note = p.ticked ? "  (already done — kept)" : (now !== best ? `  (randomized plan: ${now})` : "");
-    return `• ${iv.name}: ${best}${note}`;
-  }).filter(Boolean);
-  if (!confirm("Maximize benefit tonight?\n\nNo exploration: every intervention found to help, at its best-measured dose or option; the rest skipped. You can switch back to the exact randomized plan any time.\n\n" + lines.join("\n"))) return;
-  const res = await post("/api/maximize", { mode: "on" });
+  const res = await post("/api/maximize", { mode: tonight.maximize ? "off" : "on" });
   STATE = res.state; renderGrid();
 }
 
@@ -214,9 +191,9 @@ function renderGrid() {
       maxCtl = `<button type="button" class="max-btn${n.maximize ? " on" : ""}" title="${n.maximize
         ? "Tonight is planned for maximum benefit. Click to go back to the exact randomized plan."
         : "Maximize benefit tonight: no exploration — every intervention found to help, at its best-measured dose or option. Reversible."}">` +
-        `⭐ ${n.maximize ? "Maximized" : "Maximize"}</button>`;
+        `⭐ ${n.maximize ? "Maximizing benefit" : "Maximize benefit"}</button>`;
     } else if (n.is_today && n.maximize) {
-      maxCtl = `<span class="max-btn on static">⭐ Maximized</span>`;
+      maxCtl = `<span class="max-btn on static">⭐ Maximizing benefit</span>`;
     }
     head += `<th class="night${n.is_today ? " today" : ""}">` +
       `${n.is_today ? "Tonight" : weekday(n.date)}<span class="ndate">${shortDate(n.date)}</span>${maxCtl}</th>`;
