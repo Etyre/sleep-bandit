@@ -455,3 +455,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
   .topbar { justify-content: center; }
   .row { flex-direction: column; }
 }
+
+/* maximize-benefit toggle in the Tonight header */
+.max-btn { display: block; margin: 4px auto 0; font: inherit; font-size: 10px; padding: 1px 7px; border-radius: 10px;
+  border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; opacity: .85; white-space: nowrap; }
+.max-btn:hover { opacity: 1; color: var(--text); border-color: var(--muted); }
+.max-btn.on { color: var(--accent-2); border-color: var(--accent-2); opacity: 1; }
+.max-btn.static { cursor: default; pointer-events: none; }

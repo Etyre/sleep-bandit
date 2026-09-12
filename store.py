@@ -200,7 +200,14 @@ def connect():
         # two lower). lrhr stays on the 5-minute basis so the series is consistent;
         # the 30-second reading is kept alongside for the record/export.
         conn.execute("ALTER TABLE nights ADD COLUMN lrhr_30s REAL")
+    if "maximize" not in ncols:
+        # 1 = this night's randomized plan was replaced by the maximize-benefit plan
+        conn.execute("ALTER TABLE nights ADD COLUMN maximize INTEGER NOT NULL DEFAULT 0")
     acols = {r["name"] for r in conn.execute("PRAGMA table_info(assignments)")}
+    if "random_dose" not in acols:
+        # the randomized plan a maximize-benefit override replaced (NULL otherwise),
+        # so switching the override off restores it exactly -- no re-roll
+        conn.execute("ALTER TABLE assignments ADD COLUMN random_dose REAL")
     if "excluded" not in acols:
         # per-cell exclusion: this ONE (night, intervention) pair stops counting as on
         # OR off -- for the rare night the intervention was assigned OFF but was done
@@ -621,6 +628,49 @@ def force_assignment(conn, d, iid, assigned_dose, taken_dose=None):
     conn.commit()
 
 
+def set_night_maximize(conn, d, on):
+    """Flag / unflag a night as planned for maximum benefit (server.maximize_tonight)."""
+    conn.execute("UPDATE nights SET maximize=? WHERE date=?", (1 if on else 0, d))
+    _audit(conn, "maximize", d, enabled=bool(on))
+    conn.commit()
+
+
+def override_assignment(conn, d, iid, dose):
+    """Maximize-benefit override of ONE unticked cell: the randomized plan is parked
+    in random_dose (kept if already parked) and assigned_dose becomes `dose`. The
+    sanctioned exception to the assignment freeze -- reversible via
+    restore_assignment, audit-logged, and never touching a cell already ticked.
+    Returns True if the cell changed."""
+    row = conn.execute("SELECT assigned_dose, taken_dose, random_dose FROM assignments "
+                       "WHERE night_date=? AND intervention_id=?", (d, iid)).fetchone()
+    if not row or row["taken_dose"] is not None:
+        return False
+    if row["random_dose"] is None and float(dose) == row["assigned_dose"]:
+        return False                                   # already the plan; nothing to park
+    parked = row["random_dose"] if row["random_dose"] is not None else row["assigned_dose"]
+    conn.execute("UPDATE assignments SET random_dose=?, assigned_dose=? "
+                 "WHERE night_date=? AND intervention_id=?", (parked, float(dose), d, iid))
+    _audit(conn, "maximize_assign", d, iid, before=row["assigned_dose"], after=float(dose),
+           random_dose=parked)
+    conn.commit()
+    return True
+
+
+def restore_assignment(conn, d, iid):
+    """Undo a maximize-benefit override: put the parked randomized plan back as the
+    cell's assignment, exactly as it was. Ticked cells stay as done. Returns True if
+    the cell changed."""
+    row = conn.execute("SELECT assigned_dose, taken_dose, random_dose FROM assignments "
+                       "WHERE night_date=? AND intervention_id=?", (d, iid)).fetchone()
+    if not row or row["random_dose"] is None or row["taken_dose"] is not None:
+        return False
+    conn.execute("UPDATE assignments SET assigned_dose=random_dose, random_dose=NULL "
+                 "WHERE night_date=? AND intervention_id=?", (d, iid))
+    _audit(conn, "maximize_restore", d, iid, before=row["assigned_dose"], after=row["random_dose"])
+    conn.commit()
+    return True
+
+
 def delete_assignment(conn, d, iid):
     """Remove ONE intervention's cell from a night entirely -- as if it was never part of
     the experiment that night, so the night stops counting as on OR off for it. A
@@ -871,7 +921,7 @@ def analysis_nights(conn):
 def recent_nights(conn, limit=30):
     rows = conn.execute(
         "SELECT date, hrv, lrhr, lrhr_30s, tst, lat, eff, hrv_src, lrhr_src, tst_src, lat_src, eff_src, status, note, "
-        "excl_behavioral, excl_supplement, excl_environmental FROM nights ORDER BY date DESC LIMIT ?",
+        "excl_behavioral, excl_supplement, excl_environmental, maximize FROM nights ORDER BY date DESC LIMIT ?",
         (limit,)).fetchall()
     out = []
     for r in rows:

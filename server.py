@@ -197,6 +197,42 @@ def ensure_tonight(conn):
     return store.get_night(conn, d)
 
 
+def maximize_tonight(conn, mode):
+    """MAXIMIZE BENEFIT for tonight: no exploration, no randomization -- every active
+    intervention found to help (posterior-mean effect > 0, prior-free like the
+    Reports page) at its best-measured dose or option, everything else skipped.
+    mode: "preview" returns the plan; "on" overrides tonight's unticked cells with
+    it (each cell's randomized plan is parked in random_dose) and flags the night;
+    "off" puts the parked randomized plan back exactly -- never a re-roll -- and
+    clears the flag. Cells already ticked as done are left alone either way. This
+    is the one sanctioned, audit-logged exception to the assignment freeze."""
+    ensure_tonight(conn)
+    d = today_str()
+    night = store.get_night(conn, d)
+    cur = {a["intervention_id"]: a for a in night["assignments"]}
+    if mode == "off":
+        for iid in cur:
+            store.restore_assignment(conn, d, iid)
+        store.set_night_maximize(conn, d, False)
+        return {"date": d, "plan": []}
+    all_nights = analysis_nights_weighted(conn)
+    rows = []
+    for iv in store.list_interventions(conn, active_only=True):
+        nights, _, _ = intervention_nights(iv["id"], all_nights, "hrv", category=iv.get("category"))
+        seen = [n["taken"][iv["id"]] for n in nights if n["taken"].get(iv["id"], 0) > 0]
+        model = bandit.fit_model([iv], nights)
+        ex = bandit.plan_exploit(model["post"], model["cols"], [iv], measured={iv["id"]: seen})[iv["id"]]
+        a = cur.get(iv["id"]) or {}
+        rows.append({"id": iv["id"], "name": iv["name"], "kind": iv["kind"],
+                     "dose": ex["dose"], "effect": ex["effect"], "on_effect": ex["on_effect"],
+                     "current": a.get("assigned_dose"), "ticked": a.get("taken_dose") is not None})
+        if mode == "on":
+            store.override_assignment(conn, d, iv["id"], ex["dose"])
+    if mode == "on":
+        store.set_night_maximize(conn, d, True)
+    return {"date": d, "plan": rows}
+
+
 def reconcile_tonight_bounds(conn, iid, before=None):
     """After an intervention's dose settings change, bring TONIGHT's cell for it in
     line with the new settings -- but only if the cell is still pending: assigned ON,
@@ -275,6 +311,7 @@ def state_payload(conn):
             "excl_behavioral": bool(n["excl_behavioral"]),
             "excl_supplement": bool(n["excl_supplement"]),
             "excl_environmental": bool(n["excl_environmental"]),
+            "maximize": bool(n["maximize"]),
             "is_today": n["date"] == d_today,
         })
         cmap = {}
@@ -906,6 +943,15 @@ class Handler(BaseHTTPRequestHandler):
                 store.set_taken(conn, body["date"], iid, bool(body.get("done")),
                                 input_value=val)
                 return self._send_json(state_payload(conn))
+
+            if path == "/api/maximize":
+                mode = body.get("mode", "preview")
+                if mode not in ("preview", "on", "off"):
+                    return self._send_json({"error": "bad mode"}, 400)
+                res = maximize_tonight(conn, mode)
+                if mode != "preview":
+                    res["state"] = state_payload(conn)
+                return self._send_json(res)
 
             if path == "/api/metric":
                 store.set_metric(conn, body["date"], body.get("metric", "hrv"),

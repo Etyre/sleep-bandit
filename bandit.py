@@ -1064,6 +1064,52 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
     return plan
 
 
+def plan_exploit(post, cols, interventions, measured=None):
+    """MAXIMIZE-BENEFIT plan: all exploit, no explore, from the posterior MEAN (the
+    shrinkage estimate) rather than a Thompson draw. Per intervention:
+      - on iff the mean "does it help" effect alpha > 0 (a choice that doesn't test
+        skipping is always on; a boolean is a plain yes);
+      - the dose / option / option+dose with the highest mean effect alpha+delta,
+        among the levels actually MEASURED so far (a never-tried level hasn't been
+        found to do anything) -- the standard dose, or the best-by-prior option,
+        when nothing has been measured yet.
+    Returns {iv_id: {"dose": level, "effect": mean effect at it, "on_effect": alpha}}
+    with dose 0 for "skip"."""
+    mN = post["mN"]
+    measured = measured or {}
+    out = {}
+    for iv in interventions:
+        entry = cols.get(iv["id"])
+        if not entry:
+            out[iv["id"]] = {"dose": 0.0, "effect": 0.0, "on_effect": 0.0}
+            continue
+        alpha = mN[entry["on"]]
+        kind = iv.get("kind")
+        seen = sorted({_d(x) for x in measured.get(iv["id"], ()) if x and float(x) > 0
+                       if not (is_open(x) and not has_open_arm(iv))})
+        skip_ok = kind in ("dose", "boolean") or iv.get("test_skip")
+        if skip_ok and alpha <= 0:
+            out[iv["id"]] = {"dose": 0.0, "effect": alpha, "on_effect": alpha}
+            continue
+        if kind == "boolean":
+            out[iv["id"]] = {"dose": 1.0, "effect": alpha, "on_effect": alpha}
+            continue
+        if seen:
+            levels = seen
+        elif kind == "choice_dose":
+            std = _d(iv.get("default_dose") or 0)
+            levels = [combo_encode(o["id"], std) for o in iv.get("options") or []]
+        elif kind == "choice":
+            levels = [_d(x) for x in iv.get("dose_levels") or [] if x and float(x) > 0]
+        else:
+            levels = [_d(iv.get("default_dose") or 0)]
+        dose, val = _best_dose(mN, entry, levels)
+        if dose is None:
+            dose, val = 0.0, alpha
+        out[iv["id"]] = {"dose": dose, "effect": val, "on_effect": alpha}
+    return out
+
+
 def _percentile(sorted_vals, q):
     if not sorted_vals:
         return 0.0
