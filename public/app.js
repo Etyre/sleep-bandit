@@ -192,8 +192,9 @@ function renderGrid() {
         ? "Tonight is planned for maximum benefit. Click to go back to the exact randomized plan."
         : "Maximize benefit tonight: no exploration — every intervention found to help, at its best-measured dose or option. Reversible."}">` +
         `⭐ ${n.maximize ? "Maximizing benefit" : "Maximize benefit"}</button>`;
-    } else if (n.is_today && n.maximize) {
-      maxCtl = `<span class="max-btn on static">⭐ Maximizing benefit</span>`;
+    } else if (n.maximize) {
+      // a past (or read-only) maximize night keeps its label for good
+      maxCtl = `<span class="max-btn on static" title="This night was planned for maximum benefit, not randomized.">⭐ Maximize benefit</span>`;
     }
     head += `<th class="night${n.is_today ? " today" : ""}">` +
       `${n.is_today ? "Tonight" : weekday(n.date)}<span class="ndate">${shortDate(n.date)}</span>${maxCtl}</th>`;
