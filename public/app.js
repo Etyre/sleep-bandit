@@ -189,12 +189,12 @@ function renderGrid() {
     let maxCtl = "";
     if (n.is_today && !READ_ONLY) {
       maxCtl = `<button type="button" class="max-btn${n.maximize ? " on" : ""}" title="${n.maximize
-        ? "Tonight is planned for maximum benefit. Click to go back to the exact randomized plan."
-        : "Maximize benefit tonight: no exploration — every intervention found to help, at its best-measured dose or option. Reversible."}">` +
+        ? "Tonight is planned for maximum benefit. Not randomized, so this night's data won't count toward results. Click to go back to the exact randomized plan."
+        : "Maximize benefit tonight: no exploration — every intervention found to help, at its best-measured dose or option. Not randomized, so the night won't count toward results. Reversible."}">` +
         `⭐ ${n.maximize ? "Maximizing benefit" : "Maximize benefit"}</button>`;
     } else if (n.maximize) {
       // a past (or read-only) maximize night keeps its label for good
-      maxCtl = `<span class="max-btn on static" title="This night was planned for maximum benefit, not randomized.">⭐ Maximize benefit</span>`;
+      maxCtl = `<span class="max-btn on static" title="This night was planned for maximum benefit, not randomized — its data doesn't count toward results.">⭐ Maximize benefit</span>`;
     }
     head += `<th class="night${n.is_today ? " today" : ""}">` +
       `${n.is_today ? "Tonight" : weekday(n.date)}<span class="ndate">${shortDate(n.date)}</span>${maxCtl}</th>`;
@@ -241,7 +241,10 @@ function renderGrid() {
       for (const n of nights) {
         const c = (cells[n.date] || {})[iv.id];
         const todayCls = n.is_today ? " col-today" : "";
-        const exCls = n[exKey] ? " excluded" : "";   // dim: this night doesn't count here
+        // dim: this night doesn't count here -- category-excluded, or a past
+        // maximize-benefit night (not randomized, so never analysis data). Tonight
+        // stays undimmed while maximizing so its plan is still readable.
+        const exCls = (n[exKey] || (n.maximize && !n.is_today)) ? " excluded" : "";
         if (!c) { body += `<td class="cell na${todayCls}${exCls}"></td>`; continue; }
         const label = cellLabel(iv, c.assigned_dose);
         const ro = READ_ONLY ? " ro" : "";

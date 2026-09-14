@@ -205,7 +205,9 @@ def maximize_tonight(conn, mode):
     it (each cell's randomized plan is parked in random_dose) and flags the night;
     "off" puts the parked randomized plan back exactly -- never a re-roll -- and
     clears the flag. Cells already ticked as done are left alone either way. This
-    is the one sanctioned, audit-logged exception to the assignment freeze."""
+    is the one sanctioned, audit-logged exception to the assignment freeze.
+    A maximize night is not randomized, so store.analysis_nights drops it from every
+    effect estimate (the plan below is fit on randomized nights only)."""
     ensure_tonight(conn)
     d = today_str()
     night = store.get_night(conn, d)
