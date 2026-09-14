@@ -84,6 +84,20 @@ def recency_enabled(conn):
     return store.get_setting(conn, "recency_weighting") == "1"
 
 
+def count_maximize_nights(conn):
+    """Whether maximize-benefit nights (not randomized) feed the effect estimates.
+    Default OFF (they are not evidence); the header switch (POST /api/count_maximize)
+    turns counting on."""
+    return store.get_setting(conn, "count_maximize_nights") == "1"
+
+
+def analysis_modes(conn):
+    """The server-wide analysis switches, as every payload reports them."""
+    return {"recency": {"enabled": recency_enabled(conn),
+                        "half_life_days": RECENCY_HALF_LIFE_DAYS},
+            "count_maximize": count_maximize_nights(conn)}
+
+
 def apply_recency(nights):
     """Attach a recency weight to every analysis night. Age is measured from the
     most recent night with any recorded metric (not the wall clock), so a logging
@@ -99,7 +113,7 @@ def apply_recency(nights):
 
 def analysis_nights_weighted(conn):
     """store.analysis_nights, with recency weights attached when the mode is on."""
-    nights = store.analysis_nights(conn)
+    nights = store.analysis_nights(conn, count_maximize=count_maximize_nights(conn))
     return apply_recency(nights) if recency_enabled(conn) else nights
 
 
@@ -206,8 +220,8 @@ def maximize_tonight(conn, mode):
     "off" puts the parked randomized plan back exactly -- never a re-roll -- and
     clears the flag. Cells already ticked as done are left alone either way. This
     is the one sanctioned, audit-logged exception to the assignment freeze.
-    A maximize night is not randomized, so store.analysis_nights drops it from every
-    effect estimate (the plan below is fit on randomized nights only)."""
+    A maximize night is not randomized; whether it feeds the effect estimates (and
+    so this plan) is the count_maximize_nights setting."""
     ensure_tonight(conn)
     d = today_str()
     night = store.get_night(conn, d)
@@ -329,8 +343,7 @@ def state_payload(conn):
         cells[n["date"]] = cmap
 
     return {"today": d_today, "interventions": ivs, "nights": nights, "cells": cells,
-            "recency": {"enabled": recency_enabled(conn),
-                        "half_life_days": RECENCY_HALF_LIFE_DAYS}}
+            **analysis_modes(conn)}
 
 
 def _readout(iv, all_nights, metric, negate):
@@ -499,8 +512,7 @@ def reports_payload(conn):
         })
     return {"n_completed": n_hrv, "interventions": out,
             "hrv_trend": hrv_trend_payload(conn),
-            "recency": {"enabled": recency_enabled(conn),
-                        "half_life_days": RECENCY_HALF_LIFE_DAYS}}
+            **analysis_modes(conn)}
 
 
 # ---------------------------------------------------------------------------
@@ -690,8 +702,7 @@ def interactions_payload(conn):
                           "observational": True, "hrv": r_hrv, "lrhr": r_lrhr})
     return {"n_completed": n_hrv, "n_interventions": len(ivs), "pairs": pairs,
             "n_pairs_no_overlap": no_overlap,
-            "recency": {"enabled": recency_enabled(conn),
-                        "half_life_days": RECENCY_HALF_LIFE_DAYS}}
+            **analysis_modes(conn)}
 
 
 # ---------------------------------------------------------------------------
@@ -981,6 +992,15 @@ class Handler(BaseHTTPRequestHandler):
                 on = bool(body.get("enabled"))
                 store.set_setting(conn, "recency_weighting", "1" if on else None)
                 store._audit(conn, "set_recency", enabled=on)
+                conn.commit()
+                return self._send_json(reports_payload(conn))
+
+            if path == "/api/count_maximize":
+                # server-wide: do maximize-benefit (non-randomized) nights count as
+                # evidence? Drives the Reports numbers AND the live bandit.
+                on = bool(body.get("enabled"))
+                store.set_setting(conn, "count_maximize_nights", "1" if on else None)
+                store._audit(conn, "set_count_maximize", enabled=on)
                 conn.commit()
                 return self._send_json(reports_payload(conn))
 

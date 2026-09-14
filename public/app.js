@@ -164,7 +164,7 @@ function ivMeta(iv) {
 // =====================================================================
 async function loadGrid() {
   STATE = await api("/api/state");
-  renderRecencySlot(STATE.recency);
+  renderRecencySlot(STATE.recency, STATE.count_maximize);
   renderGrid();
 }
 
@@ -189,12 +189,12 @@ function renderGrid() {
     let maxCtl = "";
     if (n.is_today && !READ_ONLY) {
       maxCtl = `<button type="button" class="max-btn${n.maximize ? " on" : ""}" title="${n.maximize
-        ? "Tonight is planned for maximum benefit. Not randomized, so this night's data won't count toward results. Click to go back to the exact randomized plan."
-        : "Maximize benefit tonight: no exploration — every intervention found to help, at its best-measured dose or option. Not randomized, so the night won't count toward results. Reversible."}">` +
+        ? "Tonight is planned for maximum benefit (not randomized). Click to go back to the exact randomized plan."
+        : "Maximize benefit tonight: no exploration — every intervention found to help, at its best-measured dose or option. Not randomized. Reversible."}">` +
         `⭐ ${n.maximize ? "Maximizing benefit" : "Maximize benefit"}</button>`;
     } else if (n.maximize) {
       // a past (or read-only) maximize night keeps its label for good
-      maxCtl = `<span class="max-btn on static" title="This night was planned for maximum benefit, not randomized — its data doesn't count toward results.">⭐ Maximize benefit</span>`;
+      maxCtl = `<span class="max-btn on static" title="This night was planned for maximum benefit, not randomized${COUNT_MAX_ON ? "." : " — its data doesn't count toward results (see the header switch)."}">⭐ Maximize benefit</span>`;
     }
     head += `<th class="night${n.is_today ? " today" : ""}">` +
       `${n.is_today ? "Tonight" : weekday(n.date)}<span class="ndate">${shortDate(n.date)}</span>${maxCtl}</th>`;
@@ -242,9 +242,9 @@ function renderGrid() {
         const c = (cells[n.date] || {})[iv.id];
         const todayCls = n.is_today ? " col-today" : "";
         // dim: this night doesn't count here -- category-excluded, or a past
-        // maximize-benefit night (not randomized, so never analysis data). Tonight
-        // stays undimmed while maximizing so its plan is still readable.
-        const exCls = (n[exKey] || (n.maximize && !n.is_today)) ? " excluded" : "";
+        // maximize-benefit night while the "count maximize nights" switch is off.
+        // Tonight stays undimmed while maximizing so its plan is still readable.
+        const exCls = (n[exKey] || (n.maximize && !n.is_today && !COUNT_MAX_ON)) ? " excluded" : "";
         if (!c) { body += `<td class="cell na${todayCls}${exCls}"></td>`; continue; }
         const label = cellLabel(iv, c.assigned_dose);
         const ro = READ_ONLY ? " ro" : "";
@@ -521,6 +521,9 @@ function verdict(r) {
 // are effective (decayed) counts and are flagged as adjusted.
 let RECENCY_ON = false;
 let RECENCY_BUSY = false;   // a toggle request is in flight; ignore re-clicks until it lands
+// Whether maximize-benefit (non-randomized) nights count toward results (mirrors
+// the server-side setting; default off).
+let COUNT_MAX_ON = false;
 
 async function loadReports() {
   const box = $("#reports-body");
@@ -534,7 +537,7 @@ async function loadReports() {
 function renderReports(data) {
   const box = $("#reports-body");
   RECENCY_ON = !!(data.recency && data.recency.enabled);
-  renderRecencySlot(data.recency);
+  renderRecencySlot(data.recency, data.count_maximize);
   box.innerHTML = "";
   box.appendChild(el("p", "rep-stat", data.n_completed === 0
     ? "No nights logged yet — reports fill in as you enter your HRV on the Tracker."
@@ -561,8 +564,9 @@ function renderReports(data) {
 // Server-wide mode: when on, every night is weighted by 0.5^(age/half-life) in
 // BOTH the read-outs and the live bandit (Thompson planning, warm-up, lock-in
 // guard). Values become weighted means, sample sizes become effective counts.
-function renderRecencySlot(recency) {
+function renderRecencySlot(recency, countMax) {
   if (recency) RECENCY_ON = !!recency.enabled;
+  if (countMax !== undefined) COUNT_MAX_ON = !!countMax;
   const slot = $("#recency-slot");
   if (!slot) return;
   const hl = Math.round((recency && recency.half_life_days) || 30);
@@ -572,16 +576,45 @@ function renderRecencySlot(recency) {
     `weighted evidence. The early lock-in guard is off in this mode — decayed counts can't reach its ` +
     `night-count tiers, and fading evidence keeps the on/off contrast alive on its own. Ages count back ` +
     `from the most recent logged night.`;
+  const maxTip = `Maximize-benefit nights are planned from the data rather than randomized. ` +
+    `With this on, their results count toward the measured effects like any other night; ` +
+    `off, they are recorded and charted but never feed the effect estimates or the planner.`;
   if (READ_ONLY) {
-    slot.innerHTML = RECENCY_ON
-      ? `<span class="recency-badge" title="${esc(tip)}">⏳ recency weighting on · ${hl}-day half-life</span>` : "";
+    slot.innerHTML = (RECENCY_ON
+      ? `<span class="recency-badge" title="${esc(tip)}">⏳ recency weighting on · ${hl}-day half-life</span>` : "") +
+      (COUNT_MAX_ON ? "" : `<span class="recency-badge" title="${esc(maxTip)}">⭐ maximize nights not counted</span>`);
     return;
   }
   slot.innerHTML =
     `<label class="recency-label" title="${esc(tip)}">` +
     `<span>⏳ Weight recent nights more</span>` +
     `<span class="switch"><input type="checkbox" id="recency-toggle"${RECENCY_ON ? " checked" : ""}>` +
+    `<span class="knob"></span></span></label>` +
+    `<label class="recency-label" title="${esc(maxTip)}">` +
+    `<span>⭐ Count maximize nights</span>` +
+    `<span class="switch"><input type="checkbox" id="count-max-toggle"${COUNT_MAX_ON ? " checked" : ""}>` +
     `<span class="knob"></span></span></label>`;
+  $("#count-max-toggle").addEventListener("change", async (e) => {
+    if (RECENCY_BUSY) { e.target.checked = COUNT_MAX_ON; return; }
+    RECENCY_BUSY = true;
+    const enabled = e.target.checked;
+    e.target.disabled = true;
+    try {
+      const fresh = await post("/api/count_maximize", { enabled });   // returns the reports payload
+      renderRecencySlot(fresh.recency, fresh.count_maximize);
+      if (!$("#view-reports").hidden) {
+        if (!$("#reports-body").hidden) renderReports(fresh);
+        else loadInteractions();
+      } else if (STATE) {
+        renderGrid();   // past maximize nights dim / undim
+      }
+    } catch (err) {
+      alert("Could not switch maximize-night counting: " + err.message);
+      renderRecencySlot({ enabled: RECENCY_ON, half_life_days: hl }, COUNT_MAX_ON);
+    } finally {
+      RECENCY_BUSY = false;
+    }
+  });
   $("#recency-toggle").addEventListener("change", async (e) => {
     if (RECENCY_BUSY) { e.target.checked = RECENCY_ON; return; }   // a switch is already in flight
     RECENCY_BUSY = true;
@@ -589,7 +622,7 @@ function renderRecencySlot(recency) {
     e.target.disabled = true;
     try {
       const fresh = await post("/api/recency", { enabled });   // returns the reports payload
-      renderRecencySlot(fresh.recency);
+      renderRecencySlot(fresh.recency, fresh.count_maximize);
       // if a reports subview is open it shows adjusted numbers — refresh it
       if (!$("#view-reports").hidden) {
         if (!$("#reports-body").hidden) renderReports(fresh);
@@ -597,7 +630,7 @@ function renderRecencySlot(recency) {
       }
     } catch (err) {
       alert("Could not switch recency weighting: " + err.message);
-      renderRecencySlot({ enabled: RECENCY_ON, half_life_days: hl });
+      renderRecencySlot({ enabled: RECENCY_ON, half_life_days: hl }, COUNT_MAX_ON);
     } finally {
       RECENCY_BUSY = false;
     }
@@ -1515,7 +1548,7 @@ async function loadInteractions() {
 
   box.innerHTML = "";
   RECENCY_ON = !!(data.recency && data.recency.enabled);
-  renderRecencySlot(data.recency);
+  renderRecencySlot(data.recency, data.count_maximize);
   const nPairs = data.pairs.length;
   box.appendChild(el("p", "rep-stat",
     `Every pair of interventions that has shared a night, across <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}` +

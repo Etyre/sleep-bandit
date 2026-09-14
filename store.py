@@ -893,19 +893,20 @@ def first_assigned_night(conn):
     return row["d"] if row else None
 
 
-def analysis_nights(conn):
+def analysis_nights(conn, count_maximize=True):
     """Every recorded night with per-intervention (assigned, taken) so the engine
     can apply the compliance rule: on-assigned counts only if the box was checked;
     off-assigned always counts as a control.
 
-    Maximize-benefit nights (nights.maximize = 1) are LEFT OUT entirely: their plan
-    was chosen from the data rather than randomized, so they are not evidence for
-    any effect estimate (per the user, 2026-09-13). Their metrics are still recorded
-    and still show in the grid and charts -- they just never feed the model."""
+    count_maximize=False leaves maximize-benefit nights (nights.maximize = 1) out
+    entirely: their plan was chosen from the data rather than randomized, so they
+    are arguably not evidence. Server-wide setting `count_maximize_nights`
+    (server.count_maximize_nights); the default there is to leave them out. Either
+    way their metrics are recorded and still show in the grid and charts."""
     rows = conn.execute(
         "SELECT date, hrv, lrhr, tst, lat, eff, excl_behavioral, excl_supplement, excl_environmental FROM nights "
         "WHERE (hrv IS NOT NULL OR lrhr IS NOT NULL OR tst IS NOT NULL OR lat IS NOT NULL OR eff IS NOT NULL) "
-        "AND maximize = 0 "
+        + ("" if count_maximize else "AND maximize = 0 ") +
         "ORDER BY date").fetchall()
     out = []
     for r in rows:
