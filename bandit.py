@@ -230,12 +230,18 @@ def combo_decode(level):
     return opt, _d(level - opt * COMBO_BASE)
 
 
+def live_options(iv):
+    """The intervention's options still on offer: retired (removed) options stay in
+    iv['options'] so their past nights keep their label, but are never planned."""
+    return [o for o in (iv.get("options") or []) if not o.get("retired")]
+
+
 def candidate_levels(iv):
     """The intervention's candidate arms as level numbers: its dose levels, or for a
     choice+dose every option x dose pair (encoded)."""
     doses = [_d(x) for x in iv.get("dose_levels") or [] if x and float(x) > 0]
     if iv.get("kind") == "choice_dose":
-        return [combo_encode(o["id"], d) for o in (iv.get("options") or []) for d in doses]
+        return [combo_encode(o["id"], d) for o in live_options(iv) for d in doses]
     return doses
 
 
@@ -292,7 +298,7 @@ def option_prior_means(iv):
     encode the user's prior over which option is best: proportional to the log of
     the option's probability, centred so they sum to zero, on the deviation-prior
     scale. A uniform prior (or none) gives {} -- no prior. Scheduling only."""
-    probs = effective_option_probs(iv.get("options"))
+    probs = effective_option_probs(live_options(iv))
     if not probs:
         return {}
     floor = 1e-3
@@ -813,7 +819,7 @@ def _plan_combo(iv, beta, entry, measured, noise_sd):
     else:
         grid = sorted({x for x in (std, _d(std - step), _d(std + step)) if x > 0})
     best_level, best_val = 0.0, None
-    for o in iv.get("options") or []:
+    for o in live_options(iv):
         oid = int(o["id"])
         counts, real = {}, {}
         for x in measured:
@@ -1098,7 +1104,7 @@ def plan_exploit(post, cols, interventions, measured=None):
             levels = seen
         elif kind == "choice_dose":
             std = _d(iv.get("default_dose") or 0)
-            levels = [combo_encode(o["id"], std) for o in iv.get("options") or []]
+            levels = [combo_encode(o["id"], std) for o in live_options(iv)]
         elif kind == "choice":
             levels = [_d(x) for x in iv.get("dose_levels") or [] if x and float(x) > 0]
         else:

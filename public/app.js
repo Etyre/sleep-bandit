@@ -152,9 +152,13 @@ async function toggleMaximize() {
   STATE = res.state; renderGrid();
 }
 
+// options still on offer (a removed option stays in iv.options as retired so its
+// past nights keep their label, but it's never planned or listed as current)
+function liveOptions(iv) { return (iv.options || []).filter((o) => !o.retired); }
+
 function ivMeta(iv) {
-  if (iv.kind === "choice_dose") return (iv.options || []).map((o) => esc(o.label)).join(" · ") + ` × ${doseText(iv, iv.default_dose)}`;
-  if (iv.kind === "choice") return (iv.options || []).map((o) => esc(o.label)).join(" · ");
+  if (iv.kind === "choice_dose") return liveOptions(iv).map((o) => esc(o.label)).join(" · ") + ` × ${doseText(iv, iv.default_dose)}`;
+  if (iv.kind === "choice") return liveOptions(iv).map((o) => esc(o.label)).join(" · ");
   if (iv.kind === "boolean") return "yes / no";
   return doseText(iv, iv.default_dose);
 }
@@ -727,8 +731,8 @@ function reportCard(iv) {
     top.appendChild(el("span", "verdict " + vc, vt));
   }
   top.appendChild(el("span", "iv-meta",
-    iv.kind === "choice_dose" ? `${(iv.options || []).length} options × dose · standard ${doseAmount(iv, iv.default_dose)}`
-    : isChoice ? `${(iv.options || []).length} options`
+    iv.kind === "choice_dose" ? `${liveOptions(iv).length} options × dose · standard ${doseAmount(iv, iv.default_dose)}`
+    : isChoice ? `${liveOptions(iv).length} options`
     : iv.kind === "boolean" ? "yes / no"
     : `standard ${doseAmount(iv, iv.default_dose)}`));
   card.appendChild(top);
@@ -1144,6 +1148,25 @@ function doseTick(iv, dose) {
 function doseUnitCaption(iv) {
   return iv.unit || "";
 }
+// Greedy word-wrap to at most maxChars per line and maxLines lines (the last line
+// is ellipsised if the text runs on). Used for the open arm's tick label.
+function wrapLabel(text, maxChars, maxLines) {
+  const words = String(text).trim().split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = "";
+  for (const w of words) {
+    if (!cur) cur = w;
+    else if ((cur + " " + w).length <= maxChars) cur += " " + w;
+    else { lines.push(cur); cur = w; }
+  }
+  if (cur) lines.push(cur);
+  if (lines.length > maxLines) {
+    const kept = lines.slice(0, maxLines);
+    kept[maxLines - 1] = kept[maxLines - 1].slice(0, Math.max(1, maxChars - 1)) + "…";
+    return kept;
+  }
+  return lines;
+}
 
 // Dose interventions get a graph, not a horse-race table: dose on x, mean HRV
 // change over baseline on y, with a 90% credible-interval whisker per dose (the
@@ -1155,9 +1178,17 @@ function doseChart(iv, rows, r, showRec) {
   const hasOpen = rows.some((d) => isOpenDose(d.dose));
   const GAP = hasOpen ? 0.6 : 0;                 // in column widths
   // fill the report column (it's ~half the card); only grow past that for many doses
-  const W = Math.max(CHART_MIN_W, 54 + (n + GAP) * 72), H = 170;
-  const mL = 42, mR = 44, mT = 16, mB = 30;   // right margin fits the last value label
-  const pL = mL, pR = W - mR, pT = mT, pB = H - mB, pH = pB - pT, pW = pR - pL;
+  const W = Math.max(CHART_MIN_W, 54 + (n + GAP) * 72);
+  const mL = 42, mR = 44, mT = 16;            // right margin fits the last value label
+  const pL = mL, pR = W - mR, pW = pR - pL;
+  // the open-ended arm's tick is its own label ("no timer — stay on until I fall
+  // asleep"), word-wrapped to its slot; the chart grows downward to fit the lines
+  const slotW0 = pW / (n + GAP);
+  const openLines = hasOpen
+    ? wrapLabel(openLabel(iv), Math.max(10, Math.floor(2 * Math.min(0.8 * slotW0 - 12, slotW0 / 2 + 40) / 5.4)), 3)
+    : [];
+  const mB = 30 + Math.max(0, openLines.length - 1) * 11, H = 170 + Math.max(0, openLines.length - 1) * 11;
+  const pT = mT, pB = H - mB, pH = pB - pT;
 
   // dots are the RAW per-dose difference vs the off-nights baseline; whiskers
   // stay the model's 90% CI, so a thin dose's wild raw reading can sit outside
@@ -1213,12 +1244,16 @@ function doseChart(iv, rows, r, showRec) {
     // direct value label, always to the right of the dot (same direction for every dose)
     parts.push(`<text x="${x + 9}" y="${yM + 3.5}" text-anchor="start" font-size="11" font-weight="600" style="fill:${col}">${signed(v)}</text>`);
     parts.push(`</g>`);
-    // x tick
-    parts.push(`<text x="${x}" y="${pB + 15}" text-anchor="middle" font-size="10.5" style="fill:var(--muted)">${esc(String(doseTick(iv, d.dose)))}</text>`);
+    // x tick: the dose, or for the open-ended arm its label (wrapped; full text on hover)
+    if (isOpenDose(d.dose)) {
+      const tspans = openLines.map((ln, k) => `<tspan x="${x}" dy="${k ? 11 : 0}">${esc(ln)}</tspan>`).join("");
+      parts.push(`<text x="${x}" y="${pB + 15}" text-anchor="middle" font-size="10.5" style="fill:var(--muted)">${tspans}<title>${esc(openLabel(iv))}</title></text>`);
+    } else {
+      parts.push(`<text x="${x}" y="${pB + 15}" text-anchor="middle" font-size="10.5" style="fill:var(--muted)">${esc(String(doseTick(iv, d.dose)))}</text>`);
+    }
   });
 
-  let cap = doseUnitCaption(iv);
-  if (hasOpen) cap = (cap ? cap + " · " : "") + doseTick(iv, OPEN_ARM_DOSE) + " = " + openLabel(iv);
+  const cap = doseUnitCaption(iv);
   if (cap) parts.push(`<text x="${(pL + pR) / 2}" y="${H - 2}" text-anchor="middle" font-size="9.5" style="fill:var(--muted)">${esc(cap)}</text>`);
 
   const svg = `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img" ` +
@@ -1755,7 +1790,8 @@ $("#iv-form").open_arm.addEventListener("change", syncDelay);
 $("#iv-form").max_dose.addEventListener("input", syncDelay);
 
 // ---- multiple-choice options editor (each option keeps a stable id) ----
-let modalOptions = [];  // [{id: number|null, label}]
+let modalOptions = [];  // [{id: number|null, label, prior, retired}]
+const liveModalOptions = () => modalOptions.filter((o) => !o.retired);
 
 // Effective prior over the options (fraction each): assigned values as given, the
 // blank ones sharing the remaining mass equally (mirrors bandit.effective_option_probs).
@@ -1767,18 +1803,19 @@ function effectiveOptionPriors(opts) {
 }
 
 function refreshPriorPlaceholders() {
-  const eff = effectiveOptionPriors(modalOptions);
+  const live = liveModalOptions();
+  const eff = effectiveOptionPriors(live);
   $$("#options-list .opt-prior").forEach((inp, i) => {
     inp.placeholder = Math.round(eff[i] * 100) + "%";
-    inp.title = modalOptions[i].prior > 0 ? "Your prior that this option is the best"
+    inp.title = live[i].prior > 0 ? "Your prior that this option is the best"
       : `Blank — gets an equal share of what's left: ${Math.round(eff[i] * 100)}%`;
   });
-  const s = modalOptions.reduce((a, o) => a + (o.prior > 0 ? o.prior : 0), 0);
-  const blanks = modalOptions.filter((o) => !(o.prior > 0)).length;
-  const bad = s > 1 + 1e-9 || (!blanks && modalOptions.length && Math.abs(s - 1) > 1e-9);
+  const s = live.reduce((a, o) => a + (o.prior > 0 ? o.prior : 0), 0);
+  const blanks = live.filter((o) => !(o.prior > 0)).length;
+  const bad = s > 1 + 1e-9 || (!blanks && live.length && Math.abs(s - 1) > 1e-9);
   const hint = $("#prior-sum-hint");
   if (hint) {
-    hint.hidden = !modalOptions.length;
+    hint.hidden = !live.length;
     hint.textContent = bad
       ? (s > 1 ? `Priors add up to ${Math.round(s * 100)}% — they can't exceed 100%.`
                : `Priors add up to ${Math.round(s * 100)}% — with every option assigned they must total 100%.`)
@@ -1791,10 +1828,12 @@ function refreshPriorPlaceholders() {
 function renderOptions() {
   const list = $("#options-list");
   list.innerHTML = "";
-  if (!modalOptions.length) {
+  const live = liveModalOptions();
+  if (!live.length) {
     list.appendChild(el("p", "field-hint", "No options yet — add at least two below."));
   }
   modalOptions.forEach((o, i) => {
+    if (o.retired) return;
     const row = el("div", "opt-row");
     row.appendChild(el("span", "opt-label", esc(o.label)));
     // optional prior that THIS option is the best, as a percent (blank = equal share of the rest)
@@ -1820,6 +1859,24 @@ function renderOptions() {
     row.appendChild(del);
     list.appendChild(row);
   });
+  // Removed options: kept (their past nights still show under their name) and
+  // restorable -- one click puts an option back on offer for future nights.
+  const retired = modalOptions.map((o, i) => [o, i]).filter(([o]) => o.retired);
+  if (retired.length) {
+    const box = el("details", "retired-options");
+    box.appendChild(el("summary", "", `${retired.length} removed option${retired.length === 1 ? "" : "s"} — past nights still count; restore to offer again`));
+    for (const [o, i] of retired) {
+      const row = el("div", "opt-row retired");
+      row.appendChild(el("span", "opt-label", esc(o.label)));
+      const res = el("button", "ghost opt-btn", "Restore");
+      res.type = "button";
+      res.title = "Offer this option again on future nights";
+      res.addEventListener("click", () => restoreOption(i));
+      row.appendChild(res);
+      box.appendChild(row);
+    }
+    list.appendChild(box);
+  }
   refreshPriorPlaceholders();
 }
 
@@ -1842,10 +1899,16 @@ function renameOption(i) {
 }
 
 function deleteOption(i) {
-  if (window.confirm(`Remove “${modalOptions[i].label}”?\nIt won't be offered on future nights, but its past nights are kept.`)) {
-    modalOptions.splice(i, 1);
+  if (window.confirm(`Remove “${modalOptions[i].label}”?\nIt won't be offered on future nights, but its past nights are kept — and you can restore it later.`)) {
+    // never dropped: kept as retired so its history stays labelled and it can come back
+    modalOptions[i] = { ...modalOptions[i], prior: null, retired: true };
     renderOptions();
   }
+}
+
+function restoreOption(i) {
+  modalOptions[i] = { ...modalOptions[i], retired: false };
+  renderOptions();
 }
 
 $("#add-option-btn").addEventListener("click", addOptionFromInput);
@@ -1936,7 +1999,7 @@ function openModal(iv) {
   f.test_skip.checked = iv ? !!iv.test_skip : false;
   f.prior_helps.value = String(iv && iv.prior_helps ? priorPct(iv.prior_helps) : 50);
   f.note.value = iv ? iv.note : "";
-  modalOptions = iv && isChoiceKind(iv) ? (iv.options || []).map((o) => ({ id: o.id, label: o.label, prior: o.prior > 0 ? o.prior : null })) : [];
+  modalOptions = iv && isChoiceKind(iv) ? (iv.options || []).map((o) => ({ id: o.id, label: o.label, prior: o.prior > 0 ? o.prior : null, retired: !!o.retired })) : [];
   $("#new-option").value = "";
   renderOptions();
   f.input_type.value = iv && INPUT_TYPES.includes(iv.input_type) ? iv.input_type : "checkbox";
@@ -1989,9 +2052,10 @@ $("#iv-form").addEventListener("submit", async (e) => {
     return;
   }
   if (kind === "choice" || kind === "choice_dose") {
-    if (!modalOptions.length) { alert("Add at least one option."); return; }
-    const ps = modalOptions.reduce((a, o) => a + (o.prior > 0 ? o.prior : 0), 0);
-    const blanks = modalOptions.filter((o) => !(o.prior > 0)).length;
+    const live = liveModalOptions();
+    if (!live.length) { alert("Add at least one option (or restore a removed one)."); return; }
+    const ps = live.reduce((a, o) => a + (o.prior > 0 ? o.prior : 0), 0);
+    const blanks = live.filter((o) => !(o.prior > 0)).length;
     if (ps > 1 + 1e-9) { alert("The option priors add up to more than 100%."); return; }
     if (!blanks && Math.abs(ps - 1) > 1e-9) { alert("With every option given a prior, they must add up to exactly 100%."); return; }
     payload.options = modalOptions;

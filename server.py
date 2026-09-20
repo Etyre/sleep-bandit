@@ -287,6 +287,32 @@ def reconcile_tonight_bounds(conn, iid, before=None):
     store.force_assignment(conn, d, iid, new, taken_dose=cell["taken_dose"])
     return new
 
+
+def reconcile_tonight_options(conn, iid):
+    """After a multiple-choice intervention's options change, drop TONIGHT's cell
+    for it if the cell prescribes an option that no longer exists (removed /
+    retired) -- but only while the cell is still pending: not ticked as taken, on a
+    night still 'planned'. The caller's ensure_tonight then plans the cell afresh
+    from the options that remain. This is the one case where a planned cell is
+    re-rolled: the prescribed option can't be done any more. Returns True if the
+    cell was dropped."""
+    iv = store.get_intervention(conn, iid)
+    if not iv or iv.get("kind") not in ("choice", "choice_dose"):
+        return False
+    d = today_str()
+    night = store.get_night(conn, d)
+    if not night or night.get("status") != "planned":
+        return False
+    cell = next((a for a in night["assignments"] if a["intervention_id"] == iid), None)
+    if not cell or cell["taken_dose"] is not None or not (cell["assigned_dose"] or 0) > 0:
+        return False
+    level = float(cell["assigned_dose"])
+    oid = bandit.combo_decode(level)[0] if iv["kind"] == "choice_dose" else int(round(level))
+    if any(int(o["id"]) == oid for o in bandit.live_options(iv)):
+        return False
+    store._audit(conn, "replan_assign", d, iid, old_dose=level, reason="option_removed")
+    return store.delete_assignment(conn, d, iid)
+
 # ---------------------------------------------------------------------------
 # Grid-shaped state
 # ---------------------------------------------------------------------------
@@ -1052,6 +1078,7 @@ class Handler(BaseHTTPRequestHandler):
                 # its dose follows the new settings so the plan can't show a stale or
                 # impossible dose.
                 reconcile_tonight_bounds(conn, iid, before)
+                reconcile_tonight_options(conn, iid)
                 ensure_tonight(conn)
                 return self._send_json(state_payload(conn))
         finally:

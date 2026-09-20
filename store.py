@@ -309,6 +309,8 @@ def _read_options(raw):
             d = {"id": int(o.get("id", i + 1)), "label": str(o["label"])}
             if _opt_prior(o.get("prior")) is not None:
                 d["prior"] = _opt_prior(o.get("prior"))
+            if o.get("retired"):
+                d["retired"] = True
             out.append(d)
         else:
             out.append({"id": i + 1, "label": str(o)})
@@ -328,7 +330,12 @@ def _opt_prior(v):
 def _norm_choice_options(options):
     """Assign a stable id to every option (keeping existing ids, minting new ones
     for options without one). The id is what history/analysis keys on, so an
-    option survives renames and reordering."""
+    option survives renames and reordering.
+
+    A REMOVED option is never dropped from the list: it's kept with retired=True so
+    the nights it was assigned on still read by its label (in the grid and the
+    reports) and so it can be restored later. Retired options are simply not
+    offered on future nights -- see live_options."""
     options = options or []
     used = [int(o["id"]) for o in options if isinstance(o, dict) and o.get("id") is not None]
     nxt = (max(used) + 1) if used else 1
@@ -336,18 +343,26 @@ def _norm_choice_options(options):
     for o in options:
         if isinstance(o, dict):
             label, oid, prior = str(o.get("label", "")).strip(), o.get("id"), _opt_prior(o.get("prior"))
+            retired = bool(o.get("retired"))
         else:
-            label, oid, prior = str(o).strip(), None, None
+            label, oid, prior, retired = str(o).strip(), None, None, False
         if not label:
             continue
         if oid is None:
             oid = nxt
             nxt += 1
         d = {"id": int(oid), "label": label}
-        if prior is not None:
+        if prior is not None and not retired:
             d["prior"] = prior
+        if retired:
+            d["retired"] = True
         out.append(d)
     return out
+
+
+def live_options(options):
+    """The options still offered on future nights (everything not retired)."""
+    return [o for o in (options or []) if not o.get("retired")]
 
 
 # Intervention kinds. 'choice_dose' = multiple choice + dose: the app picks an option
@@ -415,8 +430,8 @@ def create_intervention(conn, name, unit="", default_dose=1.0, unit_dose=0.0,
     category = _norm_category(category)
     if kind == "choice":
         options = _norm_choice_options(options)
-        # each option is an "arm"; its stable id is the dose level
-        dose_levels = [o["id"] for o in options]
+        # each live option is an "arm"; its stable id is the dose level
+        dose_levels = [o["id"] for o in live_options(options)]
         unit, default_dose, unit_dose, dose_noun = "", 1.0, 0.0, ""
     elif kind == "boolean":
         # a plain yes/no: a single "on" arm (dose 1) vs off
@@ -484,7 +499,7 @@ def update_intervention(conn, iid, **fields):
     if kind == "choice":
         opts = _norm_choice_options(fields.get("options", iv["options"]))
         setcol("options", json.dumps(opts))
-        setcol("dose_levels", json.dumps([o["id"] for o in opts]))
+        setcol("dose_levels", json.dumps([o["id"] for o in live_options(opts)]))
         setcol("unit", "")
         setcol("default_dose", 1.0)
         setcol("dose_noun", "")
