@@ -135,8 +135,9 @@ FAST_PRIOR_WEIGHT = 0.25
 # measured and at least one has MIN_PROBES readings -- i.e. the region has evidence
 # at both ends and one end is a rung the search is investing in, which Thompson
 # sampling only does for promising rungs. So refinement concentrates inside the
-# most effective regions while bad regions mostly stay coarse. Already-measured
-# rungs are always open (their data stays exploitable). The fast sweep's kernel
+# most effective regions while bad regions mostly stay coarse. A fine rung's own
+# data (from before this scheme, or a full-grid night) does not open it -- the data
+# still shapes the curve, but the rung waits for its region. The fast sweep's kernel
 # interpolates the coarse readings (its bandwidth widens to half the typical gap
 # between measured rungs), so a fine rung between two good coarse rungs draws high
 # and one next to a bad coarse rung draws low. Only the SWEEPS do this (the fast
@@ -751,9 +752,12 @@ def _coarse_rungs(grid, step, std, open_pos=None):
 
 
 def _rung_open(r, coarse, counts):
-    """Is this rung open for probing? Coarse and already-measured rungs always; a fine
-    rung once the coarse rungs bracketing it are both measured and one is firm."""
-    if r in coarse or counts.get(r, 0) > 0:
+    """Is this rung open for probing? Coarse rungs always; a fine rung once the coarse
+    rungs bracketing it are both measured and one is firm. Having data of its own
+    does NOT open a fine rung: readings taken before the coarse-first scheme (or on
+    a full-grid night) still feed the dose-response curve, but the rung itself
+    waits for its region to be surveyed like any other."""
+    if r in coarse:
         return True
     below = max((c for c in coarse if c < r), default=None)
     above = min((c for c in coarse if c > r), default=None)
