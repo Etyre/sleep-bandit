@@ -184,11 +184,26 @@ MIN_PROBES = 5
 # that isn't a number -- e.g. the spiky mat with no timer, staying on it until you
 # fall asleep. It is recorded as this sentinel dose, sits exactly one rung above the
 # max on the exploration grid (so the ordinary one-rung-up / jump logic can step into
-# it and back out) and gets its own contrast column like any other level. While it
-# has fewer than MIN_PROBES readings, this share of probe nights go straight to it so
-# it actually gets measured. Mirrored in public/app.js (OPEN_ARM_DOSE).
+# it and back out) and gets its own contrast column like any other level.
+#
+# It is a qualitatively different condition, so finding out whether it beats the
+# numeric doses is worth more than one more reading among them. On every night
+# the intervention is ON and deviating from the standard dose, the open arm gets a
+# guaranteed FLOOR share: with probability open_arm_floor(n) it is assigned
+# outright, otherwise the ordinary scheme (the fast sweep's Thompson draw, or the
+# slow climb's probe/exploit) chooses -- and that scheme can still land on the arm
+# itself, so the floor is a minimum, not the whole share. The floor starts at
+# OPEN_ARM_FLOOR with no readings and decays hyperbolically with the arm's own
+# night count (halved at OPEN_ARM_FLOOR_HALF nights), so with data the schedule
+# asymptotes to the ordinary scheme. Mirrored in public/app.js (OPEN_ARM_DOSE).
 OPEN_ARM_DOSE = 1e9
-OPEN_ARM_PROBE_SHARE = 0.5
+OPEN_ARM_FLOOR = 1.0 / 3.0
+OPEN_ARM_FLOOR_HALF = MIN_PROBES
+
+
+def open_arm_floor(n_open):
+    """The open arm's guaranteed share of deviating on-nights after n_open readings."""
+    return OPEN_ARM_FLOOR * OPEN_ARM_FLOOR_HALF / (OPEN_ARM_FLOOR_HALF + max(0, n_open))
 
 
 def is_open(d):
@@ -1064,6 +1079,9 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
                 center = mv
 
         n_open = counts.get(open_pos, 0) if open_ok else 0
+        if open_ok and random.random() < open_arm_floor(n_open):
+            plan[iv["id"]] = OPEN_ARM_DOSE               # the open arm's floor share (see above)
+            continue
         fast = (not iv.get("delay_explore", True)) and lo is not None and hi is not None
         if fast:
             # FAST SWEEP (delay off + bounded range): Thompson draw over the whole grid,
@@ -1079,9 +1097,7 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
             plan[iv["id"]] = dose if dose and dose > 0 else 0.0
             continue
         if random.random() < PROBE_SHARE:                # explore: map the curve
-            if open_ok and n_open < MIN_PROBES and random.random() < OPEN_ARM_PROBE_SHARE:
-                dose = open_pos                          # give the open arm its first readings
-            elif timed:
+            if timed:
                 j = random.randint(1, TIME_MAX_JUMP) * random.choice((-1, 1))
                 probe = _d(center + j * step)
                 dose = probe if probe > 0 else _d(center + step)
