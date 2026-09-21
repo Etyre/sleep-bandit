@@ -97,6 +97,40 @@ with the all-exploit plan (every intervention at its best measured dose, or off)
 The randomized plan is parked and restored exactly if you switch it back off. Those
 nights are not evidence unless the "count maximize nights" switch is on.
 
+### Where each scheduling feature is documented
+
+Every feature below is explained in a comment block or docstring at the named
+place; the constants listed are the knobs. Names, not line numbers, so they stay
+valid as the files change.
+
+| Feature | Documented at | Knobs |
+|---|---|---|
+| The model (one "helps" effect + shrunk per-dose deviations, Normal-Inverse-Gamma posterior) | `bandit.py` module docstring; `fit_model` | `ON_PRIOR_VAR`, `DOSE_DEV_PRIOR_VAR`, `SIGMA2_PRIOR_A/B`, `MEANINGFUL_EFFECT` |
+| Per-night planning: one Thompson draw, ON/OFF then dose | `plan_night` docstring; `server.ensure_tonight` | — |
+| ON/OFF decision from the sampled "helps" effect | `_decide_on` | — |
+| Early lock-in guard (tiered clamp on P(ON)); per-intervention opt-out | comment above `LOCKIN_TIERS`; `lockin_cap`, `clamp_p_on`, `p_on_estimate` | `LOCKIN_TIERS`, `LOCKIN_P_SAMPLES`, `no_lockin` |
+| Cold-start warm-up: hold the standard dose, ramp exploration quadratically (linearly for time-based) | comment above `WARMUP_ON_NIGHTS` and above `PROBE_SHARE` | `WARMUP_ON_NIGHTS`, `delay_explore` |
+| Slow climb: probe vs. exploit split, one-unit supplement probes, bigger time-based jumps | comment above `PROBE_SHARE`; `_supp_probe`; the slow-climb branch of `plan_night` | `PROBE_SHARE`, `TIME_MAX_JUMP`, `MIN_PROBES` |
+| Minimum viable dose (exploit the smallest dose within 95% of the best) | comment above `MIN_VIABLE_FRAC`; `_min_viable_dose` | `MIN_VIABLE_FRAC` |
+| Dose bounds and the explored grid | `_bounds`, `_dose_step`, `store.dose_levels_from` | `min_dose`, `max_dose`, `unit_dose` |
+| Fast sweep: kernel-smoothed Thompson draw over the whole bounded grid | comment above `FAST_KERNEL_STEPS`; `_fast_grid`, `_fast_pick` | `FAST_KERNEL_STEPS`, `FAST_PRIOR_WEIGHT` |
+| Coarse-first tree search on big grids; when a fine rung opens | comment above `COARSE_MIN_RUNGS`; `_coarse_rungs`, `_rung_open`, `_coarse_night` | `COARSE_MIN_RUNGS`, `COARSE_EVERY`, `COARSE_SHARE`, `MIN_PROBES` |
+| Open-ended arm: sentinel dose, island scoring, decaying floor share (fast sweep), early tries (slow climb) | comment above `OPEN_ARM_DOSE`; `open_arm_floor`, `has_open_arm`, `_fast_pick` docstring | `OPEN_ARM_FLOOR`, `OPEN_ARM_FLOOR_HALF`, `OPEN_ARM_PROBE_SHARE` |
+| Multiple choice: options as arms, optional "skip" control, retired options never planned | `candidate_levels`, `live_options`; `store._norm_choice_options`, `store.live_options` | `test_skip` |
+| Multiple choice + dose: option × dose arms, per-option sweep | `_plan_combo` docstring; `combo_encode` | same as fast sweep |
+| Priors: "helps" prior (capped at 80%) and per-option priors, scheduling only | `scheduling_priors`, `prior_mean_for_prob`, `effective_option_probs`, `option_prior_means`; `store._clamp_prior` | `prior_helps`, option `prior` |
+| Maximize-benefit nights: all-exploit plan, parked randomized plan, restore | `plan_exploit` docstring; `server.maximize_tonight`; `store.override_assignment`, `store.restore_assignment` | header switch `count_maximize` |
+| Assignment freeze: planned cells are never re-rolled; the sanctioned exceptions | `store.set_assignment` docstring; `store.force_assignment`, `store.delete_assignment` | — |
+| Tonight's pending cell follows setting changes (new bounds / standard dose; a removed option) | `server.reconcile_tonight_bounds`, `server.reconcile_tonight_options` | — |
+| Which nights count: compliance rule, per-cell and per-category exclusions | `server.intervention_nights` docstring | — |
+| Recency weighting of evidence and effective counts | comment above `RECENCY_HALF_LIFE_DAYS`; `apply_recency` | `RECENCY_HALF_LIFE_DAYS` |
+| Night rollover at 4 AM | `server.today_str` | `NIGHT_ROLLOVER_HOUR` |
+| Pairwise interactions (Reports) | comment above `INTERACTION_PRIOR_VAR`; `pair_interaction` | `INTERACTION_PRIOR_VAR`, `INTERACTION_SAMPLES` |
+| Deterministic report read-outs (seeded Monte Carlo) | comment above `READOUT_SEED` | `READOUT_SAMPLES`, `READOUT_SEED` |
+
+Unqualified names are in `bandit.py`; `server.` and `store.` prefixes name the other
+two modules.
+
 ## What counts as evidence
 
 - An ON night counts only if you ticked it. An unticked ON night is dropped, not
@@ -171,4 +205,4 @@ Relevant environment variables: `SB_PUBLIC`, `SB_ADMIN_PATH`, `SB_PASSWORD_HASH`
 | `deploy/` | VPS setup: systemd units, Caddyfile, backup timer |
 
 The design rationale for every planning constant is in the comment block above it in
-`bandit.py`; start there before changing how the scheduler behaves.
+`bandit.py`; the table under "How the scheduler decides" maps each feature to it.
