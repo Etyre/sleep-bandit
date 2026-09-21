@@ -770,7 +770,7 @@ def _coarse_night(coarse):
     return coarse is not None and random.random() < COARSE_SHARE
 
 
-def _fast_pick(grid, beta, entry, counts, real, step, noise_sd, center=None):
+def _fast_pick(grid, beta, entry, counts, real, step, noise_sd, center=None, open_pos=None):
     """The fast sweep's choice: one Thompson draw over the grid. Each rung's value is
         smoothed sampled effect + N(0, dev_sd / sqrt(1 + n_eff)),
     where the smoothed effect is a Gaussian-kernel blend (bandwidth FAST_KERNEL_STEPS
@@ -779,7 +779,26 @@ def _fast_pick(grid, beta, entry, counts, real, step, noise_sd, center=None):
     prior sd for one dose's deviation (sqrt(DOSE_DEV_PRIOR_VAR) x noise sd); n_eff is
     the kernel-weighted count of readings near the rung. Returns (rung, draw) for the
     rung with the highest draw. counts/real: position -> readings / the level to
-    evaluate the model at (the open-arm rung's sentinel, or an encoded option+dose)."""
+    evaluate the model at (the open-arm rung's sentinel, or an encoded option+dose).
+
+    open_pos: the open-ended arm's grid position, if the intervention has one. That
+    arm is a different CONDITION ("no timer"), not one rung past the max, so it is an
+    island: scored from its own readings only (shrunk toward the plain "on" effect
+    like any thin rung), and its readings never lend themselves to the numeric rungs
+    through the kernel. Without this the max-dose rung's nights would swamp it --
+    making it look both mediocre and well-measured, and so never worth a probe."""
+    if open_pos is not None:
+        nums = [r for r in grid if r != open_pos]
+        c_num = {q: n for q, n in counts.items() if q != open_pos}
+        r_num = {q: v for q, v in real.items() if q != open_pos}
+        best = _fast_pick(nums, beta, entry, c_num, r_num, step, noise_sd, center) if nums else (None, None)
+        if open_pos in grid:
+            c_op = {open_pos: counts[open_pos]} if counts.get(open_pos) else {}
+            r_op = {open_pos: real[open_pos]} if counts.get(open_pos) else {}
+            arm = _fast_pick([open_pos], beta, entry, c_op, r_op, step, noise_sd, center)
+            if best[1] is None or arm[1] > best[1]:
+                best = arm
+        return best
     h = FAST_KERNEL_STEPS * step
     # with sparse (coarse) data the kernel widens to half the typical gap between
     # measured rungs, so untried rungs in between interpolate their neighbours
@@ -1054,7 +1073,8 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
             coarse = _coarse_rungs(grid, step, std, open_pos)
             if _coarse_night(coarse):                    # big grid: coarse-first tree search
                 grid = [r for r in grid if _rung_open(r, coarse, counts)]
-            dose = _fast_pick(grid, beta, entry, counts, real, step, math.sqrt(sigma2))[0] if grid else std
+            dose = _fast_pick(grid, beta, entry, counts, real, step, math.sqrt(sigma2),
+                              open_pos=open_pos)[0] if grid else std
             dose = unpos(dose) if dose and dose > 0 else 0.0
             plan[iv["id"]] = dose if dose and dose > 0 else 0.0
             continue
