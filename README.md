@@ -1,0 +1,174 @@
+# Sleep Bandit
+
+A single-user, self-hosted n-of-1 experiment runner for sleep interventions. Each
+evening it decides, per intervention, whether tonight is an ON or OFF night and at
+what dose or option; each morning it pulls HRV, resting heart rate and sleep metrics
+from an Oura ring; and it fits a Bayesian model to tell you which interventions help,
+at what dose, and how sure it is.
+
+Pure Python standard library plus SQLite. No dependencies to install.
+
+```
+python3 server.py          # then open http://localhost:8777
+```
+
+## How a night works
+
+1. **Plan.** When the app is opened (or on a 20-minute timer when hosted) it makes
+   sure tonight has a cell for every active intervention. Each missing cell is filled
+   by one Thompson-sampling draw from that intervention's own model. Existing cells
+   are never re-rolled: what was prescribed is the historical record.
+2. **Do it and tick it.** The Tracker grid shows tonight's column. Highlighted cells
+   are ON; tap one when you have done it. A cell's completion input is a checkbox by
+   default, or a row of buttons or a number if the intervention is set up that way.
+3. **Morning.** Oura sync fills in last night's HRV, lowest resting HR, sleep
+   efficiency, total sleep and latency. You can also type values by hand.
+4. **Reports.** The Effects tab gives each intervention a verdict, its estimated
+   effect on HRV and resting HR, a dose-response chart, and the sleep metrics. The
+   Interactions tab fits pairs for synergy or interference.
+
+A night belongs to its **evening's date** and rolls over at 4 AM, so a routine done
+at 1 AM still files under the previous evening.
+
+## Interventions
+
+Each intervention has a **category** (supplement, behavioral, environmental) and a
+**kind**:
+
+| Kind | What the app decides each night |
+|---|---|
+| Dose | ON or OFF, and if ON, an amount (e.g. 200 mg, 15 minutes) |
+| Yes / no | ON or OFF |
+| Multiple choice | one of your options, always ON (optionally also testing "skip") |
+| Multiple choice + dose | an option AND an amount; every option × dose pair is its own arm |
+
+Dose settings: standard dose, unit dose (the step between doses), optional min and
+max, and a "count as" noun so the tracker can say "2 pills" while the reports say
+"400 mg". Two switches govern exploration:
+
+- **Explore doses** off means only the standard dose is ever used.
+- **Delay exploration** (on by default) holds the standard dose until enough ON
+  nights have answered the on/off question, then ramps exploration up slowly.
+
+**Options** on a choice intervention keep a stable id, so renaming keeps history.
+Removing an option retires it: it is never planned again, but its past nights still
+show under its name, and it can be restored from the "removed options" list in the
+editor.
+
+**Open-ended arm.** A dose intervention with a max can have one more arm above it
+that is not a number, e.g. the spiky mat with no timer, staying on until you fall
+asleep. It is recorded as a sentinel dose, gets its own label in the tracker and
+reports, and is treated as a different condition rather than "one more step".
+
+Per-intervention priors (a prior that it helps at all; a prior over which option is
+best) steer early scheduling only and fade as nights accumulate. They never enter the
+reported estimates.
+
+## How the scheduler decides
+
+The engine is in `bandit.py`: a conjugate Bayesian linear regression with Thompson
+sampling, no numpy. Each intervention gets one "does it help at all" effect plus a
+heavily shrunk per-dose deviation, so "does it work" is a single well-calibrated
+parameter and "which dose" is a separate question.
+
+**ON or OFF** is decided by one posterior draw: ON if the sampled "helps" effect is
+positive. So P(ON) tracks P(it helps). An **early lock-in guard** keeps that
+probability inside [10%, 90%] until the smaller arm has 15 nights, [5%, 95%] until 30,
+then lets go, so a lucky first week cannot stop the contrast from being collected.
+
+**Which dose**, once ON, depends on the settings:
+
+- **Slow climb** (the default). The standard dose most nights; the chance of
+  deviating ramps with the warm-up. Deviating nights either exploit the minimum
+  viable dose (the smallest within 95% of the best measured effect) or probe one
+  unit dose at a time (supplements) or in bigger jumps (time-based).
+- **Fast sweep** (delay off and both min and max set). Every ON night is a Thompson
+  draw over the whole grid, smoothed across neighbouring rungs with an optimism bonus
+  where data is thin. On grids of more than ten rungs it goes **coarse-first**:
+  multiples of 5 unit doses (plus min, max and standard) are probed on 80% of nights,
+  and a fine rung opens only once the coarse rungs bracketing it are both measured
+  and one is firm. A fine rung's own old readings do not open it.
+- **Open-ended arm** in a fast sweep is scored as an island from its own nights only,
+  and is guaranteed a floor share of ON nights: one third with no readings, decaying
+  as its own nights accumulate (half that after 5), on top of whatever the draw picks.
+
+**Maximize benefit** is a per-night switch that overrides tonight's unticked cells
+with the all-exploit plan (every intervention at its best measured dose, or off).
+The randomized plan is parked and restored exactly if you switch it back off. Those
+nights are not evidence unless the "count maximize nights" switch is on.
+
+## What counts as evidence
+
+- An ON night counts only if you ticked it. An unticked ON night is dropped, not
+  treated as a control.
+- An OFF night is always a control.
+- A cell can be excluded individually (e.g. assigned OFF but you did it anyway), and
+  a whole night can be excluded per category (e.g. "ignore tonight's supplements, I
+  was ill").
+- **Recency weighting** (header switch) weights every night by 0.5^(age / 60 days)
+  in both the model and the effective counts, and disables the lock-in guard.
+
+Reports show effects on HRV (higher is better) and lowest resting HR (lower is
+better), each with a model 90% interval and a probability of a real benefit. A
+choice intervention shows a horse race of its options. Where a choice's options pin a
+behaviour (e.g. fasting vs. a full meal), an **observed** table groups nights by
+what actually happened, flagged as correlational.
+
+## Oura
+
+Oura's API is OAuth2-only. Register a private app at cloud.ouraring.com with redirect
+URI `http://localhost:8777/oura/callback`, paste its client id and secret into the
+Oura panel, and connect. Tokens live in the settings table and refresh themselves.
+A Sleep Bandit night d matches Oura day d+1 (the morning it ends), and only the
+session Oura marks as the main sleep is used, never naps. Syncs look back 45 days
+for blank nights and are throttled to one per 15 minutes.
+
+## Running locally
+
+`python3 server.py` starts it on port 8777 (`SB_PORT`, `SB_HOST` override). Opening
+the app plans tonight and syncs Oura; nothing runs in the background.
+
+On this Mac a LaunchAgent (`com.elityre.sleep-bandit`) runs `server.py` from
+`~/sleep-bandit` and keeps it alive, with logs in `~/Library/Logs/sleep-bandit.log`.
+If you start a second copy by hand while the agent's copy holds the port, the agent's
+copy exits with "address already in use" until the port is free. A second agent
+(`com.elityre.sleep-bandit-backup`) runs `backup.sh` daily.
+
+`python3 seed_demo.py` fills an empty database with simulated history whose ground
+truth is known, so you can see the reports work before you have real data.
+
+## Data and backups
+
+Everything is in `data/sleep_bandit.db`. Tables: `interventions`, `nights`,
+`assignments` (one row per intervention per night: assigned dose, taken dose,
+exclusion, completion input, parked randomized dose), `settings`, and an
+append-only `audit_log` recording every write with a millisecond timestamp.
+
+`backup.sh` takes a WAL-safe snapshot with `sqlite3 .backup` into `backups/` and
+keeps the newest 30. The database is committed to git alongside the code in this
+repo; `backups/` is not.
+
+## Hosting
+
+`deploy/README.md` covers running it on a VPS behind Caddy at a public domain: a
+read-only public view at `/`, an unlinked password-protected admin path with the
+full app, background planning and Oura sync on a 20-minute timer, and daily backups.
+Hosted mode is off by default; locally everything is read/write with no login.
+
+Relevant environment variables: `SB_PUBLIC`, `SB_ADMIN_PATH`, `SB_PASSWORD_HASH`
+(from `python3 auth.py`), `SB_BASE_URL`, `SB_AUTOSYNC`, `SB_DB_PATH`.
+
+## Files
+
+| File | Role |
+|---|---|
+| `server.py` | HTTP server, planning, analysis payloads, hosted mode |
+| `bandit.py` | the model, Thompson sampling, dose exploration, interactions |
+| `store.py` | SQLite schema, migrations, every write (audited) |
+| `oura.py` | OAuth and sync |
+| `auth.py` | password hashing and session cookies for hosted mode |
+| `public/` | the single-page UI: `index.html`, `app.js`, `styles.css` |
+| `deploy/` | VPS setup: systemd units, Caddyfile, backup timer |
+
+The design rationale for every planning constant is in the comment block above it in
+`bandit.py`; start there before changing how the scheduler behaves.
