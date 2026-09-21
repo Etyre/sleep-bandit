@@ -187,18 +187,20 @@ MIN_PROBES = 5
 # it and back out) and gets its own contrast column like any other level.
 #
 # It is a qualitatively different condition, so finding out whether it beats the
-# numeric doses is worth more than one more reading among them. On every night
-# the intervention is ON and deviating from the standard dose, the open arm gets a
-# guaranteed FLOOR share: with probability open_arm_floor(n) it is assigned
-# outright, otherwise the ordinary scheme (the fast sweep's Thompson draw, or the
-# slow climb's probe/exploit) chooses -- and that scheme can still land on the arm
-# itself, so the floor is a minimum, not the whole share. The floor starts at
-# OPEN_ARM_FLOOR with no readings and decays hyperbolically with the arm's own
-# night count (halved at OPEN_ARM_FLOOR_HALF nights), so with data the schedule
-# asymptotes to the ordinary scheme. Mirrored in public/app.js (OPEN_ARM_DOSE).
+# numeric doses is worth more than one more reading among them. In the FAST SWEEP,
+# on every on-night, the open arm gets a guaranteed FLOOR share: with probability
+# open_arm_floor(n) it is assigned outright, otherwise the Thompson draw chooses --
+# and the draw can still land on the arm itself, so the floor is a minimum, not the
+# whole share. The floor starts at OPEN_ARM_FLOOR with no readings and decays
+# hyperbolically with the arm's own night count (halved at OPEN_ARM_FLOOR_HALF
+# nights), so with data the schedule asymptotes to the plain draw. The SLOW CLIMB
+# keeps its simpler rule: while the arm has fewer than MIN_PROBES readings,
+# OPEN_ARM_PROBE_SHARE of its probe nights go straight to it. Mirrored in
+# public/app.js (OPEN_ARM_DOSE).
 OPEN_ARM_DOSE = 1e9
 OPEN_ARM_FLOOR = 1.0 / 3.0
 OPEN_ARM_FLOOR_HALF = MIN_PROBES
+OPEN_ARM_PROBE_SHARE = 0.5
 
 
 def open_arm_floor(n_open):
@@ -1079,11 +1081,11 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
                 center = mv
 
         n_open = counts.get(open_pos, 0) if open_ok else 0
-        if open_ok and random.random() < open_arm_floor(n_open):
-            plan[iv["id"]] = OPEN_ARM_DOSE               # the open arm's floor share (see above)
-            continue
         fast = (not iv.get("delay_explore", True)) and lo is not None and hi is not None
         if fast:
+            if open_ok and random.random() < open_arm_floor(n_open):
+                plan[iv["id"]] = OPEN_ARM_DOSE           # the open arm's floor share (see above)
+                continue
             # FAST SWEEP (delay off + bounded range): Thompson draw over the whole grid,
             # smoothed across neighbouring rungs, with an optimism bonus where data is
             # thin -- see FAST_* above.
@@ -1097,7 +1099,9 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
             plan[iv["id"]] = dose if dose and dose > 0 else 0.0
             continue
         if random.random() < PROBE_SHARE:                # explore: map the curve
-            if timed:
+            if open_ok and n_open < MIN_PROBES and random.random() < OPEN_ARM_PROBE_SHARE:
+                dose = open_pos                          # give the open arm its first readings
+            elif timed:
                 j = random.randint(1, TIME_MAX_JUMP) * random.choice((-1, 1))
                 probe = _d(center + j * step)
                 dose = probe if probe > 0 else _d(center + step)
