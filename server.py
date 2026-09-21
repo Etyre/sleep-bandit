@@ -126,6 +126,14 @@ def _nn(x):
 # ---------------------------------------------------------------------------
 # Planning (Bayesian bandit / Thompson sampling)
 # ---------------------------------------------------------------------------
+def _n_experiment_nights(all_nights):
+    """Nights that count as "logged" in the report headers: an HRV reading AND at
+    least one intervention cell. Backfilled history (Oura nights imported from
+    before the experiment, kept only to define the HRV baseline band) has readings
+    but no cells, so it is excluded here just as it is from every fit."""
+    return sum(1 for n in all_nights if n["hrv"] is not None and n.get("assigns"))
+
+
 def intervention_nights(iv_id, all_nights, metric, negate=False, category=None):
     """Nights that count for this intervention on the given metric, shaped for the
     bandit ({'hrv': y, 'taken': {iv_id: dose}}).
@@ -523,7 +531,7 @@ def reports_payload(conn):
     ivs = store.list_interventions(conn)
     all_nights = analysis_nights_weighted(conn)
     recency_on = recency_enabled(conn)   # recency mode also disables the lock-in guard
-    n_hrv = sum(1 for n in all_nights if n["hrv"] is not None)
+    n_hrv = _n_experiment_nights(all_nights)
     out = []
     for iv in ivs:
         out.append({
@@ -694,7 +702,7 @@ def interactions_payload(conn):
     Pairs that have never co-occurred are only counted."""
     ivs = store.list_interventions(conn)
     all_nights = analysis_nights_weighted(conn)
-    n_hrv = sum(1 for n in all_nights if n["hrv"] is not None)
+    n_hrv = _n_experiment_nights(all_nights)
     pairs, no_overlap = [], 0
     brief = lambda iv: {"id": iv["id"], "name": iv["name"], "category": iv["category"],
                         "kind": iv["kind"], "active": iv["active"]}
