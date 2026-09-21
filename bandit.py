@@ -961,8 +961,10 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
          FAST_* constants. On a big grid (more than COARSE_MIN_RUNGS rungs) the
          sweep goes COARSE-FIRST: multiples of COARSE_EVERY unit doses (plus min,
          max, standard) are mostly probed before the fine rungs between them,
-         which open region by region as the coarse rungs firm up. The slow climb
-         is untouched.
+         which open region by region as the coarse rungs firm up (a fine rung's own
+         readings don't open it). The open-ended arm, if any, is an island: scored
+         from its own readings only, and guaranteed a decaying floor share of
+         on-nights (open_arm_floor). The slow climb is untouched.
 
     Multiple-choice interventions skip stage 1 -- "off" is NOT an option and we take
     the best option even if all look weakly negative.
