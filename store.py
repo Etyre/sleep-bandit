@@ -605,9 +605,14 @@ def ensure_night(conn, d):
     return get_night(conn, d)
 
 
-def set_assignment(conn, d, iid, assigned_dose):
+def set_assignment(conn, d, iid, assigned_dose, context=None):
     """Record the plan for one cell. INSERT-ONLY and FROZEN: once a
     (night, intervention) assignment exists it can never be rewritten here.
+
+    context: optional dict of planning provenance (code version, analysis switches,
+    scheduling probability and cap, counts, prior -- see server._plan_context)
+    stored alongside the dose in the audit row, so each night records which
+    scheduler, in which mode, on what evidence, prescribed it.
 
     This is the core integrity guarantee of the experiment: the moment a night's
     dose/option is assigned, that is the historical record of what was prescribed,
@@ -622,10 +627,11 @@ def set_assignment(conn, d, iid, assigned_dose):
         "INSERT INTO assignments (night_date, intervention_id, assigned_dose) "
         "VALUES (?,?,?) ON CONFLICT(night_date, intervention_id) DO NOTHING",
         (d, iid, float(assigned_dose)))
+    ctx = dict(context or {})
     if cur.rowcount:                       # a brand-new cell was created
-        _audit(conn, "assign", d, iid, assigned_dose=float(assigned_dose))
+        _audit(conn, "assign", d, iid, assigned_dose=float(assigned_dose), **ctx)
     else:                                  # the cell already existed -> freeze protected it
-        _audit(conn, "assign_blocked", d, iid, attempted_dose=float(assigned_dose))
+        _audit(conn, "assign_blocked", d, iid, attempted_dose=float(assigned_dose), **ctx)
     conn.commit()
 
 
@@ -650,11 +656,12 @@ def set_night_maximize(conn, d, on):
     conn.commit()
 
 
-def override_assignment(conn, d, iid, dose):
+def override_assignment(conn, d, iid, dose, context=None):
     """Maximize-benefit override of ONE unticked cell: the randomized plan is parked
     in random_dose (kept if already parked) and assigned_dose becomes `dose`. The
     sanctioned exception to the assignment freeze -- reversible via
     restore_assignment, audit-logged, and never touching a cell already ticked.
+    context: planning provenance for the audit row (as in set_assignment).
     Returns True if the cell changed."""
     row = conn.execute("SELECT assigned_dose, taken_dose, random_dose FROM assignments "
                        "WHERE night_date=? AND intervention_id=?", (d, iid)).fetchone()
@@ -666,7 +673,7 @@ def override_assignment(conn, d, iid, dose):
     conn.execute("UPDATE assignments SET random_dose=?, assigned_dose=? "
                  "WHERE night_date=? AND intervention_id=?", (parked, float(dose), d, iid))
     _audit(conn, "maximize_assign", d, iid, before=row["assigned_dose"], after=float(dose),
-           random_dose=parked)
+           random_dose=parked, **dict(context or {}))
     conn.commit()
     return True
 

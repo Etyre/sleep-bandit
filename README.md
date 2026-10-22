@@ -190,6 +190,14 @@ Everything is in `data/sleep_bandit.db`. Tables: `interventions`, `nights`,
 exclusion, completion input, parked randomized dose), `settings`, and an
 append-only `audit_log` recording every write with a millisecond timestamp.
 
+Each planned cell's audit row (`assign`; `maximize_assign` for a maximize-benefit
+override) also records its **planning provenance**: the code version (git commit,
+`+dirty` if the source was modified), the analysis switches in force (recency,
+count maximize, baseline), the scheduling probability before and after the lock-in
+cap, the cap and effective on/off counts, the prior used, and the fitted baseline
+coefficient. So every night says which scheduler, in which mode, on what evidence,
+prescribed it (`server._plan_context`). Rows before 2026-10-22 carry the dose only.
+
 `backup.sh` takes a WAL-safe snapshot with `sqlite3 .backup` into `backups/` and
 keeps the newest 30. The database is committed to git alongside the code in this
 repo; `backups/` is not.

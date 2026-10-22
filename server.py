@@ -16,6 +16,7 @@ import math
 import os
 import secrets
 import statistics
+import subprocess
 import threading
 import time
 import traceback
@@ -56,6 +57,26 @@ AUTOSYNC_MINUTES = 20
 # user files it ("last night" stays last night whether the routine was done before
 # or after midnight). So the current night's date is (now - 4h)'s calendar date.
 NIGHT_ROLLOVER_HOUR = 4
+
+
+def _code_version():
+    """Identify the code that is running, for the planning audit trail: the git
+    commit (short hash) plus "+dirty" if tracked source files differ from it (the
+    database file is ignored -- it always differs). "unknown" outside a checkout."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        run = lambda *a: subprocess.run(["git", *a], cwd=here, capture_output=True,
+                                        text=True, timeout=5)
+        head = run("rev-parse", "--short", "HEAD")
+        if head.returncode != 0:
+            return "unknown"
+        dirty = run("status", "--porcelain", "--", ".", ":!data").stdout.strip()
+        return head.stdout.strip() + ("+dirty" if dirty else "")
+    except Exception:
+        return "unknown"
+
+
+CODE_VERSION = _code_version()   # fixed for the life of the process (restart to pick up code)
 
 
 def today_str():
@@ -248,11 +269,42 @@ def intervention_nights(iv_id, all_nights, metric, negate=False, category=None):
     return nights, n_on, n_off
 
 
+def _mode_flags(conn):
+    """The analysis switches as a flat dict, for the planning audit trail."""
+    return {"recency": recency_enabled(conn), "count_maximize": count_maximize_nights(conn),
+            "baseline": baseline_enabled(conn)}
+
+
+def _plan_context(conn_modes, iv, model, n_on, n_off, lockin_off, pri):
+    """Provenance recorded with every planned cell (audit_log detail, op "assign"):
+    which code and which switches planned it, the scheduling probability the
+    Thompson draw was effectively made at (p_on_raw = P(helps) under the
+    prior-inclusive fit; p_on = after the lock-in cap, exactly as _sched_info
+    reports it), the cap and effective on/off counts in force, the prior used, and
+    the fitted baseline coefficient (None when the baseline switch is off). The
+    assignment itself stays frozen; this only annotates the audit row."""
+    always_on = iv.get("kind") in ("choice", "choice_dose") and not iv.get("test_skip")
+    if always_on:
+        p_raw = p_used = 1.0
+        cap = None
+    else:
+        p_raw = bandit.p_on_estimate(model["post"], model["cols"][iv["id"]]["on"])
+        no_guard = lockin_off or bool(iv.get("no_lockin"))
+        cap = None if no_guard else bandit.lockin_cap(n_on, n_off)
+        p_used = p_raw if cap is None else min(p_raw, cap)
+    return {"code": CODE_VERSION, "modes": conn_modes,
+            "p_on_raw": round(p_raw, 4), "p_on": round(p_used, 4), "cap": cap,
+            "no_lockin": bool(iv.get("no_lockin")) or bool(lockin_off),
+            "n_on": _nn(n_on), "n_off": _nn(n_off), "prior": pri or None,
+            "base_coef": (round(model["base_coef"], 4) if model.get("base_coef") is not None else None)}
+
+
 def ensure_tonight(conn):
     """Make sure today's column exists and every active intervention has a cell.
     Each missing cell is filled by fitting that intervention's own model (on its
     compliant HRV nights) and drawing a Thompson-sampling choice. Additive:
-    existing cells are left untouched so tonight's plan can't be re-rolled."""
+    existing cells are left untouched so tonight's plan can't be re-rolled.
+    Every cell's audit row carries its planning provenance (_plan_context)."""
     d = today_str()
     store.ensure_night(conn, d)
     night = store.get_night(conn, d)
@@ -268,6 +320,7 @@ def ensure_tonight(conn):
         # intervention, never -- release. Weighted mode already keeps the contrast
         # alive by design: old evidence fades, so P(helps) can't lock in for good.
         lockin_off = recency_enabled(conn)
+        modes = _mode_flags(conn)
         for iv in missing:
             if lockin_off:
                 iv = dict(iv, no_lockin=True)
@@ -284,7 +337,8 @@ def ensure_tonight(conn):
             plan = bandit.plan_night(model["post"], model["cols"], [iv],
                                      n_on={iv["id"]: n_on}, n_off={iv["id"]: n_off},
                                      measured={iv["id"]: seen})
-            store.set_assignment(conn, d, iv["id"], plan.get(iv["id"], 0.0))
+            ctx = _plan_context(modes, iv, model, n_on, n_off, lockin_off, pri)
+            store.set_assignment(conn, d, iv["id"], plan.get(iv["id"], 0.0), context=ctx)
     return store.get_night(conn, d)
 
 
@@ -309,9 +363,10 @@ def maximize_tonight(conn, mode):
         store.set_night_maximize(conn, d, False)
         return {"date": d, "plan": []}
     all_nights = analysis_nights_weighted(conn)
+    modes = _mode_flags(conn)
     rows = []
     for iv in store.list_interventions(conn, active_only=True):
-        nights, _, _ = intervention_nights(iv["id"], all_nights, "hrv", category=iv.get("category"))
+        nights, n_on, n_off = intervention_nights(iv["id"], all_nights, "hrv", category=iv.get("category"))
         seen = [n["taken"][iv["id"]] for n in nights if n["taken"].get(iv["id"], 0) > 0]
         model = bandit.fit_model([iv], nights)
         ex = bandit.plan_exploit(model["post"], model["cols"], [iv], measured={iv["id"]: seen})[iv["id"]]
@@ -320,7 +375,11 @@ def maximize_tonight(conn, mode):
                      "dose": ex["dose"], "effect": ex["effect"], "on_effect": ex["on_effect"],
                      "current": a.get("assigned_dose"), "ticked": a.get("taken_dose") is not None})
         if mode == "on":
-            store.override_assignment(conn, d, iv["id"], ex["dose"])
+            # provenance like a planned cell, plus the exploit read-out it came from
+            ctx = {"code": CODE_VERSION, "modes": modes, "n_on": _nn(n_on), "n_off": _nn(n_off),
+                   "on_effect": round(ex["on_effect"], 4), "effect": round(ex["effect"], 4),
+                   "base_coef": (round(model["base_coef"], 4) if model.get("base_coef") is not None else None)}
+            store.override_assignment(conn, d, iv["id"], ex["dose"], context=ctx)
     if mode == "on":
         store.set_night_maximize(conn, d, True)
     return {"date": d, "plan": rows}
