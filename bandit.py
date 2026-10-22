@@ -148,12 +148,16 @@ COARSE_SHARE = 0.8
 
 # Early lock-in guard for the on/off decision. Thompson sampling schedules an
 # intervention ON with probability P(it helps); a few noisy early nights can push
-# that near 1 (or near 0) and the intervention then gets (almost) always the same
-# arm -- so the contrast that would correct the estimate stops being collected.
+# that near 1 and the intervention then gets (almost) always ON -- so the contrast
+# that would correct the estimate stops being collected.
 # The clamp is TIERED on the SMALLER arm's compliant-night count: under 15 nights the
-# scheduling probability is held within [10%, 90%]; under 30, within [5%, 95%]; from
-# 30 up it is unclamped. Between the bounds the decision is the ordinary Thompson
-# draw; the clamp only bites at the extremes. The efficacy read-outs are not
+# scheduling probability is capped at 90%; under 30, at 95%; from 30 up it is
+# unclamped. Below the cap the decision is the ordinary Thompson draw.
+# The guard is ONE-SIDED: there is deliberately no floor. Evidence that something
+# HURTS is acted on at once, however thin -- wrongly tapering off a thing that would
+# have helped costs little, while continuing to take a thing that hurts costs real
+# nights -- so a low P(helps) is followed all the way down to a negligible share.
+# The efficacy read-outs are not
 # affected -- this is scheduling only. An intervention with no_lockin set opts out
 # of the guard entirely (toggled from the Reports page cap indicator).
 LOCKIN_TIERS = ((15, 0.90), (30, 0.95))   # (smaller arm has fewer than N nights, cap)
@@ -644,12 +648,12 @@ def lockin_active(n_on, n_off):
 
 
 def clamp_p_on(p, n_on, n_off):
-    """The scheduling probability actually used: p clamped to [1 - cap, cap] for the
-    tier in force, else p itself."""
+    """The scheduling probability actually used: p capped at the tier in force, else
+    p itself. One-sided -- a low p is never raised (see LOCKIN_TIERS)."""
     cap = lockin_cap(n_on, n_off)
     if p is None or cap is None:
         return p
-    return min(max(p, 1.0 - cap), cap)
+    return min(p, cap)
 
 
 def p_on_estimate(post, on_col, samples=LOCKIN_P_SAMPLES):
@@ -665,8 +669,8 @@ def p_on_estimate(post, on_col, samples=LOCKIN_P_SAMPLES):
 def _decide_on(beta, post, entry, n_on, n_off, no_lockin=False):
     """Stage 1 of planning: is the intervention ON tonight? The ordinary Thompson
     rule is 'on iff the sampled alpha > 0'. While the lock-in guard applies, P(on) is
-    estimated and, if it lies outside the tier's [1 - cap, cap], the decision is a
-    coin at the clamped probability instead; inside the bounds the sample decides.
+    estimated and, if it lies above the tier's cap, the decision is a coin at the
+    cap instead; at or below the cap (however low) the sample decides.
     no_lockin (the per-intervention override) skips the guard entirely."""
     on = beta[entry["on"]] > 0.0
     if no_lockin or not lockin_active(n_on, n_off):

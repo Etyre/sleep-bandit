@@ -72,9 +72,11 @@ heavily shrunk per-dose deviation, so "does it work" is a single well-calibrated
 parameter and "which dose" is a separate question.
 
 **ON or OFF** is decided by one posterior draw: ON if the sampled "helps" effect is
-positive. So P(ON) tracks P(it helps). An **early lock-in guard** keeps that
-probability inside [10%, 90%] until the smaller arm has 15 nights, [5%, 95%] until 30,
-then lets go, so a lucky first week cannot stop the contrast from being collected.
+positive. So P(ON) tracks P(it helps). An **early lock-in guard** caps that
+probability at 90% until the smaller arm has 15 nights, 95% until 30, then lets go,
+so a lucky first week cannot stop the contrast from being collected. The guard is
+one-sided: there is no floor, so evidence that something hurts tapers it off right
+away, even on a small sample.
 
 **Which dose**, once ON, depends on the settings:
 
@@ -108,7 +110,7 @@ valid as the files change.
 | The model (one "helps" effect + shrunk per-dose deviations, Normal-Inverse-Gamma posterior) | `bandit.py` module docstring; `fit_model` | `ON_PRIOR_VAR`, `DOSE_DEV_PRIOR_VAR`, `SIGMA2_PRIOR_A/B`, `MEANINGFUL_EFFECT` |
 | Per-night planning: one Thompson draw, ON/OFF then dose | `plan_night` docstring; `server.ensure_tonight` | — |
 | ON/OFF decision from the sampled "helps" effect | `_decide_on` | — |
-| Early lock-in guard (tiered clamp on P(ON)); per-intervention opt-out | comment above `LOCKIN_TIERS`; `lockin_cap`, `clamp_p_on`, `p_on_estimate` | `LOCKIN_TIERS`, `LOCKIN_P_SAMPLES`, `no_lockin` |
+| Early lock-in guard (tiered cap on P(ON), no floor); per-intervention opt-out | comment above `LOCKIN_TIERS`; `lockin_cap`, `clamp_p_on`, `p_on_estimate` | `LOCKIN_TIERS`, `LOCKIN_P_SAMPLES`, `no_lockin` |
 | Cold-start warm-up: hold the standard dose, ramp exploration quadratically (linearly for time-based) | comment above `WARMUP_ON_NIGHTS` and above `PROBE_SHARE` | `WARMUP_ON_NIGHTS`, `delay_explore` |
 | Slow climb: probe vs. exploit split, one-unit supplement probes, bigger time-based jumps | comment above `PROBE_SHARE`; `_supp_probe`; the slow-climb branch of `plan_night` | `PROBE_SHARE`, `TIME_MAX_JUMP`, `MIN_PROBES` |
 | Minimum viable dose (exploit the smallest dose within 95% of the best) | comment above `MIN_VIABLE_FRAC`; `_min_viable_dose` | `MIN_VIABLE_FRAC` |

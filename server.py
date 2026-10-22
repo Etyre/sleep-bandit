@@ -435,8 +435,9 @@ def _sched_info(iv, all_nights, lockin_off=False):
     prior it equals the measured P(helps); with a prior it starts higher and asymptotes
     to the measured value as nights accumulate. A choice with no 'skip' arm is always
     scheduled. Kept SEPARATE from the efficacy read-outs, which stay prior-free.
-    While the smaller arm is thin the value is clamped by tier (bandit.LOCKIN_TIERS:
-    <15 nights -> [10%, 90%], <30 -> [5%, 95%]), exactly as the planner does -- unless
+    While the smaller arm is thin the value is capped by tier (bandit.LOCKIN_TIERS:
+    <15 nights -> at most 90%, <30 -> at most 95%; no floor on the low side), exactly
+    as the planner does -- unless
     the intervention's no_lockin override is set, or lockin_off says the guard is
     globally disabled (recency mode: decayed counts can't reach the tiers, and
     fading evidence keeps the contrast alive anyway), in which case the raw value
@@ -967,6 +968,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(state_payload(conn), 201)
 
             if path == "/api/cell":
+                # Stale-tab guard: the client says which night it is showing as
+                # Tonight. If that has rolled over since the page loaded, the tick
+                # would land on the wrong night, so refuse it and let the client
+                # refresh. Ticks on older nights (deliberate backfill) still pass:
+                # only the tab's idea of tonight is checked, not the ticked date.
+                ct = body.get("client_tonight")
+                if ct and str(ct) != today_str():
+                    return self._send_json({"error": "stale", "tonight": today_str()}, 409)
                 iid = int(body["intervention_id"])
                 # completion detail for non-checkbox input types, validated against
                 # the intervention's settings: radio -> one of its option ids;

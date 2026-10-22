@@ -4,7 +4,7 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const api = async (path, opts) => {
   const r = await fetch(path, opts);
-  if (!r.ok) throw new Error((await r.text()) || r.statusText);
+  if (!r.ok) { const e = new Error((await r.text()) || r.statusText); e.status = r.status; throw e; }
   return r.status === 204 ? null : r.json();
 };
 const post = (path, body) =>
@@ -372,6 +372,47 @@ function renderGrid() {
 
 let GRID_SCROLL = null;  // remembered horizontal scroll, so re-renders don't jump to Tonight
 
+// ---- stale-tab guard ---------------------------------------------------------
+// The grid is a snapshot: nothing pushes updates to an open tab. A tab left open
+// past the 4 AM rollover keeps showing yesterday as "Tonight", and a tap on it
+// files the tick under yesterday's date (this happened on 2026-09-25: a tab from
+// Wednesday swallowed Thursday's ticks). Two defences:
+//   * every tick carries the date this tab believes is tonight; the server
+//     refuses (409) when that is no longer its tonight, and we refresh instead;
+//   * on focus, on return from the background, and every few minutes while
+//     visible, ask the server for the current state and re-render if Tonight
+//     has moved on. Backfilling older nights on purpose still works: only the
+//     tab's notion of *tonight* is checked, not the date being ticked.
+const stateTonight = () => ((STATE && STATE.nights || []).find((n) => n.is_today) || {}).date;
+let SYNCING = false;
+async function syncTonight() {
+  if (!STATE || SYNCING) return false;
+  SYNCING = true;
+  try {
+    const fresh = await api("/api/state");
+    const now = (fresh.nights.find((n) => n.is_today) || {}).date;
+    if (now === stateTonight()) return false;
+    STATE = fresh; GRID_SCROLL = null;                 // jump to the real Tonight
+    renderRecencySlot(STATE.recency, STATE.count_maximize);
+    renderGrid();
+    return true;
+  } catch (e) {
+    return false;                                      // offline etc.: next trigger retries
+  } finally {
+    SYNCING = false;
+  }
+}
+// A tick the server refused as stale: refresh and tell the user nothing was saved.
+async function handleStaleTick(e) {
+  if (!e || e.status !== 409) return false;
+  await syncTonight();
+  alert("Nothing was saved: this page was still showing an old night as \u201cTonight\u201d. The grid has been refreshed \u2014 please tick again.");
+  return true;
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") syncTonight(); });
+window.addEventListener("focus", () => { syncTonight(); });
+setInterval(() => { if (document.visibilityState === "visible") syncTonight(); }, 5 * 60 * 1000);
+
 // which categories currently show their paused interventions (default: hidden)
 let PAUSED_OPEN = {};
 try { PAUSED_OPEN = JSON.parse(localStorage.getItem("sb.pausedOpen") || "{}") || {}; } catch (e) { PAUSED_OPEN = {}; }
@@ -416,10 +457,12 @@ async function toggleCell(td) {
   const cell = (STATE.cells[td.dataset.date] || {})[td.dataset.iv];
   if (cell) cell.done = done;
   try {
-    await post("/api/cell", { date: td.dataset.date, intervention_id: td.dataset.iv, done });
+    await post("/api/cell", { date: td.dataset.date, intervention_id: td.dataset.iv, done,
+                              client_tonight: stateTonight() });
   } catch (e) {
     td.classList.toggle("done", !done);
     if (cell) cell.done = !done;
+    if (await handleStaleTick(e)) return;
     alert("Could not save: " + e.message);
   }
 }
@@ -434,10 +477,11 @@ async function saveCellRadio(btn) {
   GRID_SCROLL = wrap ? wrap.scrollLeft : null;   // keep our place across the re-render
   try {
     await post("/api/cell", { date: td.dataset.date, intervention_id: td.dataset.iv,
-                              done: value != null, input_value: value });
+                              done: value != null, input_value: value, client_tonight: stateTonight() });
     if (cell) { cell.done = value != null; cell.input_value = value; }
     renderGrid();
   } catch (e) {
+    if (await handleStaleTick(e)) return;
     alert("Could not save: " + e.message);
   }
 }
@@ -457,10 +501,11 @@ async function saveCellQty(inp) {
   const value = v === "" ? null : v;
   try {
     await post("/api/cell", { date: td.dataset.date, intervention_id: td.dataset.iv,
-                              done: value != null, input_value: value });
+                              done: value != null, input_value: value, client_tonight: stateTonight() });
     if (cell) { cell.done = value != null; cell.input_value = value; }
     td.classList.toggle("done", value != null);
   } catch (e) {
+    if (await handleStaleTick(e)) return;
     alert("Could not save: " + e.message);
   }
 }
@@ -659,13 +704,14 @@ function openCapModal(iv) {
   if (iv.no_lockin) {
     $("#cap-text").innerHTML = `The guard is <b>off</b> for <b>${esc(iv.name)}</b>: the planner follows the ` +
       `measured <b>${raw}</b> chance unclamped, even though its smaller arm (${arm}) is still thin.`;
-    $("#cap-hint").textContent = "Turning it back on re-clamps scheduling to 10–90% until the smaller arm has " +
-      "15 nights, then 5–95% until it has 30 — so contrast nights keep being collected while the estimate is thin.";
+    $("#cap-hint").textContent = "Turning it back on caps scheduling at 90% until the smaller arm has " +
+      "15 nights, then 95% until it has 30 — so contrast nights keep being collected while the estimate is thin. " +
+      "There is no floor: a low chance is always followed as measured.";
     $("#cap-toggle").textContent = "Turn the guard back on";
   } else {
     $("#cap-text").innerHTML = `The measured chance that <b>${esc(iv.name)}</b> helps is <b>${raw}</b>, but its ` +
-      `smaller arm has only <b>${arm}</b>, so the planner clamps scheduling to ` +
-      `<b>${pct(iv.sched_tier)} / ${pct(1 - iv.sched_tier)}</b>: a few noisy early nights can't lock the decision ` +
+      `smaller arm has only <b>${arm}</b>, so the planner caps scheduling at ` +
+      `<b>${pct(iv.sched_tier)}</b>: a few noisy early nights can't lock the decision ` +
       `in, and the arm the estimate is short on keeps being sampled.`;
     $("#cap-hint").textContent = "Turning the guard off lets scheduling follow the measured chance immediately. " +
       "The cost: the under-sampled arm grows even more slowly, so the effect estimate stays uncertain for longer. " +
@@ -742,8 +788,8 @@ function reportCard(iv) {
   if (!iv.active) {
     card.appendChild(el("p", "iv-sched muted", "🗓 Paused — not currently scheduled."));
   } else if (iv.p_scheduled != null) {
-    // Early lock-in guard: while the smaller arm is thin the planner clamps this
-    // probability (<15 nights: 10–90%, <30: 5–95%). Say so when it actually bit —
+    // Early lock-in guard: while the smaller arm is thin the planner caps this
+    // probability (<15 nights: 90%, <30: 95%; never floored). Say so when it actually bit —
     // or when the guard is switched off for this intervention while it would
     // otherwise apply. Clicking the marker opens a box to toggle the guard.
     let capNote = "";
@@ -751,13 +797,12 @@ function reportCard(iv) {
       const arm = iv.sched_n_on <= iv.sched_n_off ? `${iv.sched_n_on} on-night${iv.sched_n_on === 1 ? "" : "s"}`
                                                   : `${iv.sched_n_off} off-night${iv.sched_n_off === 1 ? "" : "s"}`;
       if (iv.sched_cap != null) {
-        const hi = iv.p_scheduled_raw > 0.5;
-        const bound = hi ? pct(iv.sched_cap) : pct(1 - iv.sched_cap);
+        const bound = pct(iv.sched_cap);
         capNote = ` <span class="sched-cap" title="Measured chance is ${pct(iv.p_scheduled_raw)}, but with only ${arm} so far ` +
-          `the planner ${hi ? "caps" : "floors"} scheduling at ${bound} so a few noisy early nights can't lock the decision in. ` +
-          `The limit is ${pct(iv.sched_cap)} / ${pct(1 - iv.sched_cap)} until the smaller arm has 15 nights, then 95% / 5% until it has 30.` +
+          `the planner caps scheduling at ${bound} so a few noisy early nights can't lock the decision in. ` +
+          `The cap is 90% until the smaller arm has 15 nights, then 95% until it has 30. There is no floor.` +
           `${READ_ONLY ? "" : " Click to adjust."}">` +
-          `${hi ? "capped" : "floored"} at ${bound} · ${arm}</span>`;
+          `capped at ${bound} · ${arm}</span>`;
       } else {
         capNote = ` <span class="sched-cap cap-off" title="The early lock-in guard is switched off for this intervention: ` +
           `scheduling follows the measured ${pct(iv.p_scheduled_raw)} unclamped even though the smaller arm has only ${arm}.` +
