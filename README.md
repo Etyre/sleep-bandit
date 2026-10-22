@@ -126,6 +126,7 @@ valid as the files change.
 | Tonight's pending cell follows setting changes (new bounds / standard dose; a removed option) | `server.reconcile_tonight_bounds`, `server.reconcile_tonight_options` | — |
 | Which nights count: compliance rule, per-cell and per-category exclusions | `server.intervention_nights` docstring | — |
 | Recency weighting of evidence and effective counts | comment above `RECENCY_HALF_LIFE_DAYS`; `apply_recency` | `RECENCY_HALF_LIFE_DAYS` |
+| Baseline-drift adjustment: each night's ±7-day local baseline as a covariate, in fits, averages and scheduling | comment above `BASE_PRIOR_VAR`; comment above `server.BASELINE_WINDOW_DAYS`; `server.attach_baselines` | `BASE_PRIOR_VAR`, `BASELINE_WINDOW_DAYS`, `BASELINE_MIN_NIGHTS`; header switch `baseline_adjust` |
 | Night rollover at 4 AM | `server.today_str` | `NIGHT_ROLLOVER_HOUR` |
 | Pairwise interactions (Reports) | comment above `INTERACTION_PRIOR_VAR`; `pair_interaction` | `INTERACTION_PRIOR_VAR`, `INTERACTION_SAMPLES` |
 | Deterministic report read-outs (seeded Monte Carlo) | comment above `READOUT_SEED` | `READOUT_SAMPLES`, `READOUT_SEED` |
@@ -143,6 +144,15 @@ two modules.
   was ill").
 - **Recency weighting** (header switch) weights every night by 0.5^(age / 60 days)
   in both the model and the effective counts, and disables the lock-in guard.
+- **Adjust for baseline drift** (header switch) gives every night a local baseline,
+  the average of the same metric over the 7 days before and after (the night itself
+  excluded), and conditions every fit on it. An on/off comparison is only fair when
+  the on- and off-nights come from similar weeks; because scheduling is adaptive, an
+  intervention that locks in early collects its few off nights in a cluster, and a
+  bad month at the start then reads as "it helped". With the switch on, the model can
+  read that month as drift instead. Report averages become baseline-adjusted (same
+  units, flagged), the interaction tables too, and the planner schedules from the
+  same fit. Nights with fewer than 4 neighbours get no baseline and sit at the centre.
 
 Reports show effects on HRV (higher is better) and lowest resting HR (lower is
 better), each with a model 90% interval and a probability of a real benefit. A

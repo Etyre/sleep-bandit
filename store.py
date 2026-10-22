@@ -895,6 +895,17 @@ def completed_nights(conn):
     return out
 
 
+def metric_series(conn):
+    """Every recorded night's metrics, {date: {metric: value}}, backfilled history
+    included. Used to build each night's local baseline (server.attach_baselines)."""
+    out = {}
+    for r in conn.execute("SELECT date, hrv, lrhr, tst, lat, eff FROM nights "
+                          "WHERE hrv IS NOT NULL OR lrhr IS NOT NULL OR tst IS NOT NULL "
+                          "OR lat IS NOT NULL OR eff IS NOT NULL"):
+        out[r["date"]] = {m: r[m] for m in ("hrv", "lrhr", "tst", "lat", "eff")}
+    return out
+
+
 def hrv_series(conn):
     """Every night with a recorded HRV as (date, hrv), oldest first."""
     return [(r["date"], r["hrv"]) for r in conn.execute(

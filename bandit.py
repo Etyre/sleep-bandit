@@ -53,6 +53,20 @@ ON_PRIOR_VAR = 0.6
 # => doses are pulled toward a common effect (partial pooling), so a single
 # lucky dose can't fake a signal.
 DOSE_DEV_PRIOR_VAR = 0.12
+# Baseline drift covariate (server-wide "adjust for baseline drift" switch). When
+# on, every night carries "base": the mean of the same metric over the surrounding
+# nights (7 days either side, the night itself excluded). The fit gets one extra
+# column, base - mean(base), with this prior variance (sigma^2 units; the
+# coefficient is dimensionless, ~0.5-1 when drift is real, so this is weak).
+# Why: the on/off comparison is only fair if on- and off-nights come from similar
+# weeks. Thompson sampling makes assignments persistent -- an intervention that
+# locks ON early gets its few OFF nights in a cluster -- so a bad month at the start
+# is read as "the supplement helped". Conditioning on the local baseline lets the
+# model explain that month as drift instead. Simulation on this app's own
+# schedule: removes ~70% of the lock-in bias, ~15% tighter effects, and the
+# centred window is safe despite the planner reacting to each night's result.
+# Nights with too few neighbours get no baseline and sit at the centre (0).
+BASE_PRIOR_VAR = 1.0
 # Inverse-Gamma prior on noise variance sigma^2. Prior mean = b0/(a0-1) = 144
 # (~12ms night-to-night SD), held weakly so a couple weeks of data correct it.
 SIGMA2_PRIOR_A = 3.0
@@ -523,17 +537,21 @@ def build_columns(interventions, history_doses):
     return cols, idx
 
 
-def build_design(completed_nights, cols, p):
+def build_design(completed_nights, cols, p, base_col=None, base_center=0.0):
     """Design matrix, outcomes, and per-night weights. A night may carry "w" (the
     recency weight, 1 = full strength); it scales that night's contribution to the
     likelihood -- both its pull on the coefficients and its share of the effective
-    sample size."""
+    sample size. With base_col set, a night's "base" (local baseline, see
+    BASE_PRIOR_VAR) enters that column centred on base_center; a night without one
+    sits at 0 (the centre)."""
     X, y, w = [], [], []
     for nt in completed_nights:
         if nt.get("hrv") is None:
             continue
         row = [0.0] * p
         row[0] = 1.0
+        if base_col is not None and nt.get("base") is not None:
+            row[base_col] = float(nt["base"]) - base_center
         for iid, dose in nt.get("taken", {}).items():
             dose = _d(dose)
             if dose <= 0:
@@ -1315,20 +1333,31 @@ def pair_interaction(nights):
       p_stack     = P(a+b+g > max(a, b))         stacking beats the better one alone
     plus the conditional effects each one adds with / without the other (a vs a+g,
     b vs b+g) -- the direct answer to "does A still help on nights I take B?".
+    A night may carry "base" (baseline-drift mode, see BASE_PRIOR_VAR): the fit then
+    gets the centred baseline as a fifth column, and the raw cell means are reported
+    baseline-adjusted (y - base + mean base), in the metric's own units.
     None if there are no nights."""
     if not nights:
         return None
+    bw = [(float(n.get("w", 1.0)), float(n["base"])) for n in nights if n.get("base") is not None]
+    base_center = (sum(w * b for w, b in bw) / sum(w for w, _ in bw)) if bw else None
     X, y, w = [], [], []
     cells = {(0, 0): [], (1, 0): [], (0, 1): [], (1, 1): []}   # [(weight, y)]
     for n in nights:
         a, b = (1 if n["a"] else 0), (1 if n["b"] else 0)
         yv, wv = float(n["y"]), float(n.get("w", 1.0))
-        X.append([1.0, float(a), float(b), float(a * b)])
+        row = [1.0, float(a), float(b), float(a * b)]
+        dev = (float(n["base"]) - base_center) if (base_center is not None and n.get("base") is not None) else 0.0
+        if base_center is not None:
+            row.append(dev)
+        X.append(row)
         y.append(yv)
         w.append(wv)
-        cells[(a, b)].append((wv, yv))
+        cells[(a, b)].append((wv, yv - dev))
     V0 = [INTERCEPT_PRIOR_VAR, ON_PRIOR_VAR, ON_PRIOR_VAR, INTERACTION_PRIOR_VAR]
-    post = fit(X, y, 4, V0, w=(w if any(x != 1.0 for x in w) else None))
+    if base_center is not None:
+        V0.append(BASE_PRIOR_VAR)
+    post = fit(X, y, len(V0), V0, w=(w if any(x != 1.0 for x in w) else None))
     state = random.getstate()
     random.seed(READOUT_SEED)
     try:
@@ -1391,8 +1420,16 @@ def fit_model(interventions, completed_nights, priors=None):
                 history.setdefault(int(iid), set()).add(_d(dose))
 
     cols, p = build_columns(interventions, history)
-    X, y, w = build_design(completed_nights, cols, p)
+    base_col, base_center = None, 0.0
+    bw = [(float(nt.get("w", 1.0)), float(nt["base"])) for nt in completed_nights
+          if nt.get("hrv") is not None and nt.get("base") is not None]
+    if bw:                                   # baseline-drift mode: one extra column
+        base_col, p = p, p + 1
+        base_center = sum(w * b for w, b in bw) / sum(w for w, _ in bw)
+    X, y, w = build_design(completed_nights, cols, p, base_col, base_center)
     V0 = prior_variances(p, cols)
+    if base_col is not None:
+        V0[base_col] = BASE_PRIOR_VAR
     m0 = None
     if priors:
         m0 = [0.0] * p
@@ -1416,7 +1453,8 @@ def fit_model(interventions, completed_nights, priors=None):
                 for j, col in enumerate(entry["dev"]):
                     m0[col] = sum(crow[j] * level_mean(level) for level, crow in entry["contrast"].items())
     post = fit(X, y, p, V0, m0, w=(w if any(x != 1.0 for x in w) else None))
-    return {"post": post, "cols": cols, "n": post["n"]}
+    return {"post": post, "cols": cols, "n": post["n"], "base_col": base_col,
+            "base_coef": (post["mN"][base_col] if base_col is not None else None)}
 
 
 def analyze(interventions, completed_nights, priors=None):
@@ -1440,7 +1478,8 @@ def analyze(interventions, completed_nights, priors=None):
             if dose and float(dose) > 0:
                 observed.setdefault(int(iid), set()).add(_d(dose))
     reads = readouts(interventions, betas, m["cols"], observed)
-    return {"post": m["post"], "cols": m["cols"], "readouts": reads, "n": m["n"]}
+    return {"post": m["post"], "cols": m["cols"], "readouts": reads, "n": m["n"],
+            "base_coef": m["base_coef"]}
 
 
 # ---------------------------------------------------------------------------

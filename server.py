@@ -79,6 +79,21 @@ def today_str():
 # ---------------------------------------------------------------------------
 RECENCY_HALF_LIFE_DAYS = 60.0
 
+# ---------------------------------------------------------------------------
+# Baseline-drift adjustment (server-wide mode, toggled from the header switch).
+# When on, every night gets, per metric, a local baseline: the mean of that
+# metric over the nights within BASELINE_WINDOW_DAYS either side (the night
+# itself excluded; backfilled Oura history counts, so the first experiment
+# week has one too). The model takes it as a covariate (bandit.BASE_PRIOR_VAR
+# explains why), the Reports averages are shown baseline-adjusted, and the
+# nightly planner schedules from the same fit. A night with fewer than
+# BASELINE_MIN_NIGHTS neighbours gets no baseline and sits at the centre.
+# Setting key: baseline_adjust ("1" = on). Default off.
+# ---------------------------------------------------------------------------
+BASELINE_WINDOW_DAYS = 7
+BASELINE_MIN_NIGHTS = 4
+BASELINE_METRICS = ("hrv", "lrhr", "tst", "lat", "eff")
+
 
 def recency_enabled(conn):
     return store.get_setting(conn, "recency_weighting") == "1"
@@ -91,11 +106,55 @@ def count_maximize_nights(conn):
     return store.get_setting(conn, "count_maximize_nights") == "1"
 
 
+def baseline_enabled(conn):
+    """Whether the local-baseline covariate is in force (see BASELINE_WINDOW_DAYS)."""
+    return store.get_setting(conn, "baseline_adjust") == "1"
+
+
 def analysis_modes(conn):
     """The server-wide analysis switches, as every payload reports them."""
     return {"recency": {"enabled": recency_enabled(conn),
                         "half_life_days": RECENCY_HALF_LIFE_DAYS},
-            "count_maximize": count_maximize_nights(conn)}
+            "count_maximize": count_maximize_nights(conn),
+            "baseline": {"enabled": baseline_enabled(conn),
+                         "window_days": BASELINE_WINDOW_DAYS,
+                         "min_nights": BASELINE_MIN_NIGHTS}}
+
+
+def attach_baselines(nights, series):
+    """Give every analysis night a per-metric local baseline, n["base_<metric>"]:
+    the mean of that metric over the recorded nights within BASELINE_WINDOW_DAYS
+    either side, excluding the night itself; None with fewer than
+    BASELINE_MIN_NIGHTS neighbours. series is store.metric_series (all recorded
+    nights, so maximize nights and backfilled history count as neighbours even
+    when they are not evidence). Mutates and returns the list."""
+    import bisect
+    by_metric = {}
+    for m in BASELINE_METRICS:
+        pts = sorted((d, float(v[m])) for d, v in series.items() if v.get(m) is not None)
+        by_metric[m] = ([d for d, _ in pts], [v for _, v in pts])
+    span = timedelta(days=BASELINE_WINDOW_DAYS)
+    for n in nights:
+        d0 = date.fromisoformat(n["date"])
+        lo, hi = (d0 - span).isoformat(), (d0 + span).isoformat()
+        for m in BASELINE_METRICS:
+            dates, vals = by_metric[m]
+            i, j = bisect.bisect_left(dates, lo), bisect.bisect_right(dates, hi)
+            nb = [v for d, v in zip(dates[i:j], vals[i:j]) if d != n["date"]]
+            n["base_" + m] = (sum(nb) / len(nb)) if len(nb) >= BASELINE_MIN_NIGHTS else None
+    return nights
+
+
+def _baseline_adjusted(triples):
+    """[(w, value, baseline-or-None)] -> [(w, adjusted value)] in the same units:
+    value - baseline + (weighted mean baseline), so the figures stay on the
+    metric's own scale (an average HRV, not a deviation). Nights without a
+    baseline are left as they are (= at the mean). Identity when no night has one."""
+    have = [(w, b) for w, _, b in triples if b is not None]
+    if not have:
+        return [(w, v) for w, v, _ in triples]
+    c = sum(w * b for w, b in have) / sum(w for w, _ in have)
+    return [(w, (v - b + c) if b is not None else v) for w, v, b in triples]
 
 
 def apply_recency(nights):
@@ -114,6 +173,8 @@ def apply_recency(nights):
 def analysis_nights_weighted(conn):
     """store.analysis_nights, with recency weights attached when the mode is on."""
     nights = store.analysis_nights(conn, count_maximize=count_maximize_nights(conn))
+    if baseline_enabled(conn):
+        attach_baselines(nights, store.metric_series(conn))
     return apply_recency(nights) if recency_enabled(conn) else nights
 
 
@@ -147,7 +208,11 @@ def intervention_nights(iv_id, all_nights, metric, negate=False, category=None):
     category: when given (one of store.CATEGORIES), nights the user flagged as
     excluded for that category are dropped entirely (neither on nor off). A cell the
     user excluded individually (e.g. assigned OFF but done anyway) is likewise
-    dropped -- for this intervention only."""
+    dropped -- for this intervention only.
+
+    In baseline-drift mode each night also carries "base", its local baseline for
+    this metric (negated like the value when negate is set), or None if it has
+    none; the engine takes it as a covariate (bandit.BASE_PRIOR_VAR)."""
     nights, n_on, n_off = [], 0.0, 0.0
     for n in all_nights:
         if category and n.get("excl_" + category):   # user excluded this night's data
@@ -174,8 +239,12 @@ def intervention_nights(iv_id, all_nights, metric, negate=False, category=None):
         else:                                    # OFF -> randomized control
             dose = 0.0
             n_off += w
-        nights.append({"hrv": (-float(val) if negate else float(val)),
-                       "taken": {iv_id: dose}, "w": w})
+        row = {"hrv": (-float(val) if negate else float(val)),
+               "taken": {iv_id: dose}, "w": w}
+        if ("base_" + metric) in n:
+            b = n["base_" + metric]
+            row["base"] = None if b is None else (-b if negate else b)
+        nights.append(row)
     return nights, n_on, n_off
 
 
@@ -395,27 +464,30 @@ def _readout(iv, all_nights, metric, negate):
     # Raw (non-modeled) average of the metric on ON- vs OFF-nights, in native units,
     # recency-weighted when the mode is on. intervention_nights stores the value as
     # +val (HRV) or -val (LRHR, negated for the engine), so undo the negation here
-    # to report the real HRV / resting-HR numbers.
+    # to report the real HRV / resting-HR numbers. In baseline-drift mode the
+    # averages are baseline-adjusted (value - its local baseline + the mean
+    # baseline), still on the metric's own scale.
     iid = iv["id"]
 
     def wmean(pairs):
         s = sum(w for w, _ in pairs)
         return (sum(w * v for w, v in pairs) / s) if s > 0 else None
 
-    on_vals = [(n.get("w", 1.0), -n["hrv"] if negate else n["hrv"])
-               for n in nights if n["taken"].get(iid, 0) > 0]
-    off_vals = [(n.get("w", 1.0), -n["hrv"] if negate else n["hrv"])
-                for n in nights if n["taken"].get(iid, 0) == 0]
+    sgn = -1.0 if negate else 1.0
+    adj = _baseline_adjusted([(n.get("w", 1.0), sgn * n["hrv"],
+                               (None if n.get("base") is None else sgn * n["base"]))
+                              for n in nights])
+    doses = [n["taken"].get(iid, 0) for n in nights]
+    on_vals = [wv for wv, d in zip(adj, doses) if d > 0]
+    off_vals = [wv for wv, d in zip(adj, doses) if d == 0]
     r["on_mean"] = wmean(on_vals)
     r["off_mean"] = wmean(off_vals)
     # Same raw averages per dose/option (an always-on choice has no off baseline,
     # so its report shows these instead of a modeled effect).
     by_dose = {}
-    for n in nights:
-        dose = n["taken"].get(iid, 0)
+    for wv, dose in zip(adj, doses):
         if dose > 0:
-            by_dose.setdefault(round(dose, 6), []).append(
-                (n.get("w", 1.0), -n["hrv"] if negate else n["hrv"]))
+            by_dose.setdefault(round(dose, 6), []).append(wv)
     for row in r.get("doses", []):
         vals = by_dose.get(round(row["dose"], 6), [])
         row["raw_mean"] = wmean(vals)
@@ -577,9 +649,19 @@ def _pair_nights(iv_a, iv_b, all_nights, metric, negate):
         sa, sb = _on_state(n, iv_a["id"]), _on_state(n, iv_b["id"])
         if sa is None or sb is None:
             continue
-        out.append({"y": (-float(val) if negate else float(val)), "a": sa, "b": sb,
-                    "w": float(n.get("w", 1.0))})
+        out.append(_pair_row(n, metric, negate, sa, sb))
     return out
+
+
+def _pair_row(n, metric, negate, sa, sb):
+    """One night shaped for bandit.pair_interaction, carrying its local baseline
+    (negated like the value) in baseline-drift mode."""
+    row = {"y": (-float(n[metric]) if negate else float(n[metric])), "a": sa, "b": sb,
+           "w": float(n.get("w", 1.0))}
+    if ("base_" + metric) in n:
+        b = n["base_" + metric]
+        row["base"] = None if b is None else (-b if negate else b)
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -651,8 +733,7 @@ def _pair_nights_state(iv_a, src_iv, spec, all_nights, metric, negate):
         sb = _behavior_state(n, src_iv["id"], spec)
         if sa is None or sb is None:
             continue
-        out.append({"y": (-float(val) if negate else float(val)), "a": sa, "b": sb,
-                    "w": float(n.get("w", 1.0))})
+        out.append(_pair_row(n, metric, negate, sa, sb))
     return out
 
 
@@ -677,7 +758,15 @@ def _observational_rows(iv, all_nights):
             w = float(n.get("w", 1.0))
             for m in pts:
                 if n.get(m) is not None:
-                    pts[m][s["key"]].append((w, float(n[m])))
+                    pts[m][s["key"]].append((w, float(n[m]), n.get("base_" + m)))
+    # baseline-drift mode: adjust each metric's values across all its states at
+    # once (one common centre), so the states stay comparable with each other
+    for m in pts:
+        flat = [(k, t) for k, v in pts[m].items() for t in v]
+        adj = _baseline_adjusted([t for _, t in flat])
+        pts[m] = {k: [] for k in pts[m]}
+        for (k, _), wv in zip(flat, adj):
+            pts[m][k].append(wv)
     # P(best) among the states: chance this behavior has the highest average HRV
     # (lowest resting HR), given the night-to-night noise. Ranks averages only --
     # correlational, like the rest of the section.
@@ -1035,6 +1124,16 @@ class Handler(BaseHTTPRequestHandler):
                 on = bool(body.get("enabled"))
                 store.set_setting(conn, "recency_weighting", "1" if on else None)
                 store._audit(conn, "set_recency", enabled=on)
+                conn.commit()
+                return self._send_json(reports_payload(conn))
+
+            if path == "/api/baseline":
+                # server-wide: condition every fit on each night's local baseline
+                # (see BASELINE_WINDOW_DAYS). Drives the Reports numbers AND the
+                # live bandit, so it lives in the DB, not the browser.
+                on = bool(body.get("enabled"))
+                store.set_setting(conn, "baseline_adjust", "1" if on else None)
+                store._audit(conn, "set_baseline_adjust", enabled=on)
                 conn.commit()
                 return self._send_json(reports_payload(conn))
 

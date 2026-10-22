@@ -168,7 +168,7 @@ function ivMeta(iv) {
 // =====================================================================
 async function loadGrid() {
   STATE = await api("/api/state");
-  renderRecencySlot(STATE.recency, STATE.count_maximize);
+  renderRecencySlot(STATE.recency, STATE.count_maximize, STATE.baseline);
   renderGrid();
 }
 
@@ -393,7 +393,7 @@ async function syncTonight() {
     const now = (fresh.nights.find((n) => n.is_today) || {}).date;
     if (now === stateTonight()) return false;
     STATE = fresh; GRID_SCROLL = null;                 // jump to the real Tonight
-    renderRecencySlot(STATE.recency, STATE.count_maximize);
+    renderRecencySlot(STATE.recency, STATE.count_maximize, STATE.baseline);
     renderGrid();
     return true;
   } catch (e) {
@@ -573,6 +573,18 @@ let RECENCY_BUSY = false;   // a toggle request is in flight; ignore re-clicks u
 // Whether maximize-benefit (non-randomized) nights count toward results (mirrors
 // the server-side setting; default off).
 let COUNT_MAX_ON = false;
+// Whether fits are conditioned on each night's local baseline (mirrors the
+// server-side setting; default off). When on, the averages shown on this page are
+// baseline-adjusted and are flagged as such.
+let BASELINE_ON = false;
+let BASELINE_DAYS = 7;
+// label suffix for an average that is baseline-adjusted in this mode
+function baseNote() { return BASELINE_ON ? " (baseline-adj.)" : ""; }
+function baseFlag() {
+  return BASELINE_ON
+    ? ` <span class="adj-flag" title="Each night's value is compared with the average of the surrounding ±${BASELINE_DAYS} days, so a good or bad stretch isn't credited to whatever happened to be on. Averages shown are baseline-adjusted (value − its local baseline + the overall mean), in the usual units.">baseline-adjusted — averages are relative to each night's ±${BASELINE_DAYS}-day baseline</span>`
+    : "";
+}
 
 async function loadReports() {
   const box = $("#reports-body");
@@ -586,12 +598,13 @@ async function loadReports() {
 function renderReports(data) {
   const box = $("#reports-body");
   RECENCY_ON = !!(data.recency && data.recency.enabled);
-  renderRecencySlot(data.recency, data.count_maximize);
+  renderRecencySlot(data.recency, data.count_maximize, data.baseline);
   box.innerHTML = "";
   box.appendChild(el("p", "rep-stat", data.n_completed === 0
     ? "No nights logged yet — reports fill in as you enter your HRV on the Tracker."
     : `Based on <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}` +
       (RECENCY_ON ? ` <span class="adj-flag">recency-weighted — counts shown are adjusted</span>` : "") +
+      baseFlag() +
       `. “Effect” is the change in HRV from taking the intervention, in your HRV units. Anything reliably positive is worth keeping — even a small effect.`));
   if (data.hrv_trend) box.appendChild(hrvTrendCard(data.hrv_trend));
   if (!data.interventions.length) {
@@ -613,12 +626,18 @@ function renderReports(data) {
 // Server-wide mode: when on, every night is weighted by 0.5^(age/half-life) in
 // BOTH the read-outs and the live bandit (Thompson planning, warm-up, lock-in
 // guard). Values become weighted means, sample sizes become effective counts.
-function renderRecencySlot(recency, countMax) {
+function renderRecencySlot(recency, countMax, baseline) {
   if (recency) RECENCY_ON = !!recency.enabled;
   if (countMax !== undefined) COUNT_MAX_ON = !!countMax;
+  if (baseline) { BASELINE_ON = !!baseline.enabled; BASELINE_DAYS = baseline.window_days || BASELINE_DAYS; }
   const slot = $("#recency-slot");
   if (!slot) return;
   const hl = Math.round((recency && recency.half_life_days) || 30);
+  const baseTip = `Each night is compared with its own local baseline: the average of the same metric over the ` +
+    `${BASELINE_DAYS} days before and ${BASELINE_DAYS} after (the night itself excluded). The model takes that baseline ` +
+    `as a covariate, so a good or bad stretch is read as drift rather than credited to whatever happened to be on ` +
+    `— the fix for an intervention that locked in early and got its few off nights in one bad month. ` +
+    `Averages on the Reports page become baseline-adjusted (flagged), and the nightly planner schedules from the same fit.`;
   const tip = `Each night's datapoint — on- and off-nights alike — is weighted by how recent it is, ` +
     `halving every ${hl} days. The weights scale both the measured values and the effective sample sizes ` +
     `(shown as adjusted counts on the Reports page), and the nightly planner schedules from the same ` +
@@ -631,7 +650,8 @@ function renderRecencySlot(recency, countMax) {
   if (READ_ONLY) {
     slot.innerHTML = (RECENCY_ON
       ? `<span class="recency-badge" title="${esc(tip)}">⏳ recency weighting on · ${hl}-day half-life</span>` : "") +
-      (COUNT_MAX_ON ? "" : `<span class="recency-badge" title="${esc(maxTip)}">⭐ maximize nights not counted</span>`);
+      (COUNT_MAX_ON ? "" : `<span class="recency-badge" title="${esc(maxTip)}">⭐ maximize nights not counted</span>`) +
+      (BASELINE_ON ? `<span class="recency-badge" title="${esc(baseTip)}">📐 baseline-adjusted · ±${BASELINE_DAYS} days</span>` : "");
     return;
   }
   slot.innerHTML =
@@ -642,7 +662,35 @@ function renderRecencySlot(recency, countMax) {
     `<label class="recency-label" title="${esc(maxTip)}">` +
     `<span>⭐ Count maximize nights</span>` +
     `<span class="switch"><input type="checkbox" id="count-max-toggle"${COUNT_MAX_ON ? " checked" : ""}>` +
+    `<span class="knob"></span></span></label>` +
+    `<label class="recency-label" title="${esc(baseTip)}">` +
+    `<span>📐 Adjust for baseline drift</span>` +
+    `<span class="switch"><input type="checkbox" id="baseline-toggle"${BASELINE_ON ? " checked" : ""}>` +
     `<span class="knob"></span></span></label>`;
+  const restore = () => renderRecencySlot({ enabled: RECENCY_ON, half_life_days: hl }, COUNT_MAX_ON,
+                                          { enabled: BASELINE_ON, window_days: BASELINE_DAYS });
+  const refreshViews = (fresh) => {
+    if (!$("#view-reports").hidden) {
+      if (!$("#reports-body").hidden) renderReports(fresh);
+      else loadInteractions();
+    }
+  };
+  $("#baseline-toggle").addEventListener("change", async (e) => {
+    if (RECENCY_BUSY) { e.target.checked = BASELINE_ON; return; }
+    RECENCY_BUSY = true;
+    const enabled = e.target.checked;
+    e.target.disabled = true;
+    try {
+      const fresh = await post("/api/baseline", { enabled });   // returns the reports payload
+      renderRecencySlot(fresh.recency, fresh.count_maximize, fresh.baseline);
+      refreshViews(fresh);
+    } catch (err) {
+      alert("Could not switch baseline adjustment: " + err.message);
+      restore();
+    } finally {
+      RECENCY_BUSY = false;
+    }
+  });
   $("#count-max-toggle").addEventListener("change", async (e) => {
     if (RECENCY_BUSY) { e.target.checked = COUNT_MAX_ON; return; }
     RECENCY_BUSY = true;
@@ -650,16 +698,12 @@ function renderRecencySlot(recency, countMax) {
     e.target.disabled = true;
     try {
       const fresh = await post("/api/count_maximize", { enabled });   // returns the reports payload
-      renderRecencySlot(fresh.recency, fresh.count_maximize);
-      if (!$("#view-reports").hidden) {
-        if (!$("#reports-body").hidden) renderReports(fresh);
-        else loadInteractions();
-      } else if (STATE) {
-        renderGrid();   // past maximize nights dim / undim
-      }
+      renderRecencySlot(fresh.recency, fresh.count_maximize, fresh.baseline);
+      if (!$("#view-reports").hidden) refreshViews(fresh);
+      else if (STATE) renderGrid();   // past maximize nights dim / undim
     } catch (err) {
       alert("Could not switch maximize-night counting: " + err.message);
-      renderRecencySlot({ enabled: RECENCY_ON, half_life_days: hl }, COUNT_MAX_ON);
+      restore();
     } finally {
       RECENCY_BUSY = false;
     }
@@ -671,15 +715,11 @@ function renderRecencySlot(recency, countMax) {
     e.target.disabled = true;
     try {
       const fresh = await post("/api/recency", { enabled });   // returns the reports payload
-      renderRecencySlot(fresh.recency, fresh.count_maximize);
-      // if a reports subview is open it shows adjusted numbers — refresh it
-      if (!$("#view-reports").hidden) {
-        if (!$("#reports-body").hidden) renderReports(fresh);
-        else loadInteractions();
-      }
+      renderRecencySlot(fresh.recency, fresh.count_maximize, fresh.baseline);
+      refreshViews(fresh);   // an open reports subview shows adjusted numbers — refresh it
     } catch (err) {
       alert("Could not switch recency weighting: " + err.message);
-      renderRecencySlot({ enabled: RECENCY_ON, half_life_days: hl }, COUNT_MAX_ON);
+      restore();
     } finally {
       RECENCY_BUSY = false;
     }
@@ -854,7 +894,7 @@ function reportCard(iv) {
       const right = el("div", "iv-graph");
       if ((r.doses || []).length) {
         right.appendChild(el("p", "chart-cap",
-          'Option → HRV change vs skipping · <span class="mk-dot">●</span> raw mean · <span class="mk-ci">│</span> model 90% CI'));
+          `Option → HRV change vs skipping${baseNote()} · <span class="mk-dot">●</span> raw mean · <span class="mk-ci">│</span> model 90% CI`));
         right.appendChild(optionChart(iv, r.doses, r));
       }
       body.appendChild(right);
@@ -876,7 +916,7 @@ function reportCard(iv) {
         `Based on ${dataNote}`));
       if (doses.length) {
         const table = el("table", "dose-table");
-        table.innerHTML = "<tr><th>Option</th><th>Avg HRV</th><th>Avg resting HR</th><th>P(best)</th><th></th></tr>";
+        table.innerHTML = `<tr><th>Option</th><th>Avg HRV${baseNote()}</th><th>Avg resting HR${baseNote()}</th><th>P(best)</th><th></th></tr>`;
         for (const d of doses) {
           const rec = sameLevel(d.dose, r.recommended_dose) && r.recommended_dose > 0;
           table.appendChild(choiceRow(d, lrByOpt.get(Number(d.dose).toFixed(6)),
@@ -899,7 +939,7 @@ function reportCard(iv) {
       if ((r.doses || []).length) {
         const showRec = enoughForDoseRec(r);
         right.appendChild(el("p", "chart-cap",
-          'Dose → HRV change over baseline · <span class="mk-dot">●</span> raw mean · <span class="mk-ci">│</span> model 90% CI'));
+          `Dose → HRV change vs off nights${baseNote()} · <span class="mk-dot">●</span> raw mean · <span class="mk-ci">│</span> model 90% CI`));
         right.appendChild(doseChart(iv, r.doses, r, showRec));
         if (!showRec) {
           right.appendChild(el("p", "iv-meta",
@@ -924,7 +964,7 @@ function reportCard(iv) {
     head.appendChild(flag);
     card.appendChild(head);
     const t = el("table", "dose-table");
-    t.innerHTML = `<tr><th>Behavior</th><th>Avg HRV</th><th>Avg resting HR</th><th>P(best)</th><th></th></tr>`;
+    t.innerHTML = `<tr><th>Behavior</th><th>Avg HRV${baseNote()}</th><th>Avg resting HR${baseNote()}</th><th>P(best)</th><th></th></tr>`;
     t.querySelectorAll("th")[3].title = "Chance this behavior has the highest average HRV of the " +
       "behaviors listed, given the night-to-night noise in your data. Ranks averages only — " +
       "it inherits the correlational caveat above.";
@@ -979,7 +1019,7 @@ function appendLat(card, iv) {
   const cls = delta <= 0 ? "pos" : "neg";
   const label = isChoice ? "Sleep latency — any option vs skipping" : "Sleep latency";
   const avgs = (re.on_mean != null && re.off_mean != null)
-    ? ` Avg <b>${avg1(re.on_mean)} min</b> on / <b>${avg1(re.off_mean)} min</b> off.` : "";
+    ? ` Avg${baseNote()} <b>${avg1(re.on_mean)} min</b> on / <b>${avg1(re.off_mean)} min</b> off.` : "";
   card.appendChild(el("p", "iv-meta eff-line",
     `⏱ <b>${label}</b>: <span class="effect ${cls}">${signed(delta)}</span> min ` +
     `model CI <span class="ci">[${signed(lo)}, ${signed(hi)}]</span> ` +
@@ -1006,7 +1046,7 @@ function appendTst(card, iv) {
   const hm = (h) => { const m = Math.round(h * 60); return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`; };
   const mins = (h) => (h >= 0 ? "+" : "−") + Math.round(Math.abs(h) * 60) + " min";
   const avgs = (re.on_mean != null && re.off_mean != null)
-    ? ` Avg <b>${hm(re.on_mean)}</b> on / <b>${hm(re.off_mean)}</b> off.` : "";
+    ? ` Avg${baseNote()} <b>${hm(re.on_mean)}</b> on / <b>${hm(re.off_mean)}</b> off.` : "";
   card.appendChild(el("p", "iv-meta eff-line",
     `🛌 <b>${label}</b>: <span class="effect ${cls}">${mins(eff)}</span> ` +
     `model CI <span class="ci">[${mins(re.on_ci_low)}, ${mins(re.on_ci_high)}]</span> ` +
@@ -1033,7 +1073,7 @@ function appendEff(card, iv) {
   const cls = eff >= 0 ? "pos" : "neg";
   const label = isChoice ? "Sleep efficiency — any option vs skipping" : "Sleep efficiency";
   const avgs = (re.on_mean != null && re.off_mean != null)
-    ? ` Avg <b>${avg1(re.on_mean)}%</b> on / <b>${avg1(re.off_mean)}%</b> off.` : "";
+    ? ` Avg${baseNote()} <b>${avg1(re.on_mean)}%</b> on / <b>${avg1(re.off_mean)}%</b> off.` : "";
   card.appendChild(el("p", "iv-meta eff-line",
     `😴 <b>${label}</b>: <span class="effect ${cls}">${signed(eff)}</span> pp ` +
     `model CI <span class="ci">[${signed(re.on_ci_low)}, ${signed(re.on_ci_high)}]</span> ` +
@@ -1066,7 +1106,7 @@ function hrvMetric(r, dataNote, iv) {
     `<b>${pct(r.p_helps)}</b> chance of a real benefit${sizable}`));
   if (r.on_mean != null && r.off_mean != null)
     b.appendChild(el("div", "metric-avgs",
-      `Avg HRV <b>${avg1(r.on_mean)}</b> on nights · <b>${avg1(r.off_mean)}</b> off`));
+      `Avg HRV${baseNote()} <b>${avg1(r.on_mean)}</b> on nights · <b>${avg1(r.off_mean)}</b> off`));
   b.appendChild(el("div", "metric-note", `Based on ${dataNote}`));
   return b;
 }
@@ -1095,7 +1135,7 @@ function rhrMetric(iv) {
     `<b>${pct(rl.p_helps)}</b> chance it lowers`));
   if (rl.on_mean != null && rl.off_mean != null)
     b.appendChild(el("div", "metric-avgs",
-      `Avg resting HR <b>${avg1(rl.on_mean)}</b> on nights · <b>${avg1(rl.off_mean)}</b> off`));
+      `Avg resting HR${baseNote()} <b>${avg1(rl.on_mean)}</b> on nights · <b>${avg1(rl.off_mean)}</b> off`));
   return b;
 }
 
@@ -1119,7 +1159,7 @@ function appendLrhr(card, iv) {
   const cls = effBpm <= 0 ? "pos" : "neg";  // lower resting HR is good -> green
   const label = isChoice ? "Resting HR — any option vs skipping" : "Resting HR";
   const avgs = (rl.on_mean != null && rl.off_mean != null)
-    ? ` Avg <b>${avg1(rl.on_mean)}</b> on / <b>${avg1(rl.off_mean)}</b> off bpm.` : "";
+    ? ` Avg${baseNote()} <b>${avg1(rl.on_mean)}</b> on / <b>${avg1(rl.off_mean)}</b> off bpm.` : "";
   card.appendChild(el("p", "iv-meta",
     `🫀 <b>${label}</b>: <span class="effect ${cls}">${signed(effBpm)}</span> bpm ` +
     `model CI <span class="ci">[${signed(-rl.on_ci_high)}, ${signed(-rl.on_ci_low)}]</span> ` +
@@ -1628,11 +1668,11 @@ async function loadInteractions() {
 
   box.innerHTML = "";
   RECENCY_ON = !!(data.recency && data.recency.enabled);
-  renderRecencySlot(data.recency, data.count_maximize);
+  renderRecencySlot(data.recency, data.count_maximize, data.baseline);
   const nPairs = data.pairs.length;
   box.appendChild(el("p", "rep-stat",
     `Every pair of interventions that has shared a night, across <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}` +
-    (RECENCY_ON ? ` <span class="adj-flag">recency-weighted — counts shown are adjusted</span>` : "") + `. ` +
+    (RECENCY_ON ? ` <span class="adj-flag">recency-weighted — counts shown are adjusted</span>` : "") + baseFlag() + `. ` +
     `For each pair the model asks whether the two did <em>better</em> together than their separate effects add up to (synergy), ` +
     `about as much as either alone (substitutes — their effects overlap), or <em>worse</em> than the better one alone (interference). ` +
     `A verdict needs ≥${MIN_BOTH} nights with both on. With ${nPairs} pair${nPairs === 1 ? "" : "s"} under test, expect the odd false flag — treat a flag as a lead to watch, not a conclusion.` +
@@ -1729,7 +1769,7 @@ function pairCard(p) {
 
   // right: the raw 2x2 so the verdict is inspectable
   const right = el("div");
-  right.appendChild(el("div", "metric-label", `Average HRV by night type <span class="metric-hint">raw averages · n nights</span>`));
+  right.appendChild(el("div", "metric-label", `Average HRV by night type <span class="metric-hint">${BASELINE_ON ? "baseline-adjusted averages" : "raw averages"} · n nights</span>`));
   const fmt = (v, n) => v == null ? `<span class="n">—</span>` : `${avg1(v)}<span class="n">n=${n}</span>`;
   right.appendChild(el("table", "cell-table",
     `<tr><th></th><th>${esc(p.b.name)} off</th><th>${esc(p.b.name)} on</th></tr>` +
