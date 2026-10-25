@@ -531,6 +531,8 @@ def tag_night(conn, d, key=None, model=None, ref=None, thresh=None):
             known.add(slug)
         if slug not in slugs:
             slugs.append(slug)
+    rank = {v["slug"]: i for i, v in enumerate(store.tag_vocab(conn))}
+    slugs.sort(key=lambda s: rank.get(s, len(rank)))   # stored in vocabulary order
     summary = (out.get("summary") or "").strip()[:200]
     store.set_night_tags(conn, d, slugs, summary, model, hrv_value)
     store._audit(conn, "tag_usage", d, input=usage.get("input_tokens"), output=usage.get("output_tokens"),

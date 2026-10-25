@@ -471,6 +471,7 @@ def state_payload(conn):
     ivs = store.list_interventions(conn)  # active first, then paused
     nights_rows = store.recent_nights(conn, GRID_NIGHTS)  # newest first, incl. today
     tags_by_date = store.night_tags(conn)
+    vocab_rank = {v["slug"]: i for i, v in enumerate(store.tag_vocab(conn))}
 
     nights, cells = [], {}
     for n in nights_rows:
@@ -493,7 +494,7 @@ def state_payload(conn):
             "excl_environmental": bool(n["excl_environmental"]),
             "maximize": bool(n["maximize"]),
             "is_today": n["date"] == d_today,
-            "tags": (tags_by_date.get(n["date"]) or {}).get("tags", []),
+            "tags": _vocab_order((tags_by_date.get(n["date"]) or {}).get("tags", []), vocab_rank),
             "tags_summary": (tags_by_date.get(n["date"]) or {}).get("summary", ""),
         })
         cmap = {}
@@ -658,6 +659,12 @@ def hrv_trend_payload(conn):
             "app_start": store.first_assigned_night(conn)}
 
 
+def _vocab_order(slugs, rank):
+    """Tags always listed in vocabulary order (the order tags were first defined),
+    so the same tag sits in the same place on every night and every card."""
+    return sorted(slugs, key=lambda s: (rank.get(s, len(rank)), s))
+
+
 def tags_info(conn):
     """What every payload carries about night-shape tags: whether tagging is on,
     the HRV threshold, and the vocabulary (slug -> label/description)."""
@@ -730,7 +737,8 @@ def tag_associations(iv, all_nights, tags_by_date, vocab):
             "low_on_tag": a, "low_on_n": len(low_on), "low_off_tag": c, "low_off_n": len(low_off),
             "ratio": (r_on / r_off) if r_off > 0 else None, "p": round(p, 4),
         })
-    out.sort(key=lambda f: f["p"])
+    rank = {slug: i for i, slug in enumerate(vocab)}   # vocab is insertion-ordered
+    out.sort(key=lambda f: rank.get(f["slug"], len(rank)))
     return out
 
 
