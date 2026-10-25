@@ -297,6 +297,8 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 /* the minor sleep metrics (total sleep, latency, efficiency): visibly smaller than the
    HRV / resting-HR read-outs, on both pages */
 .eff-line { margin-top: 8px; font-size: 11px; }
+/* a rule between the two headline metrics (HRV, resting HR) and the sleep-architecture lines */
+.iv > :not(.eff-line) + .eff-line { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 12px; }
 .eff-line .effect { font-size: 11.5px; }
 .metric-row.minor .rowlab { font-size: 12px; padding-top: 4px; padding-bottom: 4px; }
 .metric-row.minor .rowlab .rmeta { font-size: 10.5px; }
