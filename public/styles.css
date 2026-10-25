@@ -485,6 +485,9 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .iv-tagflag { font-size: 12.5px; margin: 10px 0 0; color: var(--muted); line-height: 1.5; }
 .iv-tagflag + .iv-tagflag { margin-top: 4px; }
 .iv-tagflag b { color: var(--text); }
+/* tags describe bad nights: carrying one less often is good, more often is bad */
+.iv-tagflag b.good { color: var(--good); }
+.iv-tagflag b.bad { color: var(--bad); }
 .tags-modal { max-width: 560px; }
 .check-row { display: flex; align-items: center; gap: 8px; font-weight: 600; }
 .check-row input { width: auto; margin: 0; }

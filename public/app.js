@@ -828,7 +828,7 @@ function appendTagFlags(card, iv) {
       `Only low-HRV nights get tags, so an intervention that simply lowers HRV picks up every tag — ` +
       `restricted to low nights the split is ${f.low_on_tag} of ${f.low_on_n} on vs ${f.low_off_tag} of ${f.low_off_n} off.`;
     card.appendChild(el("p", "iv-tagflag",
-      `🏷 Nights on this are tagged ${tagChip(f.slug, tip)} <b>${times}${f.direction === "more" ? "more" : "less"} often:</b> ` +
+      `🏷 Nights on this are tagged ${tagChip(f.slug, tip)} <b class="${f.direction === "more" ? "bad" : "good"}">${times}${f.direction === "more" ? "more" : "less"} often:</b> ` +
       `${f.on_tag} of ${f.on_n} on-nights vs ${f.off_tag} of ${f.off_n} off-nights, p = ${f.p}.`));
   }
 }
