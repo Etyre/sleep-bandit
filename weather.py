@@ -1,13 +1,14 @@
 """
-weather.py -- outdoor temperature for each night, so a report can ask whether the
-best Chili Pad / air-conditioning setting depends on the season.
+weather.py -- outdoor temperature for each night, where it was slept, so a report can
+ask whether the best Chili Pad / air-conditioning setting depends on the season.
 
-Source: Open-Meteo (open-meteo.com), free, no key. Hourly 2 m air temperature for
-the configured location (Berkeley, CA by default; SB_LAT / SB_LON override). The
-archive endpoint covers everything up to a few days ago; the forecast endpoint's
-`past_days` covers the most recent week, so the two together leave no gap.
+Source: Open-Meteo (open-meteo.com), free, no key. Hourly 2 m air temperature at the
+night's city (Tracker dropdown; store.effective_cities carries a choice forward to
+later nights). The archive endpoint covers everything up to a few days ago; the
+forecast endpoint's `past_days` covers the most recent week, so the two together
+leave no gap. New cities are geocoded through Open-Meteo's geocoding API.
 
-A night d (evening date) gets:
+A night d (evening date) gets, in the city's own time zone:
   tnight  mean temperature from 21:00 on d to 06:00 on d+1   (the sleeping hours)
   tmin    minimum over the same window
   tmax    maximum over the daytime hours of d
@@ -17,7 +18,6 @@ Pure standard library, like the rest of the app. Failures are logged, never fata
 """
 
 import json
-import os
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,11 +25,9 @@ from datetime import date, datetime, timedelta
 
 import store
 
-LAT = float(os.environ.get("SB_LAT", "37.8716"))
-LON = float(os.environ.get("SB_LON", "-122.2728"))
-TZ = os.environ.get("SB_TZ", "America/Los_Angeles")
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 HTTP_TIMEOUT = 25
 CHUNK_DAYS = 180            # archive request size
 RECENT_DAYS = 7             # the forecast endpoint's past_days window we rely on
@@ -51,30 +49,40 @@ def _get(url, params):
         raise WeatherError(f"Could not reach Open-Meteo: {e.reason}") from e
 
 
-def _hourly(start, end):
-    """{ 'YYYY-MM-DDTHH:00': temp } for start <= day <= end (ISO strings), from the
-    archive for older days and the forecast endpoint for the last week."""
+def _hourly(city, start, end):
+    """{ 'YYYY-MM-DDTHH:00': temp } at `city` ({name, lat, lon, tz}) for start <= day
+    <= end (ISO strings): the archive for older days, the forecast endpoint for the
+    last week."""
+    base = {"latitude": city["lat"], "longitude": city["lon"], "hourly": "temperature_2m", "timezone": city["tz"]}
     out = {}
     today = date.today()
     recent_from = today - timedelta(days=RECENT_DAYS - 1)
     s, e = date.fromisoformat(start), date.fromisoformat(end)
-    # archive part (anything before the recent window)
     a_end = min(e, recent_from - timedelta(days=1))
     cur = s
     while cur <= a_end:
         chunk_end = min(a_end, cur + timedelta(days=CHUNK_DAYS - 1))
-        d = _get(ARCHIVE_URL, {"latitude": LAT, "longitude": LON, "start_date": cur.isoformat(),
-                               "end_date": chunk_end.isoformat(), "hourly": "temperature_2m", "timezone": TZ})
+        d = _get(ARCHIVE_URL, {**base, "start_date": cur.isoformat(), "end_date": chunk_end.isoformat()})
         h = d.get("hourly") or {}
         out.update({t: v for t, v in zip(h.get("time", []), h.get("temperature_2m", [])) if v is not None})
         cur = chunk_end + timedelta(days=1)
-    # recent part
     if e >= recent_from:
-        d = _get(FORECAST_URL, {"latitude": LAT, "longitude": LON, "past_days": RECENT_DAYS,
-                                "forecast_days": 1, "hourly": "temperature_2m", "timezone": TZ})
+        d = _get(FORECAST_URL, {**base, "past_days": RECENT_DAYS, "forecast_days": 1})
         h = d.get("hourly") or {}
         out.update({t: v for t, v in zip(h.get("time", []), h.get("temperature_2m", [])) if v is not None})
     return out
+
+
+def geocode(name):
+    """Best match for a place name: {name, lat, lon, tz}. Raises WeatherError if none."""
+    d = _get(GEOCODE_URL, {"name": name, "count": 1, "language": "en", "format": "json"})
+    hits = d.get("results") or []
+    if not hits:
+        raise WeatherError(f"No place called “{name}” found.")
+    h = hits[0]
+    label = h.get("name") or name
+    return {"name": label, "lat": h["latitude"], "lon": h["longitude"], "tz": h.get("timezone") or "UTC",
+            "admin": h.get("admin1") or "", "country": h.get("country") or ""}
 
 
 def night_stats(hourly, d):
@@ -92,26 +100,35 @@ def night_stats(hourly, d):
 
 
 def sync(conn, current_night, force=False):
-    """Fill weather for every recorded night that lacks it (up to last night; tonight
-    hasn't happened). Throttled unless forced. Returns a summary dict."""
+    """Fill weather for every recorded night that lacks it at the city it was slept in
+    (up to last night; tonight hasn't happened). Throttled unless forced. Returns
+    a summary dict."""
     last = store.get_setting(conn, "weather_last_sync")
     if last and not force:
         if datetime.now() - datetime.fromisoformat(last) < timedelta(hours=SYNC_THROTTLE_HOURS):
             return {"skipped": True}
-    missing = store.nights_missing_weather(conn, "2000-01-01", current_night)
+    missing = store.nights_missing_weather(conn, current_night)
     result = {"missing": len(missing), "filled": 0}
-    if missing:
+    cities = {c["name"]: c for c in store.list_cities(conn)}
+    by_city = {}
+    for d, c in missing:
+        by_city.setdefault(c, []).append(d)
+    for cname, dates in by_city.items():
+        city = cities.get(cname)
+        if not city:
+            continue
         try:
-            hourly = _hourly(missing[0], (date.fromisoformat(missing[-1]) + timedelta(days=1)).isoformat())
+            hourly = _hourly(city, dates[0], (date.fromisoformat(dates[-1]) + timedelta(days=1)).isoformat())
         except WeatherError as e:
             result["error"] = str(e)
-            return result
-        for d in missing:
+            continue
+        for d in dates:
             tn, tmin, tmax = night_stats(hourly, d)
             if tn is None:
                 continue
-            store.set_weather(conn, d, tn, tmin, tmax)
+            store.set_weather(conn, d, cname, tn, tmin, tmax)
             result["filled"] += 1
-        conn.commit()
-    store.set_setting(conn, "weather_last_sync", datetime.now().isoformat(timespec="seconds"))
+    conn.commit()
+    if "error" not in result:
+        store.set_setting(conn, "weather_last_sync", datetime.now().isoformat(timespec="seconds"))
     return result

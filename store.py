@@ -81,12 +81,21 @@ CREATE TABLE IF NOT EXISTS night_tags (
     hrv        REAL,                           -- the night's HRV when it was tagged
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS cities (
+    name       TEXT PRIMARY KEY,               -- as shown in the Tracker's city dropdown
+    lat        REAL NOT NULL,
+    lon        REAL NOT NULL,
+    tz         TEXT NOT NULL,                  -- IANA zone, for the night window
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS weather (
-    date       TEXT PRIMARY KEY,               -- the evening (same key as nights.date)
+    date       TEXT NOT NULL,                  -- the evening (same key as nights.date)
+    city       TEXT NOT NULL,                  -- cities.name the temperatures are for
     tnight     REAL,                           -- mean outdoor °C 21:00 that evening .. 06:00 next morning
     tmin       REAL,                           -- min outdoor °C over the same window
     tmax       REAL,                           -- max outdoor °C over the day of the evening
-    fetched_at TEXT NOT NULL
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (date, city)
 );
 CREATE TABLE IF NOT EXISTS tag_vocab (
     slug        TEXT PRIMARY KEY,
@@ -96,6 +105,18 @@ CREATE TABLE IF NOT EXISTS tag_vocab (
     created_at  TEXT NOT NULL
 );
 """
+
+
+# Cities offered in the Tracker's per-night dropdown from the start; more can be added
+# from the dropdown ("Other…", geocoded by weather.geocode). The first is the default
+# for nights before any city was ever chosen.
+DEFAULT_CITIES = (
+    ("Berkeley", 37.8716, -122.2728, "America/Los_Angeles"),
+    ("Washington DC", 38.9072, -77.0369, "America/New_York"),
+    ("Phoenix", 33.4484, -112.0740, "America/Phoenix"),
+    ("New York City", 40.7128, -74.0060, "America/New_York"),
+)
+DEFAULT_CITY = DEFAULT_CITIES[0][0]
 
 
 def _now():
@@ -227,6 +248,21 @@ def connect():
         # two lower). lrhr stays on the 5-minute basis so the series is consistent;
         # the 30-second reading is kept alongside for the record/export.
         conn.execute("ALTER TABLE nights ADD COLUMN lrhr_30s REAL")
+    if "city" not in ncols:
+        # where the night was slept (Tracker dropdown); NULL inherits the previous night's
+        conn.execute("ALTER TABLE nights ADD COLUMN city TEXT")
+    wcols = {r["name"] for r in conn.execute("PRAGMA table_info(weather)")}
+    if "city" not in wcols:
+        # the first weather table was Berkeley-only and keyed by date alone
+        conn.executescript("""
+            CREATE TABLE weather_new (date TEXT NOT NULL, city TEXT NOT NULL, tnight REAL, tmin REAL,
+                tmax REAL, fetched_at TEXT NOT NULL, PRIMARY KEY (date, city));
+            INSERT INTO weather_new SELECT date, 'Berkeley', tnight, tmin, tmax, fetched_at FROM weather;
+            DROP TABLE weather; ALTER TABLE weather_new RENAME TO weather;""")
+    for name, lat, lon, tz in DEFAULT_CITIES:
+        conn.execute("INSERT OR IGNORE INTO cities (name, lat, lon, tz, created_at) VALUES (?, ?, ?, ?, ?)",
+                     (name, lat, lon, tz, _now()))
+    conn.commit()
     if "maximize" not in ncols:
         # 1 = this night's randomized plan was replaced by the maximize-benefit plan
         conn.execute("ALTER TABLE nights ADD COLUMN maximize INTEGER NOT NULL DEFAULT 0")
@@ -988,7 +1024,7 @@ def analysis_nights(conn, count_maximize=True):
 def recent_nights(conn, limit=30):
     rows = conn.execute(
         "SELECT date, hrv, lrhr, lrhr_30s, tst, lat, eff, hrv_src, lrhr_src, tst_src, lat_src, eff_src, status, note, "
-        "excl_behavioral, excl_supplement, excl_environmental, maximize FROM nights ORDER BY date DESC LIMIT ?",
+        "excl_behavioral, excl_supplement, excl_environmental, maximize, city FROM nights ORDER BY date DESC LIMIT ?",
         (limit,)).fetchall()
     out = []
     for r in rows:
@@ -1128,22 +1164,69 @@ def tag_counts(conn, threshold):
 
 
 # ---------------------------------------------------------------------------
-# Outdoor weather per night (weather.py): is the best pad / AC setting seasonal?
+# Where each night was slept, and the outdoor weather there (weather.py)
 # ---------------------------------------------------------------------------
-def set_weather(conn, d, tnight, tmin, tmax):
-    conn.execute("INSERT INTO weather (date, tnight, tmin, tmax, fetched_at) VALUES (?, ?, ?, ?, ?) "
-                 "ON CONFLICT(date) DO UPDATE SET tnight=excluded.tnight, tmin=excluded.tmin, "
-                 "tmax=excluded.tmax, fetched_at=excluded.fetched_at", (d, tnight, tmin, tmax, _now()))
+def list_cities(conn):
+    return [dict(r) for r in conn.execute("SELECT name, lat, lon, tz FROM cities ORDER BY rowid")]
+
+
+def add_city(conn, name, lat, lon, tz):
+    cur = conn.execute("INSERT OR IGNORE INTO cities (name, lat, lon, tz, created_at) VALUES (?, ?, ?, ?, ?)",
+                       (name, float(lat), float(lon), tz, _now()))
+    if cur.rowcount:
+        _audit(conn, "add_city", name=name, lat=lat, lon=lon, tz=tz)
+        conn.commit()
+    return bool(cur.rowcount)
+
+
+def set_night_city(conn, d, city):
+    """Record where night d was (or will be) slept. Later nights without a city of
+    their own inherit it (effective_cities). None clears the explicit choice."""
+    ensure_night(conn, d)
+    old = conn.execute("SELECT city FROM nights WHERE date=?", (d,)).fetchone()["city"]
+    conn.execute("UPDATE nights SET city=? WHERE date=?", (city or None, d))
+    _audit(conn, "set_city", d, city=city, replaced=old)
+    conn.commit()
+
+
+def effective_cities(conn):
+    """{date: city} for every night: its own city when set, else the most recent
+    earlier night's, else the default. Carry-forward in date order."""
+    out, cur = {}, DEFAULT_CITY
+    for r in conn.execute("SELECT date, city FROM nights ORDER BY date"):
+        if r["city"]:
+            cur = r["city"]
+        out[r["date"]] = cur
+    return out
+
+
+def set_weather(conn, d, city, tnight, tmin, tmax):
+    conn.execute("INSERT INTO weather (date, city, tnight, tmin, tmax, fetched_at) VALUES (?, ?, ?, ?, ?, ?) "
+                 "ON CONFLICT(date, city) DO UPDATE SET tnight=excluded.tnight, tmin=excluded.tmin, "
+                 "tmax=excluded.tmax, fetched_at=excluded.fetched_at", (d, city, tnight, tmin, tmax, _now()))
 
 
 def weather_series(conn):
-    """{date: {"tnight", "tmin", "tmax"}} in °C for every night fetched."""
-    return {r["date"]: {"tnight": r["tnight"], "tmin": r["tmin"], "tmax": r["tmax"]}
-            for r in conn.execute("SELECT date, tnight, tmin, tmax FROM weather")}
+    """{(date, city): {"tnight", "tmin", "tmax"}} in °C for every pair fetched."""
+    return {(r["date"], r["city"]): {"tnight": r["tnight"], "tmin": r["tmin"], "tmax": r["tmax"]}
+            for r in conn.execute("SELECT date, city, tnight, tmin, tmax FROM weather")}
 
 
-def nights_missing_weather(conn, since, before):
-    """Recorded nights in [since, before) with no weather row yet, oldest first."""
-    return [r["date"] for r in conn.execute(
-        "SELECT n.date FROM nights n LEFT JOIN weather w ON w.date = n.date "
-        "WHERE n.date >= ? AND n.date < ? AND w.date IS NULL ORDER BY n.date", (since, before))]
+def night_weather(conn):
+    """{date: {"city", "tnight", "tmin", "tmax"}} for every night whose weather at its
+    effective city has been fetched."""
+    wx = weather_series(conn)
+    out = {}
+    for d, city in effective_cities(conn).items():
+        w = wx.get((d, city))
+        if w:
+            out[d] = {"city": city, **w}
+    return out
+
+
+def nights_missing_weather(conn, before):
+    """[(date, city)] for nights before `before` whose weather at their effective city
+    isn't stored yet, oldest first."""
+    have = {(r["date"], r["city"]) for r in conn.execute("SELECT date, city FROM weather")}
+    return [(d, c) for d, c in sorted(effective_cities(conn).items())
+            if d < before and (d, c) not in have]

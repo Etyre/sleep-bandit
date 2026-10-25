@@ -208,9 +208,13 @@ the app stays standard-library only on the system Python.
 
 A temperature-dosed intervention (unit contains `°`: Chili Pad, air conditioning)
 gets a section at the foot of its report asking whether its best setting depends on
-the season. `weather.py` keeps each night's outdoor temperature from Open-Meteo
-(Berkeley by default; `SB_LAT` / `SB_LON` / `SB_TZ` override): the 9 pm–6 am mean
-and minimum, and the day's maximum, fetched with each sync. The section plots every
+the season. Each night has a **city** (dropdown under the date on the Tracker; the
+list starts as Berkeley, Washington DC, Phoenix and New York City, and "Other…" adds
+a place through Open-Meteo's geocoder). A night with no choice of its own inherits
+the previous night's, so a trip only needs marking on its first and last nights.
+`weather.py` keeps each night's outdoor temperature at that city from Open-Meteo:
+the 9 pm–6 am mean and minimum, and the day's maximum, fetched with each sync and
+again whenever a city changes. The section plots every
 counted night as outdoor night temperature against HRV, colored by setting, bins the
 nights into outdoor-temperature terciles with each setting's average per bin (★ the
 best with at least two nights), and fits HRV ~ setting × outdoor temperature on the

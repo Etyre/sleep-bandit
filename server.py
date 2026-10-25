@@ -460,6 +460,10 @@ def public_scrub(payload):
     for n in payload.get("nights", []) or []:
         if "note" in n:
             n["note"] = ""
+        for k in ("city", "city_eff"):   # where you sleep is not public either
+            if k in n:
+                n[k] = None
+    payload.pop("cities", None)
     for iv in payload.get("interventions", []) or []:
         if "note" in iv:
             iv["note"] = ""
@@ -473,6 +477,7 @@ def state_payload(conn):
     nights_rows = store.recent_nights(conn, GRID_NIGHTS)  # newest first, incl. today
     tags_by_date = store.night_tags(conn)
     vocab_rank = {v["slug"]: i for i, v in enumerate(store.tag_vocab(conn))}
+    city_eff = store.effective_cities(conn)
 
     nights, cells = [], {}
     for n in nights_rows:
@@ -496,6 +501,10 @@ def state_payload(conn):
             "maximize": bool(n["maximize"]),
             "is_today": n["date"] == d_today,
             "tags": _vocab_order((tags_by_date.get(n["date"]) or {}).get("tags", []), vocab_rank),
+            # where the night was slept: the explicit choice (None = inherited) and the
+            # effective city after carry-forward from earlier nights
+            "city": n["city"],
+            "city_eff": city_eff.get(n["date"], store.DEFAULT_CITY),
             "tags_summary": (tags_by_date.get(n["date"]) or {}).get("summary", ""),
         })
         cmap = {}
@@ -511,7 +520,8 @@ def state_payload(conn):
         cells[n["date"]] = cmap
 
     return {"today": d_today, "interventions": ivs, "nights": nights, "cells": cells,
-            "tags": tags_info(conn), **analysis_modes(conn)}
+            "tags": tags_info(conn), "cities": [c["name"] for c in store.list_cities(conn)],
+            **analysis_modes(conn)}
 
 
 def _readout(iv, all_nights, metric, negate):
@@ -745,7 +755,7 @@ def season_payload(iv, all_nights, wx):
         w = wx.get(n["date"])
         if not w or w.get("tnight") is None:
             continue
-        rows.append({"date": n["date"], "dose": dose, "hrv": float(n["hrv"]),
+        rows.append({"date": n["date"], "dose": dose, "hrv": float(n["hrv"]), "city": w["city"],
                      "base": n.get("base_hrv"), "out": conv(float(w["tnight"]))})
     if len(rows) < SEASON_MIN_POINTS:
         return None
@@ -755,8 +765,8 @@ def season_payload(iv, all_nights, wx):
         c = sum(bs) / len(bs)
         for r in rows:
             r["hrv"] = r["hrv"] - r["base"] + c
-    points = [{"date": r["date"], "dose": r["dose"], "hrv": round(r["hrv"], 1), "out": round(r["out"], 1)}
-              for r in rows]
+    points = [{"date": r["date"], "dose": r["dose"], "hrv": round(r["hrv"], 1), "out": round(r["out"], 1),
+               "city": r["city"]} for r in rows]
     # outdoor-temperature bins: terciles when there are enough nights, else halves
     outs = sorted(r["out"] for r in rows)
     k = 3 if len(rows) >= 12 else 2
@@ -800,7 +810,8 @@ def season_payload(iv, all_nights, wx):
             inter = {"coef": round(beta[3], 3), "se": round(se[3], 3), "n": len(on),
                      "dose_slope": round(beta[1], 2), "dose_slope_se": round(se[1], 2),
                      "out_slope": round(beta[2], 2), "out_slope_se": round(se[2], 2)}
-    return {"deg": deg, "points": points, "bins": bins, "doses": doses,
+    cities = sorted({r["city"] for r in rows})
+    return {"deg": deg, "points": points, "bins": bins, "doses": doses, "cities": cities,
             "dose_counts": {repr(d): sum(1 for r in rows if r["dose"] == d) for d in doses},
             "interaction": inter, "n": len(rows)}
 
@@ -894,7 +905,7 @@ def reports_payload(conn):
     n_hrv = _n_experiment_nights(all_nights)
     tinfo = tags_info(conn)
     tags_by_date = store.night_tags(conn)
-    wx = store.weather_series(conn)
+    wx = store.night_weather(conn)
     out = []
     for iv in ivs:
         out.append({
@@ -1400,6 +1411,33 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/note":
                 store.set_note(conn, body["date"], body.get("note", ""))
                 return self._send_json(state_payload(conn))
+
+            if path == "/api/city":
+                # where a night was slept; later nights inherit it until changed
+                city = (body.get("city") or "").strip() or None
+                if city and city not in {c["name"] for c in store.list_cities(conn)}:
+                    return self._send_json({"error": f"Unknown city “{city}”."}, 400)
+                store.set_night_city(conn, body["date"], city)
+                try:   # fetch that city's weather for the nights now attributed to it
+                    weather.sync(conn, today_str(), force=True)
+                except Exception:
+                    traceback.print_exc()
+                return self._send_json(state_payload(conn))
+
+            if path == "/api/cities":
+                # add a city to the dropdown, located through Open-Meteo's geocoder
+                name = (body.get("name") or "").strip()
+                if not name:
+                    return self._send_json({"error": "Type a city name."}, 400)
+                try:
+                    g = weather.geocode(name)
+                except weather.WeatherError as e:
+                    return self._send_json({"error": str(e)}, 400)
+                label = g["name"] if not g["admin"] or g["admin"] == g["name"] else f"{g['name']}, {g['admin']}"
+                if g["country"] and g["country"] not in ("United States",):
+                    label += f" ({g['country']})"
+                store.add_city(conn, label, g["lat"], g["lon"], g["tz"])
+                return self._send_json({"city": label, "cities": [c["name"] for c in store.list_cities(conn)]})
 
             if path == "/api/exclude":
                 store.set_exclusion(conn, body["date"], body.get("category", ""),

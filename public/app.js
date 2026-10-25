@@ -201,7 +201,7 @@ function renderGrid() {
       maxCtl = `<span class="max-btn on static" title="This night was planned for maximum benefit, not randomized${COUNT_MAX_ON ? "." : " — its data doesn't count toward results (see the header switch)."}">⭐ Maximize benefit</span>`;
     }
     head += `<th class="night${n.is_today ? " today" : ""}">` +
-      `${n.is_today ? "Tonight" : weekday(n.date)}<span class="ndate">${shortDate(n.date)}</span>${maxCtl}</th>`;
+      `${n.is_today ? "Tonight" : weekday(n.date)}<span class="ndate">${shortDate(n.date)}</span>${cityCtl(n)}${maxCtl}</th>`;
   }
   head += `</tr></thead>`;
 
@@ -356,6 +356,7 @@ function renderGrid() {
     $$(".notecell textarea", table).forEach((t) => t.addEventListener("change", () => saveNote(t)));
     $$(".excl-btn", table).forEach((b) => b.addEventListener("click", () => toggleExclusion(b)));
     $$("button.max-btn", table).forEach((b) => b.addEventListener("click", toggleMaximize));
+    $$(".city-sel", table).forEach((sel) => sel.addEventListener("change", () => saveCity(sel)));
   }
   $$(".fold-btn", table).forEach((b) => b.addEventListener("click", () => {
     PAUSED_OPEN[b.dataset.cat] = !PAUSED_OPEN[b.dataset.cat];
@@ -372,6 +373,38 @@ function renderGrid() {
 }
 
 let GRID_SCROLL = null;  // remembered horizontal scroll, so re-renders don't jump to Tonight
+
+// ---- where each night was slept -----------------------------------------------
+// A city dropdown under each date. A night without a choice of its own inherits
+// the previous night's (shown dimmed): if you slept in DC last night you're
+// assumed to be in DC tonight until you say otherwise. "Other…" adds a city
+// (geocoded server-side) and selects it. The night's outdoor weather (the season
+// sections on the Reports page) is looked up at this city.
+function cityCtl(n) {
+  if (READ_ONLY || !n.city_eff) return "";
+  const inherited = !n.city;
+  const opts = (STATE.cities || []).map((c) =>
+    `<option value="${esc(c)}"${c === n.city_eff ? " selected" : ""}>${esc(c)}</option>`).join("");
+  return `<select class="city-sel${inherited ? " inherited" : ""}" data-date="${n.date}" ` +
+    `title="${inherited ? "Where you slept — assumed the same as the night before. Change it if you were elsewhere."
+                        : "Where you slept this night (later nights inherit it)"}">` +
+    `${opts}<option value="__other">Other…</option></select>`;
+}
+async function saveCity(sel) {
+  const date = sel.dataset.date;
+  let city = sel.value;
+  try {
+    if (city === "__other") {
+      const name = prompt("City (it will be located automatically):");
+      if (!name || !name.trim()) { renderGrid(); return; }
+      const r = await post("/api/cities", { name: name.trim() });
+      city = r.city;
+    }
+    const wrap = $(".grid-wrap"); GRID_SCROLL = wrap ? wrap.scrollLeft : null;
+    STATE = await post("/api/city", { date, city });
+    renderGrid();
+  } catch (e) { alert("Error: " + e.message); renderGrid(); }
+}
 
 // ---- night-shape tags row --------------------------------------------------
 // Low-HRV nights (below STATE.tags.threshold) get one or more shape tags from
@@ -837,7 +870,7 @@ function appendSeason(card, iv) {
 
   const sec = el("div", "season");
   sec.appendChild(el("div", "season-head",
-    `🌡 Setting vs. outdoor temperature <span class="rmeta">Berkeley night air (9 pm–6 am mean, Open-Meteo), in ${deg} · ` +
+    `🌡 Setting vs. outdoor temperature <span class="rmeta">Night air where you slept (${(sp.cities || []).map(esc).join(", ")}; 9 pm–6 am mean, Open-Meteo), in ${deg} · ` +
     `${sp.n} night${sp.n === 1 ? "" : "s"}${BASELINE_ON ? " · HRV baseline-adj." : ""}</span>`));
   const row = el("div", "season-row");
 
@@ -879,7 +912,7 @@ function appendSeason(card, iv) {
   }
   for (const p of pts) {
     const col = colorOf(p.dose);
-    const title = `${shortDate(p.date)} · ${fmtDose(p.dose)} · HRV ${p.hrv.toFixed(1)} · outside ${p.out.toFixed(1)}${deg}`;
+    const title = `${shortDate(p.date)} · ${fmtDose(p.dose)} · HRV ${p.hrv.toFixed(1)} · ${p.city ? p.city + " " : ""}${p.out.toFixed(1)}${deg} outside`;
     parts.push(p.dose > 0
       ? `<circle cx="${px(p.out)}" cy="${py(p.hrv)}" r="4.5" style="fill:${col};stroke:var(--panel)" stroke-width="1.5"><title>${esc(title)}</title></circle>`
       : `<circle cx="${px(p.out)}" cy="${py(p.hrv)}" r="4" fill="none" style="stroke:${col}" stroke-width="1.6"><title>${esc(title)}</title></circle>`);
