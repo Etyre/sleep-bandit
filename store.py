@@ -1050,7 +1050,7 @@ def nights_missing_series(conn):
 def tag_vocab(conn):
     """Ordered list of {slug, label, description, created_by} -- oldest first."""
     return [dict(r) for r in conn.execute(
-        "SELECT slug, label, description, created_by FROM tag_vocab ORDER BY created_at, slug")]
+        "SELECT slug, label, description, created_by FROM tag_vocab ORDER BY rowid")]
 
 
 def upsert_tag_vocab(conn, slug, label, description, created_by):
