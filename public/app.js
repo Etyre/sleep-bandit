@@ -860,13 +860,13 @@ function reportCard(iv) {
 function appendSeason(card, iv) {
   const sp = iv.season;
   const deg = sp.deg;
-  // color follows the setting's VALUE, coolest blue through purple to warmest red
-  // (hue 220 -> 360), so two nearby settings look alike and the extremes stand
-  // apart; off nights are hollow grey
+  // color follows the setting's VALUE, coolest blue through purple to warmest red,
+  // in OKLCH so lightness and chroma stay constant along the ramp (HSL blues and
+  // purples read much darker than its reds); off nights are hollow grey
   const onDoses = sp.doses.filter((d) => d > 0);
   const dLo = Math.min(...onDoses), dHi = Math.max(...onDoses);
   const colorOf = (d) => d > 0
-    ? `hsl(${Math.round(dHi > dLo ? 220 + 140 * (d - dLo) / (dHi - dLo) : 220)} 72% 62%)`
+    ? `oklch(0.74 0.16 ${Math.round(dHi > dLo ? 262 + 125 * (d - dLo) / (dHi - dLo) : 262) % 360})`
     : "var(--muted)";
   const fmtDose = (d) => d > 0 ? `${numLabel(d)} ${esc(iv.unit)}` : "off";
 
