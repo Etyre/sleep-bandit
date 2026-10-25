@@ -812,6 +812,28 @@ let REPORT_OPEN = {};
 try { REPORT_OPEN = JSON.parse(localStorage.getItem("sb.reportOpen") || "{}") || {}; } catch (e) { REPORT_OPEN = {}; }
 
 function reportCard(iv) {
+  const card = reportCardBody(iv);
+  appendTagFlags(card, iv);
+  return card;
+}
+
+// Night-shape associations, at the foot of the card: a tag this intervention's
+// nights carry disproportionately often (or rarely) vs its control nights --
+// Fisher exact test on raw counts (server.tag_associations). Flagged either way.
+function appendTagFlags(card, iv) {
+  for (const f of iv.tag_flags || []) {
+    const times = f.ratio == null ? "" : `${(f.ratio >= 1 ? f.ratio : 1 / f.ratio).toFixed(1)}× `;
+    const tip = `Among this intervention's ${f.on_n} confirmed-on nights, ${f.on_tag} were tagged “${tagLabel(f.slug)}”; ` +
+      `among its ${f.off_n} assigned-off (control) nights, ${f.off_tag}. Two-sided Fisher exact p = ${f.p}. ` +
+      `Only low-HRV nights get tags, so an intervention that simply lowers HRV picks up every tag — ` +
+      `restricted to low nights the split is ${f.low_on_tag} of ${f.low_on_n} on vs ${f.low_off_tag} of ${f.low_off_n} off.`;
+    card.appendChild(el("p", "iv-tagflag",
+      `🏷 Nights on this are tagged ${tagChip(f.slug, tip)} <b>${times}${f.direction === "more" ? "more" : "less"} often:</b> ` +
+      `${f.on_tag} of ${f.on_n} on-nights vs ${f.off_tag} of ${f.off_n} off-nights, p = ${f.p}.`));
+  }
+}
+
+function reportCardBody(iv) {
   const r = iv.readout || {};
   const isChoice = isChoiceKind(iv);
   const nOn = r.n_on || 0, nOff = r.n_off || 0, nObs = nOn + nOff;
@@ -884,20 +906,6 @@ function reportCard(iv) {
       capEl.addEventListener("click", () => openCapModal(iv));
     }
     card.appendChild(sched);
-  }
-
-  // Night-shape associations: a tag this intervention's nights carry
-  // disproportionately often (or rarely) vs its control nights -- Fisher exact
-  // test on raw counts (server.tag_associations). Flagged either way.
-  for (const f of iv.tag_flags || []) {
-    const ratio = f.ratio == null ? "" : ` (${f.ratio >= 1 ? f.ratio.toFixed(1) : (1 / f.ratio).toFixed(1)}× ${f.direction === "more" ? "more" : "less"} often)`;
-    const tip = `Among this intervention's ${f.on_n} confirmed-on nights, ${f.on_tag} were tagged “${tagLabel(f.slug)}”; ` +
-      `among its ${f.off_n} assigned-off (control) nights, ${f.off_tag}. Two-sided Fisher exact p = ${f.p}. ` +
-      `Only low-HRV nights get tags, so an intervention that simply lowers HRV picks up every tag — ` +
-      `restricted to low nights the split is ${f.low_on_tag} of ${f.low_on_n} on vs ${f.low_off_tag} of ${f.low_off_n} off.`;
-    card.appendChild(el("p", "iv-tagflag",
-      `🏷 Nights on this are tagged ${tagChip(f.slug, tip)} <b>${f.direction === "more" ? "more" : "less"} often</b>` +
-      `${ratio}: ${f.on_tag} of ${f.on_n} on-nights vs ${f.off_tag} of ${f.off_n} off-nights, p = ${f.p}.`));
   }
 
   const lObs = (iv.readout_lrhr?.n_on || 0) + (iv.readout_lrhr?.n_off || 0);
