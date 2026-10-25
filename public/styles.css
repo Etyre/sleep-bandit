@@ -491,3 +491,4 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .vocab li b { color: var(--text); }
 .vocab li .ntag { cursor: default; }
 .muted { color: var(--muted); }
+.claude-mark { vertical-align: -2px; margin-right: 2px; }
