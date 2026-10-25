@@ -472,7 +472,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 /* ---- night-shape tags (tags.py): Tracker row + report flags + panel ---- */
 .tagcell { padding: 3px 4px; vertical-align: top; text-align: center; background: rgba(94,224,192,.04); }
 .ntag {
-  display: inline-block; margin: 1px 2px; padding: 1px 7px; border-radius: 10px;
+  display: inline-block; margin: 1px 2px; padding: 1px 7px; border-radius: 4px;
   font-size: 10.5px; font-weight: 600; white-space: nowrap; cursor: help;
   color: var(--warn); background: rgba(255,170,80,.12); border: 1px solid rgba(255,170,80,.45);
 }
