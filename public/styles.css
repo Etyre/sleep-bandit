@@ -478,7 +478,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 }
 /* in the grid the chips flow side by side while they fit and wrap onto further
    lines when they don't; a label never widens the column -- the row grows taller */
-.tagcell .tagwrap { display: flex; flex-wrap: wrap; justify-content: center; gap: 3px; }
+.tagcell .tagwrap { display: flex; flex-wrap: wrap; justify-content: center; gap: 3px; width: 0; min-width: 100%; }  /* width 0 keeps the chips from widening the column (table auto-layout); min-width fills it */
 .tagcell .ntag { margin: 0; white-space: normal; max-width: 100%; box-sizing: border-box; line-height: 1.3; }
 .ntag.pending { color: var(--muted); background: transparent; border-style: dashed; }
 .tags-row .rowlab { color: var(--warn); }
