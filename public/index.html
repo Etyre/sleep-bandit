@@ -33,6 +33,7 @@
         <button class="primary" id="add-btn">+ Add intervention</button>
         <span class="spacer"></span>
         <button class="ghost" id="oura-btn">💍 Oura</button>
+        <button class="ghost" id="tags-btn">🏷 Night tags</button>
         <a class="ghost" href="/api/export" target="_blank">Export</a>
       </div>
       <div class="grid-wrap">
@@ -190,6 +191,36 @@
         <button type="button" class="ghost" id="cap-cancel">Cancel</button>
         <button type="button" class="primary" id="cap-toggle"></button>
       </div>
+    </div>
+  </div>
+
+  <!-- Night-shape tags modal -->
+  <div class="modal-backdrop" id="tags-backdrop" hidden>
+    <div class="modal card tags-modal">
+      <div class="card-head">
+        <h2>🏷 Night-shape tags</h2>
+        <button class="ghost" id="tags-close">✕</button>
+      </div>
+      <p id="tags-status" class="oura-status">Loading…</p>
+      <form id="tags-form">
+        <label class="check-row"><input type="checkbox" name="enabled"> Tag low-HRV nights automatically</label>
+        <label>Claude API key
+          <input name="api_key" type="password" autocomplete="off" placeholder="sk-ant-…">
+        </label>
+        <label>Tag nights whose HRV is below
+          <input name="threshold" type="number" step="0.5" min="0" class="narrow">
+        </label>
+        <p class="field-hint">Every night Oura's raw within-night series (heart rate and HRV every five minutes, sleep phases, movement) is stored. For each night under the threshold, Claude reads that series next to a summary of your typical nights and assigns one or more <b>shape</b> tags — reusing the vocabulary below, adding a tag when none fits. Tags show on the Tracker under resting HR, and each intervention's report flags any tag its nights carry unusually often or rarely. The key is stored in this app's database only; one night costs a few cents.</p>
+        <div class="vocab-head">Vocabulary <span class="muted" id="tags-vocab-n"></span></div>
+        <ul class="vocab" id="tags-vocab"></ul>
+        <div class="modal-actions">
+          <button type="button" class="danger" id="tags-clear" hidden>Clear all tags</button>
+          <span class="spacer"></span>
+          <button type="button" class="ghost" id="tags-run" hidden>Tag pending nights</button>
+          <button type="button" class="ghost" id="tags-cancel">Close</button>
+          <button type="submit" class="primary" id="tags-save">Save</button>
+        </div>
+      </form>
     </div>
   </div>
 

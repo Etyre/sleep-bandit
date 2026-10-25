@@ -312,6 +312,7 @@ function renderGrid() {
 
   // outcome metric rows (HRV = target; resting HR = secondary, lower is better)
   for (const m of METRICS) {
+    if (m.key === "tst") body += tagsRow(nights);   // night-shape tags sit under resting HR
     body += `<tr class="metric-row${m.minor ? " minor" : ""}"><th class="rowlab metric-lab">${m.label}` +
       `<span class="rmeta">${m.hint}</span></th>`;
     for (const n of nights) {
@@ -371,6 +372,33 @@ function renderGrid() {
 }
 
 let GRID_SCROLL = null;  // remembered horizontal scroll, so re-renders don't jump to Tonight
+
+// ---- night-shape tags row --------------------------------------------------
+// Low-HRV nights (below STATE.tags.threshold) get one or more shape tags from
+// Claude's read of the raw within-night series (tags.py). Row appears once
+// tagging is on or any shown night carries a tag; a low night still waiting for
+// its read shows a dashed "…".
+const tagLabel = (slug) => ((STATE && STATE.tags && STATE.tags.vocab[slug]) || {}).label || slug;
+const tagDesc = (slug) => ((STATE && STATE.tags && STATE.tags.vocab[slug]) || {}).description || "";
+function tagChip(slug, extraTitle) {
+  const t = tagDesc(slug) + (extraTitle ? "\n\n" + extraTitle : "");
+  return `<span class="ntag" title="${esc(t)}">${esc(tagLabel(slug))}</span>`;
+}
+function tagsRow(nights) {
+  const info = (STATE && STATE.tags) || { enabled: false, threshold: 42, vocab: {} };
+  if (!info.enabled && !nights.some((n) => (n.tags || []).length)) return "";
+  let row = `<tr class="metric-row minor tags-row"><th class="rowlab metric-lab">Night shape` +
+    `<span class="rmeta">low-HRV nights (&lt; ${esc(info.threshold)}) · tagged by Claude</span></th>`;
+  for (const n of nights) {
+    const ts = n.tags || [];
+    let inner = "";
+    if (ts.length) inner = ts.map((s) => tagChip(s, n.tags_summary || "")).join("");
+    else if (info.enabled && n.hrv != null && n.hrv < info.threshold)
+      inner = `<span class="ntag pending" title="Low night — not read yet (tagging runs in the background)">…</span>`;
+    row += `<td class="tagcell${n.is_today ? " col-today" : ""}">${inner}</td>`;
+  }
+  return row + `</tr>`;
+}
 
 // ---- stale-tab guard ---------------------------------------------------------
 // The grid is a snapshot: nothing pushes updates to an open tab. A tab left open
@@ -856,6 +884,20 @@ function reportCard(iv) {
       capEl.addEventListener("click", () => openCapModal(iv));
     }
     card.appendChild(sched);
+  }
+
+  // Night-shape associations: a tag this intervention's nights carry
+  // disproportionately often (or rarely) vs its control nights -- Fisher exact
+  // test on raw counts (server.tag_associations). Flagged either way.
+  for (const f of iv.tag_flags || []) {
+    const ratio = f.ratio == null ? "" : ` (${f.ratio >= 1 ? f.ratio.toFixed(1) : (1 / f.ratio).toFixed(1)}× ${f.direction === "more" ? "more" : "less"} often)`;
+    const tip = `Among this intervention's ${f.on_n} confirmed-on nights, ${f.on_tag} were tagged “${tagLabel(f.slug)}”; ` +
+      `among its ${f.off_n} assigned-off (control) nights, ${f.off_tag}. Two-sided Fisher exact p = ${f.p}. ` +
+      `Only low-HRV nights get tags, so an intervention that simply lowers HRV picks up every tag — ` +
+      `restricted to low nights the split is ${f.low_on_tag} of ${f.low_on_n} on vs ${f.low_off_tag} of ${f.low_off_n} off.`;
+    card.appendChild(el("p", "iv-tagflag",
+      `🏷 Nights on this are tagged ${tagChip(f.slug, tip)} <b>${f.direction === "more" ? "more" : "less"} often</b>` +
+      `${ratio}: ${f.on_tag} of ${f.on_n} on-nights vs ${f.off_tag} of ${f.off_n} off-nights, p = ${f.p}.`));
   }
 
   const lObs = (iv.readout_lrhr?.n_on || 0) + (iv.readout_lrhr?.n_off || 0);
@@ -2298,11 +2340,93 @@ function handleOuraReturn() {
   else alert(m[1] === "denied" ? "Oura connection was declined." : "Oura connection failed — try connecting again.");
 }
 
+// =====================================================================
+// NIGHT-SHAPE TAGS (tags.py)
+// =====================================================================
+let TAGS = null;          // last /api/tags/status payload
+let TAGS_POLL = null;     // timer while the background tagger runs
+
+function renderTagsUI() {
+  const st = $("#tags-status");
+  const f = $("#tags-form");
+  if (!TAGS) { st.textContent = "Loading…"; return; }
+  const c = TAGS.counts, w = TAGS.worker;
+  let html = TAGS.enabled
+    ? `<b class="oura-ok">On.</b> `
+    : (TAGS.configured ? `<b>Off</b> — key saved; tick the box to start tagging. ` : `<b>Off</b> — paste a Claude API key to start. `);
+  html += `${c.tagged} tagged · ${TAGS.pending} pending of ${c.low} low night${c.low === 1 ? "" : "s"} ` +
+    `(${c.recorded} recorded, ${c.series} with raw series) · model <code>${esc(TAGS.model)}</code>` +
+    (TAGS.key_from_env ? " · key from ANTHROPIC_API_KEY" : "");
+  if (w.running) html += `<br><b>Tagging…</b> ${w.done} of ${w.total}` +
+    (w.last_date ? ` — last: ${esc(shortDate(w.last_date))} → ${(w.last_tags || []).map(tagLabel).map(esc).join(", ") || "no tags"}` : "");
+  else if (w.started && w.done) html += `<br>Last run: ${w.done} night${w.done === 1 ? "" : "s"} tagged.`;
+  if (w.error) html += `<br><span class="oura-err">${esc(w.error)}</span>`;
+  st.innerHTML = html;
+  if (document.activeElement !== f.enabled) f.enabled.checked = !!TAGS.enabled;
+  if (document.activeElement !== f.threshold) f.threshold.value = TAGS.threshold;
+  f.api_key.placeholder = TAGS.configured ? "(saved — leave blank to keep)" : "sk-ant-…";
+  $("#tags-run").hidden = !TAGS.configured || !TAGS.pending || w.running;
+  $("#tags-run").textContent = `Tag ${TAGS.pending} pending night${TAGS.pending === 1 ? "" : "s"} now`;
+  $("#tags-clear").hidden = !c.tagged;
+  $("#tags-vocab-n").textContent = `· ${TAGS.vocab.length} tags`;
+  $("#tags-vocab").innerHTML = TAGS.vocab.map((v) =>
+    `<li><span class="ntag">${esc(v.label)}</span> <b>${v.n}</b> night${v.n === 1 ? "" : "s"}` +
+    `${v.created_by !== "seed" ? ` <span class="muted">· added by ${esc(v.created_by)}</span>` : ""}<br>${esc(v.description)}</li>`).join("");
+  // keep polling while the background tagger runs, then refresh the grid once
+  if (w.running && !TAGS_POLL) {
+    TAGS_POLL = setInterval(async () => {
+      try { TAGS = await api("/api/tags/status"); } catch { return; }
+      renderTagsUI();
+      if (!TAGS.worker.running) { clearInterval(TAGS_POLL); TAGS_POLL = null; loadGrid(); }
+    }, 3000);
+  }
+}
+
+async function refreshTagsStatus() {
+  try { TAGS = await api("/api/tags/status"); } catch { TAGS = null; }
+  renderTagsUI();
+}
+
+function openTagsModal() { renderTagsUI(); $("#tags-backdrop").hidden = false; refreshTagsStatus(); }
+function closeTagsModal() { $("#tags-backdrop").hidden = true; }
+
+$("#tags-btn").addEventListener("click", openTagsModal);
+$("#tags-close").addEventListener("click", closeTagsModal);
+$("#tags-cancel").addEventListener("click", closeTagsModal);
+$("#tags-backdrop").addEventListener("click", (e) => { if (e.target === $("#tags-backdrop")) closeTagsModal(); });
+
+$("#tags-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    TAGS = await post("/api/tags/config", {
+      api_key: f.api_key.value.trim(),      // blank = keep the stored key
+      threshold: Number(f.threshold.value),
+      enabled: f.enabled.checked,
+    });
+    f.api_key.value = "";
+    renderTagsUI();
+    await loadGrid();   // the row appears/disappears with the switch
+  } catch (err) { alert("Error: " + err.message); }
+});
+
+$("#tags-run").addEventListener("click", async () => {
+  try { TAGS = await post("/api/tags/run", {}); renderTagsUI(); }
+  catch (err) { alert("Error: " + err.message); }
+});
+
+$("#tags-clear").addEventListener("click", async () => {
+  if (!confirm("Clear every night's tags?\n\nThe vocabulary is kept. Low nights will be re-read on the next run.")) return;
+  try { TAGS = await post("/api/tags/clear", {}); renderTagsUI(); await loadGrid(); }
+  catch (err) { alert("Error: " + err.message); }
+});
+
 // ---- hosted mode: what each face of the site shows -------------------------
 if (READ_ONLY) {
   // public view: no editing controls anywhere (and no way to reach the admin page)
   $("#add-btn").hidden = true;
   $("#oura-btn").hidden = true;
+  $("#tags-btn").hidden = true;
   const exp = $('.toolbar a[href="/api/export"]'); if (exp) exp.hidden = true;
   const hint = $("#view-grid .hint");
   if (hint) hint.textContent = "Each night the app chooses which interventions to run (and at what dose/option), weighted toward what's raised HRV so far. Highlighted cells were done; the bottom rows are each morning's measurements.";

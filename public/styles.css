@@ -468,3 +468,26 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .max-btn:hover { opacity: 1; color: var(--text); border-color: var(--muted); }
 .max-btn.on { color: var(--accent-2); border-color: var(--accent-2); opacity: 1; }
 .max-btn.static { cursor: default; pointer-events: none; }
+
+/* ---- night-shape tags (tags.py): Tracker row + report flags + panel ---- */
+.tagcell { padding: 3px 4px; vertical-align: top; text-align: center; background: rgba(94,224,192,.04); }
+.ntag {
+  display: inline-block; margin: 1px 2px; padding: 1px 7px; border-radius: 10px;
+  font-size: 10.5px; font-weight: 600; white-space: nowrap; cursor: help;
+  color: var(--warn); background: rgba(255,170,80,.12); border: 1px solid rgba(255,170,80,.45);
+}
+.ntag.pending { color: var(--muted); background: transparent; border-style: dashed; }
+.tags-row .rowlab { color: var(--warn); }
+.iv-tagflag { font-size: 12.5px; margin: 4px 0 2px; color: var(--muted); line-height: 1.5; }
+.iv-tagflag b { color: var(--text); }
+.tags-modal { max-width: 560px; }
+.check-row { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.check-row input { width: auto; margin: 0; }
+.modal input.narrow { width: 90px; display: inline-block; margin-left: 8px; }
+.vocab-head { font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--muted); margin: 4px 0 0; }
+.vocab { list-style: none; padding: 0; margin: 0; max-height: 220px; overflow: auto; font-size: 12px; }
+.vocab li { padding: 4px 0; border-top: 1px solid var(--line); color: var(--muted); }
+.vocab li:first-child { border-top: 0; }
+.vocab li b { color: var(--text); }
+.vocab li .ntag { cursor: default; }
+.muted { color: var(--muted); }

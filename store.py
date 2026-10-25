@@ -68,6 +68,26 @@ CREATE TABLE IF NOT EXISTS audit_log (
     intervention_id INTEGER,                   -- the intervention it touched (NULL if n/a)
     detail          TEXT NOT NULL DEFAULT ''   -- JSON: before/after values and context
 );
+CREATE TABLE IF NOT EXISTS night_series (
+    date       TEXT PRIMARY KEY,               -- the evening (same key as nights.date)
+    doc        TEXT NOT NULL,                  -- JSON: Oura's within-night series + summary (oura._series_doc)
+    fetched_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS night_tags (
+    date       TEXT PRIMARY KEY,
+    tags       TEXT NOT NULL,                  -- JSON list of tag_vocab slugs
+    summary    TEXT NOT NULL DEFAULT '',       -- the tagger's one-line reading of the night
+    model      TEXT NOT NULL DEFAULT '',       -- which model tagged it
+    hrv        REAL,                           -- the night's HRV when it was tagged
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tag_vocab (
+    slug        TEXT PRIMARY KEY,
+    label       TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',      -- 'seed' | model id | 'user'
+    created_at  TEXT NOT NULL
+);
 """
 
 
@@ -984,3 +1004,117 @@ def latest_unrecorded(conn, today):
         "SELECT date FROM nights WHERE hrv IS NULL AND date <= ? "
         "ORDER BY date DESC LIMIT 1", (today,)).fetchone()
     return r["date"] if r else None
+
+
+# ---------------------------------------------------------------------------
+# Within-night raw series (Oura's 5-minute HR / HRV samples, hypnogram, movement)
+# and the night-shape tags an LLM assigns to low-HRV nights (see tags.py)
+# ---------------------------------------------------------------------------
+def set_night_series(conn, d, doc):
+    """Store (or refresh) a night's raw Oura series document. Returns True if it
+    was new or changed."""
+    raw = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+    row = conn.execute("SELECT doc FROM night_series WHERE date=?", (d,)).fetchone()
+    if row and row["doc"] == raw:
+        return False
+    conn.execute("INSERT INTO night_series (date, doc, fetched_at) VALUES (?, ?, ?) "
+                 "ON CONFLICT(date) DO UPDATE SET doc=excluded.doc, fetched_at=excluded.fetched_at",
+                 (d, raw, _now()))
+    conn.commit()
+    return True
+
+
+def get_night_series(conn, d):
+    row = conn.execute("SELECT doc FROM night_series WHERE date=?", (d,)).fetchone()
+    return json.loads(row["doc"]) if row else None
+
+
+def all_night_series(conn):
+    """{date: doc} for every night with a stored series, plus that night's HRV."""
+    out = {}
+    for r in conn.execute("SELECT s.date, s.doc, n.hrv FROM night_series s "
+                          "LEFT JOIN nights n ON n.date = s.date ORDER BY s.date"):
+        doc = json.loads(r["doc"])
+        doc["_hrv"] = r["hrv"]
+        out[r["date"]] = doc
+    return out
+
+
+def nights_missing_series(conn):
+    """Dates of recorded nights that have no raw series yet (oldest first)."""
+    return [r["date"] for r in conn.execute(
+        "SELECT n.date FROM nights n LEFT JOIN night_series s ON s.date = n.date "
+        "WHERE n.hrv IS NOT NULL AND s.date IS NULL ORDER BY n.date")]
+
+
+def tag_vocab(conn):
+    """Ordered list of {slug, label, description, created_by} -- oldest first."""
+    return [dict(r) for r in conn.execute(
+        "SELECT slug, label, description, created_by FROM tag_vocab ORDER BY created_at, slug")]
+
+
+def upsert_tag_vocab(conn, slug, label, description, created_by):
+    """Add a tag to the vocabulary; an existing slug keeps its original label and
+    description (the tagger may re-propose a tag it already has). Returns True
+    when it was new."""
+    cur = conn.execute(
+        "INSERT INTO tag_vocab (slug, label, description, created_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?) ON CONFLICT(slug) DO NOTHING",
+        (slug, label, description, created_by, _now()))
+    if cur.rowcount:
+        _audit(conn, "tag_vocab_add", slug=slug, label=label, by=created_by)
+        conn.commit()
+        return True
+    return False
+
+
+def set_night_tags(conn, d, tags, summary, model, hrv):
+    conn.execute(
+        "INSERT INTO night_tags (date, tags, summary, model, hrv, created_at) VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(date) DO UPDATE SET tags=excluded.tags, summary=excluded.summary, "
+        "model=excluded.model, hrv=excluded.hrv, created_at=excluded.created_at",
+        (d, json.dumps(list(tags)), summary or "", model or "", hrv, _now()))
+    _audit(conn, "tag_night", d, tags=list(tags), model=model, hrv=hrv)
+    conn.commit()
+
+
+def night_tags(conn):
+    """{date: {"tags": [slug...], "summary": str, "model": str, "hrv": float}}."""
+    out = {}
+    for r in conn.execute("SELECT date, tags, summary, model, hrv FROM night_tags"):
+        out[r["date"]] = {"tags": json.loads(r["tags"]), "summary": r["summary"],
+                          "model": r["model"], "hrv": r["hrv"]}
+    return out
+
+
+def clear_night_tags(conn):
+    n = conn.execute("SELECT COUNT(*) FROM night_tags").fetchone()[0]
+    conn.execute("DELETE FROM night_tags")
+    _audit(conn, "tags_cleared", count=n)
+    conn.commit()
+    return n
+
+
+def nights_to_tag(conn, threshold):
+    """Recorded nights with HRV below the threshold that have a raw series but no
+    tags yet -- newest first, so the experiment nights get tagged before the
+    backfilled history."""
+    return [r["date"] for r in conn.execute(
+        "SELECT n.date FROM nights n JOIN night_series s ON s.date = n.date "
+        "LEFT JOIN night_tags t ON t.date = n.date "
+        "WHERE n.hrv IS NOT NULL AND n.hrv < ? AND t.date IS NULL ORDER BY n.date DESC",
+        (float(threshold),))]
+
+
+def tag_counts(conn, threshold):
+    """Bookkeeping for the tags panel."""
+    low = conn.execute("SELECT COUNT(*) FROM nights WHERE hrv IS NOT NULL AND hrv < ?",
+                       (float(threshold),)).fetchone()[0]
+    low_series = conn.execute(
+        "SELECT COUNT(*) FROM nights n JOIN night_series s ON s.date = n.date "
+        "WHERE n.hrv IS NOT NULL AND n.hrv < ?", (float(threshold),)).fetchone()[0]
+    tagged = conn.execute("SELECT COUNT(*) FROM night_tags").fetchone()[0]
+    series = conn.execute("SELECT COUNT(*) FROM night_series").fetchone()[0]
+    recorded = conn.execute("SELECT COUNT(*) FROM nights WHERE hrv IS NOT NULL").fetchone()[0]
+    return {"low": low, "low_with_series": low_series, "tagged": tagged,
+            "series": series, "recorded": recorded}

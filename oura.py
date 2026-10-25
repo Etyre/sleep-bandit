@@ -192,6 +192,42 @@ def _lrhr_5min(doc):
     return doc.get("lowest_heart_rate")
 
 
+# Within-night series kept per night (store.night_series) for the night-shape
+# tagger (tags.py): the 5-minute heart-rate and HRV samples, the 5-minute
+# hypnogram, 30-second movement, and the summary numbers that frame them.
+SERIES_FIELDS = ("bedtime_start", "bedtime_end", "latency", "awake_time", "time_in_bed",
+                 "total_sleep_duration", "efficiency", "restless_periods",
+                 "deep_sleep_duration", "light_sleep_duration", "rem_sleep_duration",
+                 "average_heart_rate", "lowest_heart_rate", "average_hrv", "average_breath",
+                 "sleep_phase_5_min", "movement_30_sec")
+
+
+def _series_doc(doc):
+    """The slice of an Oura sleep document the tagger needs."""
+    out = {k: doc.get(k) for k in SERIES_FIELDS}
+    for k in ("heart_rate", "hrv"):
+        v = doc.get(k) or {}
+        out[k] = {"interval": v.get("interval"), "items": v.get("items") or [],
+                  "timestamp": v.get("timestamp")}
+    return out
+
+
+def _write_night(conn, night, doc, result):
+    """Write one matched night's metrics (and its raw series) from its sleep doc,
+    tallying filled/updated into result."""
+    for metric, value in (("hrv", _hrv_value(doc)),
+                          ("lrhr", _lrhr_5min(doc)),
+                          ("lrhr_30s", doc.get("lowest_heart_rate")),
+                          ("tst", _tst_hours(doc)),
+                          ("lat", _latency_min(doc)),
+                          ("eff", doc.get("efficiency"))):
+        wrote = store.set_metric_from_oura(conn, night, metric, value)
+        if wrote:
+            result[wrote] += 1
+    if store.set_night_series(conn, night, _series_doc(doc)):
+        result["series"] = result.get("series", 0) + 1
+
+
 def sync(conn, current_night, force=False):
     """Bring recent past nights' HRV / resting-HR in line with Oura: blank cells are
     filled, and hand-typed values are replaced when Oura's (more precise) number
@@ -225,15 +261,7 @@ def sync(conn, current_night, force=False):
             doc = by_day.get((date.fromisoformat(night["date"]) + timedelta(days=1)).isoformat())
             if not doc:
                 continue
-            for metric, value in (("hrv", _hrv_value(doc)),
-                                  ("lrhr", _lrhr_5min(doc)),
-                                  ("lrhr_30s", doc.get("lowest_heart_rate")),
-                                  ("tst", _tst_hours(doc)),
-                                  ("lat", _latency_min(doc)),
-                                  ("eff", doc.get("efficiency"))):
-                wrote = store.set_metric_from_oura(conn, night["date"], metric, value)
-                if wrote:
-                    result[wrote] += 1
+            _write_night(conn, night["date"], doc, result)
     store.set_setting(conn, "oura_last_sync", datetime.now().isoformat(timespec="seconds"))
     store.set_setting(conn, "oura_last_result", json.dumps(result))
     return result
@@ -265,15 +293,33 @@ def backfill(conn, first_night, last_night):
     result = {"nights_found": len(by_day), "filled": 0, "updated": 0}
     for day, doc in sorted(by_day.items()):
         night = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
-        for metric, value in (("hrv", _hrv_value(doc)),
-                              ("lrhr", _lrhr_5min(doc)),
-                              ("lrhr_30s", doc.get("lowest_heart_rate")),
-                              ("tst", _tst_hours(doc)),
-                              ("lat", _latency_min(doc)),
-                              ("eff", doc.get("efficiency"))):
-            wrote = store.set_metric_from_oura(conn, night, metric, value)
-            if wrote:
-                result[wrote] += 1
+        _write_night(conn, night, doc, result)
+    return result
+
+
+SERIES_CHUNK_DAYS = 60
+
+
+def backfill_series(conn):
+    """Fetch the raw within-night series for every recorded night that doesn't have
+    one yet (the metrics themselves are left alone). Pulls Oura in 60-day chunks
+    spanning the missing dates. Returns {"missing": n, "fetched": n}."""
+    missing = store.nights_missing_series(conn)
+    result = {"missing": len(missing), "fetched": 0}
+    if not missing:
+        return result
+    want = set(missing)
+    start = date.fromisoformat(missing[0])
+    last = date.fromisoformat(missing[-1])
+    while start <= last:
+        end = min(start + timedelta(days=SERIES_CHUNK_DAYS - 1), last)
+        by_day = _main_sleep_by_day(fetch_sleep(
+            conn, (start + timedelta(days=1)).isoformat(), (end + timedelta(days=2)).isoformat()))
+        for day, doc in by_day.items():
+            night = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+            if night in want and store.set_night_series(conn, night, _series_doc(doc)):
+                result["fetched"] += 1
+        start = end + timedelta(days=1)
     return result
 
 

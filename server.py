@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 import auth
 import bandit
 import oura
+import tags
 import store
 
 HOST = os.environ.get("SB_HOST", "127.0.0.1")
@@ -469,6 +470,7 @@ def state_payload(conn):
     d_today = today_str()
     ivs = store.list_interventions(conn)  # active first, then paused
     nights_rows = store.recent_nights(conn, GRID_NIGHTS)  # newest first, incl. today
+    tags_by_date = store.night_tags(conn)
 
     nights, cells = [], {}
     for n in nights_rows:
@@ -491,6 +493,8 @@ def state_payload(conn):
             "excl_environmental": bool(n["excl_environmental"]),
             "maximize": bool(n["maximize"]),
             "is_today": n["date"] == d_today,
+            "tags": (tags_by_date.get(n["date"]) or {}).get("tags", []),
+            "tags_summary": (tags_by_date.get(n["date"]) or {}).get("summary", ""),
         })
         cmap = {}
         for a in n["assignments"]:
@@ -505,7 +509,7 @@ def state_payload(conn):
         cells[n["date"]] = cmap
 
     return {"today": d_today, "interventions": ivs, "nights": nights, "cells": cells,
-            **analysis_modes(conn)}
+            "tags": tags_info(conn), **analysis_modes(conn)}
 
 
 def _readout(iv, all_nights, metric, negate):
@@ -654,6 +658,82 @@ def hrv_trend_payload(conn):
             "app_start": store.first_assigned_night(conn)}
 
 
+def tags_info(conn):
+    """What every payload carries about night-shape tags: whether tagging is on,
+    the HRV threshold, and the vocabulary (slug -> label/description)."""
+    return {"enabled": tags.enabled(conn), "threshold": tags.threshold(conn),
+            "vocab": {v["slug"]: {"label": v["label"], "description": v["description"]}
+                      for v in store.tag_vocab(conn)}}
+
+
+def _fisher_two_sided(a, b, c, d):
+    """Two-sided Fisher exact p-value for the 2x2 table [[a, b], [c, d]]: the sum of
+    the hypergeometric probabilities of every table (same margins) no more likely
+    than the observed one. Exact, stdlib only."""
+    n1, n2, k = a + b, c + d, a + c
+    n = n1 + n2
+    if n == 0 or k == 0 or k == n or n1 == 0 or n2 == 0:
+        return 1.0
+    denom = math.comb(n, k)
+    def p_of(x):
+        return math.comb(n1, x) * math.comb(n2, k - x) / denom
+    p_obs = p_of(a)
+    lo, hi = max(0, k - n2), min(k, n1)
+    return min(1.0, sum(p for p in (p_of(x) for x in range(lo, hi + 1)) if p <= p_obs * (1 + 1e-9)))
+
+
+TAG_FLAG_P = 0.05        # flag an intervention-tag association at this two-sided p
+TAG_FLAG_MIN_TAGGED = 3  # ... and only when at least this many of its nights carry the tag
+
+
+def tag_associations(iv, all_nights, tags_by_date, vocab):
+    """Does this intervention's presence go with a kind of night? For every tag,
+    compare how often the intervention's confirmed-on nights carry it with how
+    often its assigned-off nights do (same nights that count for its HRV read-out:
+    category exclusions and cell exclusions respected; recency weights ignored --
+    these are raw counts). Fisher's exact test; flagged in either direction.
+
+    Nights above the HRV threshold are never tagged, so an intervention that
+    lowers HRV outright will tend to pick up every tag -- the per-flag counts
+    among LOW nights only are included so the reader can tell "more bad nights"
+    from "a different kind of bad night"."""
+    on_dates, off_dates = [], []
+    cat = iv.get("category")
+    for n in all_nights:
+        if cat and n.get("excl_" + cat):
+            continue
+        if n.get("hrv") is None:
+            continue
+        st = _on_state(n, iv["id"])
+        if st == 1:
+            on_dates.append(n["date"])
+        elif st == 0:
+            off_dates.append(n["date"])
+    if not on_dates or not off_dates:
+        return []
+    low_on = [d for d in on_dates if d in tags_by_date]
+    low_off = [d for d in off_dates if d in tags_by_date]
+    out = []
+    for slug, meta in vocab.items():
+        a = sum(1 for d in on_dates if slug in tags_by_date.get(d, {}).get("tags", []))
+        c = sum(1 for d in off_dates if slug in tags_by_date.get(d, {}).get("tags", []))
+        if a + c < TAG_FLAG_MIN_TAGGED:
+            continue
+        b, dd = len(on_dates) - a, len(off_dates) - c
+        p = _fisher_two_sided(a, b, c, dd)
+        if p >= TAG_FLAG_P:
+            continue
+        r_on, r_off = a / len(on_dates), c / len(off_dates)
+        out.append({
+            "slug": slug, "label": meta["label"], "direction": "more" if r_on > r_off else "less",
+            "on_tag": a, "on_n": len(on_dates), "off_tag": c, "off_n": len(off_dates),
+            "low_on_tag": a, "low_on_n": len(low_on), "low_off_tag": c, "low_off_n": len(low_off),
+            "ratio": (r_on / r_off) if r_off > 0 else None, "p": round(p, 4),
+        })
+    out.sort(key=lambda f: f["p"])
+    return out
+
+
 def reports_payload(conn):
     """Per-intervention efficacy read-outs for BOTH metrics (HRV: higher better;
     LRHR: lower better). Each intervention is fit on its own compliant nights.
@@ -664,10 +744,13 @@ def reports_payload(conn):
     all_nights = analysis_nights_weighted(conn)
     recency_on = recency_enabled(conn)   # recency mode also disables the lock-in guard
     n_hrv = _n_experiment_nights(all_nights)
+    tinfo = tags_info(conn)
+    tags_by_date = store.night_tags(conn)
     out = []
     for iv in ivs:
         out.append({
             **iv,
+            "tag_flags": tag_associations(iv, all_nights, tags_by_date, tinfo["vocab"]),
             "readout": _readout(iv, all_nights, "hrv", negate=False),
             "readout_lrhr": _readout(iv, all_nights, "lrhr", negate=True),
             "readout_tst": _readout(iv, all_nights, "tst", negate=False),
@@ -677,7 +760,7 @@ def reports_payload(conn):
             **_sched_info(iv, all_nights, lockin_off=recency_on),
         })
     return {"n_completed": n_hrv, "interventions": out,
-            "hrv_trend": hrv_trend_payload(conn),
+            "hrv_trend": hrv_trend_payload(conn), "tags": tinfo,
             **analysis_modes(conn)}
 
 
@@ -1020,6 +1103,8 @@ class Handler(BaseHTTPRequestHandler):
                 })
             if path == "/api/oura/status":
                 return self._send_json(oura.status(conn))
+            if path == "/api/tags/status":
+                return self._send_json(tags.status(conn))
             if path == "/oura/connect":
                 # start the OAuth dance: remember a CSRF state, hand off to Oura
                 client_id = store.get_setting(conn, "oura_client_id")
@@ -1213,8 +1298,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(oura.status(conn))
 
             if path == "/api/oura/sync":
-                return self._send_json(oura.sync(conn, today_str(),
-                                                 force=bool(body.get("force"))))
+                res = oura.sync(conn, today_str(), force=bool(body.get("force")))
+                if tags.enabled(conn) and tags.api_key(conn) \
+                        and store.nights_to_tag(conn, tags.threshold(conn)):
+                    tags.run_pending_async(limit=tags.PER_PASS)
+                return self._send_json(res)
 
             if path == "/api/oura/disconnect":
                 for k in ("oura_access_token", "oura_refresh_token", "oura_expires_at",
@@ -1223,6 +1311,53 @@ class Handler(BaseHTTPRequestHandler):
                 store._audit(conn, "oura_disconnect")
                 conn.commit()
                 return self._send_json(oura.status(conn))
+
+            # ---- night-shape tags (tags.py) ----
+            if path == "/api/tags/config":
+                if "api_key" in body:
+                    key = (body.get("api_key") or "").strip()
+                    if key:   # blank means "keep the stored key"
+                        store.set_setting(conn, "anthropic_api_key", key)
+                if "threshold" in body:
+                    try:
+                        store.set_setting(conn, "tags_threshold", str(float(body["threshold"])))
+                    except (TypeError, ValueError):
+                        return self._send_json({"error": "Threshold must be a number."}, 400)
+                if "enabled" in body:
+                    on = bool(body.get("enabled"))
+                    if on and not tags.api_key(conn):
+                        return self._send_json({"error": "Paste an API key before switching tagging on."}, 400)
+                    store.set_setting(conn, "tags_enabled", "1" if on else "0")
+                    store._audit(conn, "set_tags_enabled", enabled=on)
+                if body.get("forget_key"):
+                    store.set_setting(conn, "anthropic_api_key", None)
+                    store.set_setting(conn, "tags_enabled", "0")
+                st = tags.status(conn)
+                if st["enabled"] and st["pending"]:
+                    tags.run_pending_async()
+                    st["worker"] = tags.worker_status()
+                return self._send_json(st)
+
+            if path == "/api/tags/run":
+                # tag every pending low night in the background; the panel polls status
+                if not tags.api_key(conn):
+                    return self._send_json({"error": "No API key saved."}, 400)
+                if tags.status(conn)["counts"]["low"] > tags.status(conn)["counts"]["low_with_series"]:
+                    oura.backfill_series(conn)
+                tags.run_pending_async(limit=body.get("limit"))
+                return self._send_json(tags.status(conn))
+
+            if path == "/api/tags/series":
+                # fetch the raw series for every recorded night that lacks one
+                try:
+                    return self._send_json(oura.backfill_series(conn))
+                except oura.OuraError as e:
+                    return self._send_json({"error": str(e)}, 400)
+
+            if path == "/api/tags/clear":
+                n = store.clear_night_tags(conn)
+                return self._send_json({"cleared": n, **tags.status(conn)})
+
         finally:
             conn.close()
         self.send_error(404)
@@ -1299,6 +1434,9 @@ def _autosync_loop():
                 ensure_tonight(conn)
                 if oura.status(conn).get("connected"):
                     oura.sync(conn, today_str())
+                if tags.enabled(conn) and tags.api_key(conn) \
+                        and store.nights_to_tag(conn, tags.threshold(conn)):
+                    tags.run_pending_async(limit=tags.PER_PASS)
             finally:
                 conn.close()
         except Exception:
