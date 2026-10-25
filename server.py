@@ -28,6 +28,7 @@ import auth
 import bandit
 import oura
 import tags
+import weather
 import store
 
 HOST = os.environ.get("SB_HOST", "127.0.0.1")
@@ -665,6 +666,145 @@ def _vocab_order(slugs, rank):
     return sorted(slugs, key=lambda s: (rank.get(s, len(rank)), s))
 
 
+# ---------------------------------------------------------------------------
+# Setting vs. outdoor temperature (temperature-dosed interventions: Chili Pad, AC)
+# ---------------------------------------------------------------------------
+SEASON_MIN_POINTS = 6      # fewer nights with weather than this: no section
+SEASON_MIN_CELL = 2        # a bin's best setting must have at least this many nights
+
+
+def is_temperature_dosed(iv):
+    return iv.get("kind") == "dose" and "°" in (iv.get("unit") or "")
+
+
+def _solve(A, b):
+    """Gaussian elimination with partial pivoting; None if singular."""
+    n = len(b)
+    M = [row[:] + [b[i]] for i, row in enumerate(A)]
+    for c in range(n):
+        piv = max(range(c, n), key=lambda r: abs(M[r][c]))
+        if abs(M[piv][c]) < 1e-12:
+            return None
+        M[c], M[piv] = M[piv], M[c]
+        for r in range(n):
+            if r != c:
+                f = M[r][c] / M[c][c]
+                for k in range(c, n + 1):
+                    M[r][k] -= f * M[c][k]
+    return [M[i][n] / M[i][i] for i in range(n)]
+
+
+def _ols(X, y):
+    """Plain least squares: (coefs, standard errors, df) or None."""
+    p = len(X[0]); n = len(y)
+    if n <= p + 1:
+        return None
+    XtX = [[sum(X[k][i] * X[k][j] for k in range(n)) for j in range(p)] for i in range(p)]
+    Xty = [sum(X[k][i] * y[k] for k in range(n)) for i in range(p)]
+    beta = _solve(XtX, Xty)
+    if beta is None:
+        return None
+    resid = [y[k] - sum(X[k][i] * beta[i] for i in range(p)) for k in range(n)]
+    s2 = sum(r * r for r in resid) / (n - p)
+    # diagonal of (XtX)^-1 via solving for unit vectors
+    se = []
+    for i in range(p):
+        e = [1.0 if j == i else 0.0 for j in range(p)]
+        col = _solve(XtX, e)
+        if col is None:
+            return None
+        se.append(math.sqrt(max(0.0, s2 * col[i])))
+    return beta, se, n - p
+
+
+def season_payload(iv, all_nights, wx):
+    """For a temperature-dosed intervention: every counted night as (outdoor night
+    temperature, setting, HRV), the nights binned by outdoor temperature with the
+    per-setting average in each bin, and a dose x outdoor interaction fit. Outdoor
+    temperatures come back in the intervention's own unit. HRV is baseline-adjusted
+    when that mode is on (same adjustment as the read-outs). None if too thin."""
+    to_f = "f" in (iv.get("unit") or "").lower()
+    conv = (lambda c: c * 9.0 / 5.0 + 32.0) if to_f else (lambda c: c)
+    cat = iv.get("category")
+    rows = []
+    for n in all_nights:
+        if cat and n.get("excl_" + cat):
+            continue
+        if n.get("hrv") is None:
+            continue
+        a = n["assigns"].get(iv["id"])
+        if a is None or a.get("excluded"):
+            continue
+        assigned = a["assigned"] or 0
+        if assigned > 0:
+            if not (a["taken"] is not None and a["taken"] > 0):
+                continue
+            dose = float(assigned)
+        else:
+            dose = 0.0
+        w = wx.get(n["date"])
+        if not w or w.get("tnight") is None:
+            continue
+        rows.append({"date": n["date"], "dose": dose, "hrv": float(n["hrv"]),
+                     "base": n.get("base_hrv"), "out": conv(float(w["tnight"]))})
+    if len(rows) < SEASON_MIN_POINTS:
+        return None
+    # baseline adjustment (common centre, as in _readout)
+    bs = [r["base"] for r in rows if r["base"] is not None]
+    if bs and all(r["base"] is not None for r in rows):
+        c = sum(bs) / len(bs)
+        for r in rows:
+            r["hrv"] = r["hrv"] - r["base"] + c
+    points = [{"date": r["date"], "dose": r["dose"], "hrv": round(r["hrv"], 1), "out": round(r["out"], 1)}
+              for r in rows]
+    # outdoor-temperature bins: terciles when there are enough nights, else halves
+    outs = sorted(r["out"] for r in rows)
+    k = 3 if len(rows) >= 12 else 2
+    cuts = [outs[int(len(outs) * i / k)] for i in range(1, k)]
+    def bin_of(o):
+        return sum(1 for ccut in cuts if o >= ccut)
+    deg = "°F" if to_f else "°C"
+    labels = []
+    for i in range(k):
+        if i == 0:
+            labels.append(f"below {cuts[0]:.1f}{deg}")
+        elif i == k - 1:
+            labels.append(f"{cuts[-1]:.1f}{deg} and up")
+        else:
+            labels.append(f"{cuts[i-1]:.1f}–{cuts[i]:.1f}{deg}")
+    doses = sorted({r["dose"] for r in rows})
+    bins = []
+    for i in range(k):
+        inb = [r for r in rows if bin_of(r["out"]) == i]
+        cells = {}
+        for d in doses:
+            v = [r["hrv"] for r in inb if r["dose"] == d]
+            if v:
+                cells[repr(d)] = {"mean": round(sum(v) / len(v), 1), "n": len(v)}
+        best = None
+        cand = [(c["mean"], d) for d, c in cells.items() if c["n"] >= SEASON_MIN_CELL]
+        if cand:
+            best = max(cand)[1]
+        bins.append({"label": labels[i], "n": len(inb), "cells": cells, "best": best,
+                     "out_mean": round(sum(r["out"] for r in inb) / len(inb), 1) if inb else None})
+    # interaction: HRV ~ a + b*dose + c*out + d*dose*out on the ON nights only
+    on = [r for r in rows if r["dose"] > 0]
+    inter = None
+    if len(on) >= 10 and len({r["dose"] for r in on}) >= 2:
+        om = sum(r["out"] for r in on) / len(on)
+        dm = sum(r["dose"] for r in on) / len(on)
+        X = [[1.0, r["dose"] - dm, r["out"] - om, (r["dose"] - dm) * (r["out"] - om)] for r in on]
+        fit = _ols(X, [r["hrv"] for r in on])
+        if fit:
+            beta, se, df = fit
+            inter = {"coef": round(beta[3], 3), "se": round(se[3], 3), "n": len(on),
+                     "dose_slope": round(beta[1], 2), "dose_slope_se": round(se[1], 2),
+                     "out_slope": round(beta[2], 2), "out_slope_se": round(se[2], 2)}
+    return {"deg": deg, "points": points, "bins": bins, "doses": doses,
+            "dose_counts": {repr(d): sum(1 for r in rows if r["dose"] == d) for d in doses},
+            "interaction": inter, "n": len(rows)}
+
+
 def tags_info(conn):
     """What every payload carries about night-shape tags: whether tagging is on,
     the HRV threshold, and the vocabulary (slug -> label/description)."""
@@ -754,11 +894,13 @@ def reports_payload(conn):
     n_hrv = _n_experiment_nights(all_nights)
     tinfo = tags_info(conn)
     tags_by_date = store.night_tags(conn)
+    wx = store.weather_series(conn)
     out = []
     for iv in ivs:
         out.append({
             **iv,
             "tag_flags": tag_associations(iv, all_nights, tags_by_date, tinfo["vocab"]),
+            "season": season_payload(iv, all_nights, wx) if is_temperature_dosed(iv) else None,
             "readout": _readout(iv, all_nights, "hrv", negate=False),
             "readout_lrhr": _readout(iv, all_nights, "lrhr", negate=True),
             "readout_tst": _readout(iv, all_nights, "tst", negate=False),
@@ -1307,6 +1449,10 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/api/oura/sync":
                 res = oura.sync(conn, today_str(), force=bool(body.get("force")))
+                try:
+                    weather.sync(conn, today_str())
+                except Exception:
+                    traceback.print_exc()
                 if tags.enabled(conn) and tags.api_key(conn) \
                         and store.nights_to_tag(conn, tags.threshold(conn)):
                     tags.run_pending_async(limit=tags.PER_PASS)
@@ -1442,6 +1588,7 @@ def _autosync_loop():
                 ensure_tonight(conn)
                 if oura.status(conn).get("connected"):
                     oura.sync(conn, today_str())
+                weather.sync(conn, today_str())
                 if tags.enabled(conn) and tags.api_key(conn) \
                         and store.nights_to_tag(conn, tags.threshold(conn)):
                     tags.run_pending_async(limit=tags.PER_PASS)

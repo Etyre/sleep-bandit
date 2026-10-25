@@ -813,8 +813,124 @@ try { REPORT_OPEN = JSON.parse(localStorage.getItem("sb.reportOpen") || "{}") ||
 
 function reportCard(iv) {
   const card = reportCardBody(iv);
+  if (iv.season) appendSeason(card, iv);
   appendTagFlags(card, iv);
   return card;
+}
+
+// ---- setting vs. outdoor temperature ------------------------------------------
+// For temperature-dosed interventions (Chili Pad, air conditioning): every counted
+// night plotted as outdoor night temperature vs HRV, colored by the setting, plus
+// the nights binned by outdoor temperature with each setting's average -- does the
+// best setting move with the season? (server.season_payload; weather.py)
+function appendSeason(card, iv) {
+  const sp = iv.season;
+  const deg = sp.deg;
+  // color follows the setting's VALUE (coolest blue -> warmest red), so two nearby
+  // settings look alike and the extremes stand apart; off nights are hollow grey
+  const onDoses = sp.doses.filter((d) => d > 0);
+  const dLo = Math.min(...onDoses), dHi = Math.max(...onDoses);
+  const colorOf = (d) => d > 0
+    ? `hsl(${Math.round(dHi > dLo ? 215 - 200 * (d - dLo) / (dHi - dLo) : 200)} 70% 58%)`
+    : "var(--muted)";
+  const fmtDose = (d) => d > 0 ? `${numLabel(d)} ${esc(iv.unit)}` : "off";
+
+  const sec = el("div", "season");
+  sec.appendChild(el("div", "season-head",
+    `🌡 Setting vs. outdoor temperature <span class="rmeta">Berkeley night air (9 pm–6 am mean, Open-Meteo), in ${deg} · ` +
+    `${sp.n} night${sp.n === 1 ? "" : "s"}${BASELINE_ON ? " · HRV baseline-adj." : ""}</span>`));
+  const row = el("div", "season-row");
+
+  // --- scatter: x outdoor, y HRV, colored by setting; per-setting trend when ≥ 4 nights
+  const pts = sp.points;
+  const W = 460, H = 210, mL = 36, mR = 12, mT = 12, mB = 34;
+  const pL = mL, pR = W - mR, pT = mT, pB = H - mB;
+  let xlo = Math.min(...pts.map((p) => p.out)), xhi = Math.max(...pts.map((p) => p.out));
+  let ylo = Math.min(...pts.map((p) => p.hrv)), yhi = Math.max(...pts.map((p) => p.hrv));
+  if (xhi - xlo < 1) { xhi += 0.5; xlo -= 0.5; }
+  if (yhi - ylo < 1) { yhi += 1; ylo -= 1; }
+  const xpad = (xhi - xlo) * 0.06, ypad = (yhi - ylo) * 0.08;
+  xlo -= xpad; xhi += xpad; ylo -= ypad; yhi += ypad;
+  const px = (v) => pL + (v - xlo) / (xhi - xlo) * (pR - pL);
+  const py = (v) => pT + (yhi - v) / (yhi - ylo) * (pB - pT);
+  const parts = [];
+  parts.push(`<line x1="${pL}" y1="${pB}" x2="${pR}" y2="${pB}" style="stroke:var(--line)"/>`);
+  parts.push(`<line x1="${pL}" y1="${pT}" x2="${pL}" y2="${pB}" style="stroke:var(--line)"/>`);
+  parts.push(`<text x="${pL - 5}" y="${pT + 4}" text-anchor="end" font-size="10" style="fill:var(--muted)">${Math.round(yhi)}</text>`);
+  parts.push(`<text x="${pL - 5}" y="${pB}" text-anchor="end" font-size="10" style="fill:var(--muted)">${Math.round(ylo)}</text>`);
+  parts.push(`<text x="${pL - 5}" y="${(pT + pB) / 2 + 3}" text-anchor="end" font-size="9.5" style="fill:var(--muted)">HRV</text>`);
+  // bin boundaries (the cut-offs the table uses)
+  const cuts = sp.bins.slice(1).map((b) => Number((b.label.match(/^([\d.]+)/) || [])[1])).filter((v) => !Number.isNaN(v));
+  for (const c of cuts) parts.push(`<line x1="${px(c)}" y1="${pT}" x2="${px(c)}" y2="${pB}" stroke-dasharray="3 4" style="stroke:var(--line)"/>`);
+  for (const v of [xlo + xpad, xhi - xpad]) parts.push(`<text x="${px(v)}" y="${pB + 13}" text-anchor="middle" font-size="10" style="fill:var(--muted)">${v.toFixed(1)}</text>`);
+  for (const c of cuts) parts.push(`<text x="${px(c)}" y="${pB + 13}" text-anchor="middle" font-size="10" style="fill:var(--muted)">${c.toFixed(1)}</text>`);
+  parts.push(`<text x="${(pL + pR) / 2}" y="${H - 3}" text-anchor="middle" font-size="9.5" style="fill:var(--muted)">outdoor night temperature, ${deg}</text>`);
+  // trend per setting (least squares) when it has at least 4 nights
+  for (const d of sp.doses) {
+    const q = pts.filter((p) => p.dose === d);
+    if (q.length < 4) continue;
+    const mx = q.reduce((a, p) => a + p.out, 0) / q.length, my = q.reduce((a, p) => a + p.hrv, 0) / q.length;
+    const sxx = q.reduce((a, p) => a + (p.out - mx) ** 2, 0);
+    if (sxx < 1e-9) continue;
+    const b = q.reduce((a, p) => a + (p.out - mx) * (p.hrv - my), 0) / sxx;
+    const x0 = Math.min(...q.map((p) => p.out)), x1 = Math.max(...q.map((p) => p.out));
+    parts.push(`<line x1="${px(x0)}" y1="${py(my + b * (x0 - mx))}" x2="${px(x1)}" y2="${py(my + b * (x1 - mx))}" ` +
+      `stroke-width="1.5" style="stroke:${colorOf(d)};opacity:.55"${d === 0 ? ' stroke-dasharray="4 3"' : ""}/>`);
+  }
+  for (const p of pts) {
+    const col = colorOf(p.dose);
+    const title = `${shortDate(p.date)} · ${fmtDose(p.dose)} · HRV ${p.hrv.toFixed(1)} · outside ${p.out.toFixed(1)}${deg}`;
+    parts.push(p.dose > 0
+      ? `<circle cx="${px(p.out)}" cy="${py(p.hrv)}" r="4.5" style="fill:${col};stroke:var(--panel)" stroke-width="1.5"><title>${esc(title)}</title></circle>`
+      : `<circle cx="${px(p.out)}" cy="${py(p.hrv)}" r="4" fill="none" style="stroke:${col}" stroke-width="1.6"><title>${esc(title)}</title></circle>`);
+  }
+  const chart = el("div", "season-chart",
+    `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img" ` +
+    `aria-label="Outdoor night temperature versus HRV for ${esc(iv.name)}, colored by setting">${parts.join("")}</svg>`);
+  const legend = el("div", "season-legend");
+  legend.innerHTML = sp.doses.map((d) =>
+    `<span class="season-key"><i style="${d > 0 ? "background:" + colorOf(d) : "border:1.5px solid var(--muted)"}"></i>${fmtDose(d)}` +
+    `<span class="muted"> ${sp.dose_counts[String(Number(d).toFixed(1))] || ""}</span></span>`).join("");
+  chart.appendChild(legend);
+  row.appendChild(chart);
+
+  // --- table: outdoor bins × settings (settings with ≥ 2 nights overall)
+  const cols = sp.doses.filter((d) => (sp.dose_counts[String(Number(d).toFixed(1))] || 0) >= 2);
+  const t = el("table", "season-table");
+  let h = `<tr><th>Outdoor night</th>`;
+  for (const d of cols) h += `<th style="color:${colorOf(d)}">${fmtDose(d)}</th>`;
+  h += `</tr>`;
+  for (const b of sp.bins) {
+    h += `<tr><th>${esc(b.label)}<span class="rmeta">${b.n} night${b.n === 1 ? "" : "s"}</span></th>`;
+    for (const d of cols) {
+      const c = b.cells[String(Number(d).toFixed(1))];
+      const best = b.best != null && Number(b.best) === d;
+      h += `<td class="${best ? "best" : ""}" title="${c ? `${c.n} night${c.n === 1 ? "" : "s"} at this setting in this outdoor range` : "no nights"}">` +
+        (c ? `${best ? "★ " : ""}<b>${avg1(c.mean)}</b><span class="muted"> ${c.n}</span>` : `<span class="muted">—</span>`) + `</td>`;
+    }
+    h += `</tr>`;
+  }
+  t.innerHTML = h;
+  row.appendChild(t);
+  sec.appendChild(row);
+
+  // --- does the best setting move with the weather? (dose × outdoor interaction)
+  const it = sp.interaction;
+  let note;
+  if (it) {
+    const lo = it.coef - 1.645 * it.se, hi = it.coef + 1.645 * it.se;
+    const clear = lo > 0 || hi < 0;
+    const s1 = (x) => Math.abs(x) < 0.05 ? "0.0" : signed(x);   // no "-0.0"
+    note = `Average HRV per bin, ★ = best setting with at least 2 nights. Interaction fit on the ${it.n} on-nights: ` +
+      `each extra outdoor degree changes the per-degree effect of the setting by <b>${s1(it.coef)}</b> ms ` +
+      `(90% CI ${s1(lo)} to ${s1(hi)}) — ` +
+      (clear ? `<b class="${it.coef > 0 ? "good" : "bad"}">the best setting does look weather-dependent</b>.`
+             : `no sign yet that the best setting moves with the weather.`);
+  } else {
+    note = `Average HRV per bin, ★ = best setting with at least 2 nights. Too few on-nights across settings to test whether the best setting moves with the weather.`;
+  }
+  sec.appendChild(el("p", "season-note", note));
+  card.appendChild(sec);
 }
 
 // Night-shape associations, at the foot of the card: a tag this intervention's

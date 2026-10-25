@@ -204,6 +204,19 @@ Every read is audited (`tag_night`, `tag_usage`); a new vocabulary entry is audi
 as `tag_vocab_add`. The call goes over plain HTTPS from `tags.py` -- no SDK, since
 the app stays standard-library only on the system Python.
 
+## Setting vs. outdoor temperature
+
+A temperature-dosed intervention (unit contains `°`: Chili Pad, air conditioning)
+gets a section at the foot of its report asking whether its best setting depends on
+the season. `weather.py` keeps each night's outdoor temperature from Open-Meteo
+(Berkeley by default; `SB_LAT` / `SB_LON` / `SB_TZ` override): the 9 pm–6 am mean
+and minimum, and the day's maximum, fetched with each sync. The section plots every
+counted night as outdoor night temperature against HRV, colored by setting, bins the
+nights into outdoor-temperature terciles with each setting's average per bin (★ the
+best with at least two nights), and fits HRV ~ setting × outdoor temperature on the
+on-nights, reporting the interaction with a 90% interval. Same nights and the same
+baseline adjustment as the read-outs. `server.season_payload`.
+
 ## Running locally
 
 `python3 server.py` starts it on port 8777 (`SB_PORT`, `SB_HOST` override). Opening
@@ -256,6 +269,7 @@ Relevant environment variables: `SB_PUBLIC`, `SB_ADMIN_PATH`, `SB_PASSWORD_HASH`
 | `store.py` | SQLite schema, migrations, every write (audited) |
 | `oura.py` | OAuth and sync, including the raw within-night series |
 | `tags.py` | night-shape tags: features, reference, the Claude call, background tagger |
+| `weather.py` | outdoor temperature per night (Open-Meteo) for the season sections |
 | `auth.py` | password hashing and session cookies for hosted mode |
 | `public/` | the single-page UI: `index.html`, `app.js`, `styles.css` |
 | `deploy/` | VPS setup: systemd units, Caddyfile, backup timer |

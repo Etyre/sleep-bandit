@@ -500,3 +500,22 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .vocab li .ntag { cursor: default; }
 .muted { color: var(--muted); }
 .claude-mark { vertical-align: -2px; margin-right: 2px; }
+
+/* ---- setting vs. outdoor temperature (temperature-dosed interventions) ---- */
+.season { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
+.season-head { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+.season-head .rmeta { display: block; font-weight: 400; font-size: 11px; color: var(--muted); }
+.season-row { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: flex-start; }
+.season-chart { flex: 1 1 320px; min-width: 260px; max-width: 480px; }
+.season-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--muted); margin-top: 4px; }
+.season-key i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; box-sizing: border-box; }
+.season-table { flex: 1 1 260px; border-collapse: collapse; font-size: 12px; }
+.season-table th, .season-table td { padding: 4px 8px; border-bottom: 1px solid var(--line); text-align: center; white-space: nowrap; }
+.season-table th { font-size: 11px; color: var(--muted); font-weight: 600; }
+.season-table tr > th:first-child { text-align: left; color: var(--text); }
+.season-table tr > th:first-child .rmeta { display: block; font-weight: 400; font-size: 10.5px; color: var(--muted); }
+.season-table td.best { background: rgba(94,224,192,.08); }
+.season-table td.best b { color: var(--accent-2); }
+.season-note { font-size: 12px; color: var(--muted); margin: 8px 0 0; line-height: 1.5; }
+.season-note b.good { color: var(--good); }
+.season-note b.bad { color: var(--bad); }

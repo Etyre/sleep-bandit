@@ -81,6 +81,13 @@ CREATE TABLE IF NOT EXISTS night_tags (
     hrv        REAL,                           -- the night's HRV when it was tagged
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS weather (
+    date       TEXT PRIMARY KEY,               -- the evening (same key as nights.date)
+    tnight     REAL,                           -- mean outdoor °C 21:00 that evening .. 06:00 next morning
+    tmin       REAL,                           -- min outdoor °C over the same window
+    tmax       REAL,                           -- max outdoor °C over the day of the evening
+    fetched_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS tag_vocab (
     slug        TEXT PRIMARY KEY,
     label       TEXT NOT NULL,
@@ -1118,3 +1125,25 @@ def tag_counts(conn, threshold):
     recorded = conn.execute("SELECT COUNT(*) FROM nights WHERE hrv IS NOT NULL").fetchone()[0]
     return {"low": low, "low_with_series": low_series, "tagged": tagged,
             "series": series, "recorded": recorded}
+
+
+# ---------------------------------------------------------------------------
+# Outdoor weather per night (weather.py): is the best pad / AC setting seasonal?
+# ---------------------------------------------------------------------------
+def set_weather(conn, d, tnight, tmin, tmax):
+    conn.execute("INSERT INTO weather (date, tnight, tmin, tmax, fetched_at) VALUES (?, ?, ?, ?, ?) "
+                 "ON CONFLICT(date) DO UPDATE SET tnight=excluded.tnight, tmin=excluded.tmin, "
+                 "tmax=excluded.tmax, fetched_at=excluded.fetched_at", (d, tnight, tmin, tmax, _now()))
+
+
+def weather_series(conn):
+    """{date: {"tnight", "tmin", "tmax"}} in °C for every night fetched."""
+    return {r["date"]: {"tnight": r["tnight"], "tmin": r["tmin"], "tmax": r["tmax"]}
+            for r in conn.execute("SELECT date, tnight, tmin, tmax FROM weather")}
+
+
+def nights_missing_weather(conn, since, before):
+    """Recorded nights in [since, before) with no weather row yet, oldest first."""
+    return [r["date"] for r in conn.execute(
+        "SELECT n.date FROM nights n LEFT JOIN weather w ON w.date = n.date "
+        "WHERE n.date >= ? AND n.date < ? AND w.date IS NULL ORDER BY n.date", (since, before))]
