@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS weather (
     tnight     REAL,                           -- mean outdoor °C 21:00 that evening .. 06:00 next morning
     tmin       REAL,                           -- min outdoor °C over the same window
     tmax       REAL,                           -- max outdoor °C over the day of the evening
+    src        TEXT NOT NULL DEFAULT 'clock',  -- 'sleep': window = Oura bedtime..wake; 'clock': 21:00..06:00 fallback
     fetched_at TEXT NOT NULL,
     PRIMARY KEY (date, city)
 );
@@ -256,9 +257,12 @@ def connect():
         # the first weather table was Berkeley-only and keyed by date alone
         conn.executescript("""
             CREATE TABLE weather_new (date TEXT NOT NULL, city TEXT NOT NULL, tnight REAL, tmin REAL,
-                tmax REAL, fetched_at TEXT NOT NULL, PRIMARY KEY (date, city));
-            INSERT INTO weather_new SELECT date, 'Berkeley', tnight, tmin, tmax, fetched_at FROM weather;
+                tmax REAL, src TEXT NOT NULL DEFAULT 'clock', fetched_at TEXT NOT NULL, PRIMARY KEY (date, city));
+            INSERT INTO weather_new (date, city, tnight, tmin, tmax, fetched_at)
+                SELECT date, 'Berkeley', tnight, tmin, tmax, fetched_at FROM weather;
             DROP TABLE weather; ALTER TABLE weather_new RENAME TO weather;""")
+    elif "src" not in wcols:
+        conn.execute("ALTER TABLE weather ADD COLUMN src TEXT NOT NULL DEFAULT 'clock'")
     for name, lat, lon, tz in DEFAULT_CITIES:
         conn.execute("INSERT OR IGNORE INTO cities (name, lat, lon, tz, created_at) VALUES (?, ?, ?, ?, ?)",
                      (name, lat, lon, tz, _now()))
@@ -1200,10 +1204,19 @@ def effective_cities(conn):
     return out
 
 
-def set_weather(conn, d, city, tnight, tmin, tmax):
-    conn.execute("INSERT INTO weather (date, city, tnight, tmin, tmax, fetched_at) VALUES (?, ?, ?, ?, ?, ?) "
+def set_weather(conn, d, city, tnight, tmin, tmax, src):
+    conn.execute("INSERT INTO weather (date, city, tnight, tmin, tmax, src, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
                  "ON CONFLICT(date, city) DO UPDATE SET tnight=excluded.tnight, tmin=excluded.tmin, "
-                 "tmax=excluded.tmax, fetched_at=excluded.fetched_at", (d, city, tnight, tmin, tmax, _now()))
+                 "tmax=excluded.tmax, src=excluded.src, fetched_at=excluded.fetched_at",
+                 (d, city, tnight, tmin, tmax, src, _now()))
+
+
+def sleep_windows(conn):
+    """{date: (bedtime_start, bedtime_end)} ISO timestamps with offset, from the stored
+    Oura series -- the hours actually asleep, for the weather window."""
+    return {r["date"]: (r["s"], r["e"]) for r in conn.execute(
+        "SELECT date, json_extract(doc, '$.bedtime_start') AS s, json_extract(doc, '$.bedtime_end') AS e "
+        "FROM night_series") if r["s"] and r["e"]}
 
 
 def weather_series(conn):
@@ -1226,7 +1239,15 @@ def night_weather(conn):
 
 def nights_missing_weather(conn, before):
     """[(date, city)] for nights before `before` whose weather at their effective city
-    isn't stored yet, oldest first."""
-    have = {(r["date"], r["city"]) for r in conn.execute("SELECT date, city FROM weather")}
-    return [(d, c) for d, c in sorted(effective_cities(conn).items())
-            if d < before and (d, c) not in have]
+    isn't stored yet -- or was computed on the clock fallback while the night now has
+    an Oura sleep window -- oldest first."""
+    have = {(r["date"], r["city"]): r["src"] for r in conn.execute("SELECT date, city, src FROM weather")}
+    windows = sleep_windows(conn)
+    out = []
+    for d, c in sorted(effective_cities(conn).items()):
+        if d >= before:
+            continue
+        src = have.get((d, c))
+        if src is None or (src == "clock" and d in windows):
+            out.append((d, c))
+    return out

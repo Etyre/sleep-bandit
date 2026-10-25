@@ -870,7 +870,7 @@ function appendSeason(card, iv) {
 
   const sec = el("div", "season");
   sec.appendChild(el("div", "season-head",
-    `🌡 Setting vs. outdoor temperature <span class="rmeta">Night air where you slept (${(sp.cities || []).map(esc).join(", ")}; 9 pm–6 am mean, Open-Meteo), in ${deg} · ` +
+    `🌡 Setting vs. outdoor temperature <span class="rmeta">Outside air where you slept (${(sp.cities || []).map(esc).join(", ")}), averaged over your actual sleep window (Oura bedtime to wake; Open-Meteo), in ${deg} · ` +
     `${sp.n} night${sp.n === 1 ? "" : "s"}${BASELINE_ON ? " · HRV baseline-adj." : ""}</span>`));
   const row = el("div", "season-row");
 

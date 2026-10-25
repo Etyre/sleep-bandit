@@ -213,8 +213,10 @@ list starts as Berkeley, Washington DC, Phoenix and New York City, and "Other…
 a place through Open-Meteo's geocoder). A night with no choice of its own inherits
 the previous night's, so a trip only needs marking on its first and last nights.
 `weather.py` keeps each night's outdoor temperature at that city from Open-Meteo:
-the 9 pm–6 am mean and minimum, and the day's maximum, fetched with each sync and
-again whenever a city changes. The section plots every
+the mean and minimum over the hours actually asleep (Oura's bedtime start to bedtime
+end, padded half an hour each side; 9 pm–6 am until a night's sleep record arrives,
+then redone), and the day's maximum, fetched with each sync and again whenever a
+city changes. The section plots every
 counted night as outdoor night temperature against HRV, colored by setting, bins the
 nights into outdoor-temperature terciles with each setting's average per bin (★ the
 best with at least two nights), and fits HRV ~ setting × outdoor temperature on the
