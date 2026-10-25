@@ -395,7 +395,7 @@ function tagsRow(nights) {
     if (ts.length) inner = ts.map((s) => tagChip(s, n.tags_summary || "")).join("");
     else if (info.enabled && n.hrv != null && n.hrv < info.threshold)
       inner = `<span class="ntag pending" title="Low night — not read yet (tagging runs in the background)">…</span>`;
-    row += `<td class="tagcell${n.is_today ? " col-today" : ""}">${inner}</td>`;
+    row += `<td class="tagcell${n.is_today ? " col-today" : ""}"><div class="tagwrap">${inner}</div></td>`;
   }
   return row + `</tr>`;
 }
