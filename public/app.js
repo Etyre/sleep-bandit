@@ -376,8 +376,9 @@ let GRID_SCROLL = null;  // remembered horizontal scroll, so re-renders don't ju
 
 // ---- where each night was slept -----------------------------------------------
 // A city dropdown under each date. A night without a choice of its own inherits
-// the previous night's (shown dimmed): if you slept in DC last night you're
-// assumed to be in DC tonight until you say otherwise. "Other…" adds a city
+// the previous night's -- that IS the normal case, shown exactly like an explicit
+// choice: if you slept in DC last night you're assumed to be in DC tonight until
+// you say otherwise. "Other…" adds a city
 // (geocoded server-side) and selects it. The night's outdoor weather (the season
 // sections on the Reports page) is looked up at this city.
 function cityCtl(n) {
@@ -385,9 +386,9 @@ function cityCtl(n) {
   const inherited = !n.city;
   const opts = (STATE.cities || []).map((c) =>
     `<option value="${esc(c)}"${c === n.city_eff ? " selected" : ""}>${esc(c)}</option>`).join("");
-  return `<select class="city-sel${inherited ? " inherited" : ""}" data-date="${n.date}" ` +
-    `title="${inherited ? "Where you slept — assumed the same as the night before. Change it if you were elsewhere."
-                        : "Where you slept this night (later nights inherit it)"}">` +
+  return `<select class="city-sel" data-date="${n.date}" ` +
+    `title="${inherited ? "Where you slept — same as the night before unless you change it."
+                        : "Where you slept this night (later nights follow it)"}">` +
     `${opts}<option value="__other">Other…</option></select>`;
 }
 async function saveCity(sel) {

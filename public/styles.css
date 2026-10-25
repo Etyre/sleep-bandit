@@ -77,14 +77,13 @@ button:hover, .ghost:hover { border-color: var(--accent); }
 }
 .grid thead th.today { color: var(--accent-2); }
 .grid thead th .ndate { display: block; font-weight: 400; font-size: 10px; opacity: .7; margin-top: 1px; }
-/* where the night was slept; dimmed while inherited from the night before */
+/* where the night was slept (inherited from the night before unless changed) */
 .grid thead th .city-sel {
   display: block; margin: 3px auto 0; max-width: 100%; font: inherit; font-size: 10.5px; font-weight: 600;
   color: var(--text); background: transparent; border: 1px solid transparent; border-radius: 4px;
   padding: 1px 2px; cursor: pointer; text-align: center; text-align-last: center;
 }
 .grid thead th .city-sel:hover, .grid thead th .city-sel:focus { border-color: var(--line); background: var(--panel); outline: none; }
-.grid thead th .city-sel.inherited { color: var(--muted); font-weight: 400; }
 .grid thead th .city-sel option { color: var(--text); background: var(--panel); }
 
 /* frozen first column (row labels) */
