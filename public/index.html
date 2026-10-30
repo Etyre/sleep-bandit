@@ -2,8 +2,16 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Sleep Bandit</title>
+  <meta name="theme-color" content="#0f1220">
+  <!-- installable on a phone's home screen (iPhone: Share → Add to Home Screen; Android: Install app) -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Sleep Bandit">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
   <link rel="stylesheet" href="/styles.css">
   <!--SB_CONFIG-->
 </head>
@@ -18,6 +26,7 @@
     </div>
     <div class="nav-col">
       <nav class="tabs">
+        <button class="tab" data-view="tonight">🌙 Tonight</button>
         <button class="tab active" data-view="grid">🗓 Tracker</button>
         <button class="tab" data-view="reports">📊 Reports</button>
         <button class="ghost" id="logout-btn" hidden title="Sign out of the admin page">Log out</button>
@@ -27,6 +36,11 @@
   </header>
 
   <main>
+    <!-- TONIGHT: the plan as a checklist (what the phone opens on) -->
+    <section id="view-tonight" class="view tonight" hidden>
+      <div id="tonight-body"><p class="empty">Loading…</p></div>
+    </section>
+
     <!-- TRACKER (spreadsheet) -->
     <section id="view-grid" class="view">
       <div class="toolbar">
@@ -37,7 +51,7 @@
         <a class="ghost" href="/api/export" target="_blank">Export</a>
       </div>
       <div class="grid-wrap">
-        <table class="grid" id="grid"></table>
+        <table class="grid" id="grid-table"></table>
       </div>
       <p class="hint">Each night the app chooses which interventions to run (and at what dose/option), weighted toward what's raised your HRV so far. Do the highlighted cells, tap each to check it off, and enter each morning's HRV in the bottom row.</p>
     </section>

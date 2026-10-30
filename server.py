@@ -22,7 +22,7 @@ import time
 import traceback
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import auth
 import bandit
@@ -1158,6 +1158,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        if path.endswith("sw.js"):
+            self.send_header("Cache-Control", "no-cache")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1212,11 +1214,46 @@ class Handler(BaseHTTPRequestHandler):
         base = (ADMIN_PATH if mode in ("login", "admin") else "/")
         cfg = {"mode": mode, "base": base, "hosted": PUBLIC_MODE,
                "redirect_uri": oura.redirect_uri(PORT, BASE_URL)}
-        html = html.replace("<!--SB_CONFIG-->", "<script>window.SB=" + json.dumps(cfg) + "</script>")
+        html = html.replace("<!--SB_CONFIG-->",
+                            f'<link rel="manifest" href="/manifest.webmanifest?start={quote(base, safe="")}">'
+                            "<script>window.SB=" + json.dumps(cfg) + "</script>")
         body = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_manifest(self):
+        """Web-app manifest, so the site installs to a phone's home screen. One per
+        face: the public root and (hosted) the admin page are separate apps, each
+        opening on its own Tonight view."""
+        start = parse_qs(urlparse(self.path).query).get("start", ["/"])[0]
+        if not (start == "/" or (PUBLIC_MODE and start == ADMIN_PATH)):
+            start = "/"
+        admin = start != "/"
+        m = {
+            "id": start,
+            "name": "Sleep Bandit" + (" (admin)" if admin else ""),
+            "short_name": "Sleep Bandit",
+            "description": "Tonight's plan from your randomized n-of-1 sleep experiments.",
+            "start_url": start + "#tonight",
+            "scope": "/",
+            "display": "standalone",
+            "orientation": "portrait",
+            "background_color": "#0f1220",
+            "theme_color": "#0f1220",
+            "icons": [
+                {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+                {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+                {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+            ],
+        }
+        body = json.dumps(m).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/manifest+json")
+        self.send_header("Cache-Control", "no-cache")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1239,10 +1276,16 @@ class Handler(BaseHTTPRequestHandler):
         statics = {
             "/styles.css": ("styles.css", "text/css; charset=utf-8"),
             "/app.js": ("app.js", "application/javascript; charset=utf-8"),
+            "/sw.js": ("sw.js", "application/javascript; charset=utf-8"),
+            "/icon-192.png": ("icon-192.png", "image/png"),
+            "/icon-512.png": ("icon-512.png", "image/png"),
+            "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
         }
         if path in statics:
             name, ctype = statics[path]
             return self._send_file(os.path.join(PUBLIC_DIR, name), ctype)
+        if path == "/manifest.webmanifest":
+            return self._send_manifest()
 
         writer = self._can_write()          # hosted: only a signed-in admin
         scrub = (lambda p: p) if writer else public_scrub

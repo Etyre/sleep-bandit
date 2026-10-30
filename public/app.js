@@ -2,9 +2,11 @@
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+let STATE_FROM_CACHE = false;   // /api/state was served by sw.js with no network (offline)
 const api = async (path, opts) => {
   const r = await fetch(path, opts);
   if (!r.ok) { const e = new Error((await r.text()) || r.statusText); e.status = r.status; throw e; }
+  if (path === "/api/state") STATE_FROM_CACHE = r.headers.get("X-SB-Cached") === "1";
   return r.status === 204 ? null : r.json();
 };
 const post = (path, body) =>
@@ -149,7 +151,7 @@ async function toggleMaximize() {
   const tonight = STATE.nights.find((n) => n.is_today);
   if (!tonight) return;
   const res = await post("/api/maximize", { mode: tonight.maximize ? "off" : "on" });
-  STATE = res.state; renderGrid();
+  STATE = res.state; renderGrid(); renderTonight();
 }
 
 // options still on offer (a removed option stays in iv.options as retired so its
@@ -170,13 +172,14 @@ async function loadGrid() {
   STATE = await api("/api/state");
   renderRecencySlot(STATE.recency, STATE.count_maximize, STATE.baseline);
   renderGrid();
+  renderTonight();
 }
 
 function renderGrid() {
   const { interventions, cells } = STATE;
   // Server sends nights newest-first; show them oldest -> newest so tonight is on the right.
   const nights = STATE.nights.slice().reverse();
-  const table = $("#grid");
+  const table = $("#grid-table");
 
   if (!interventions.length) {
     table.innerHTML =
@@ -457,6 +460,7 @@ async function syncTonight() {
     STATE = fresh; GRID_SCROLL = null;                 // jump to the real Tonight
     renderRecencySlot(STATE.recency, STATE.count_maximize, STATE.baseline);
     renderGrid();
+    renderTonight();
     return true;
   } catch (e) {
     return false;                                      // offline etc.: next trigger retries
@@ -596,6 +600,171 @@ async function saveNote(t) {
     if (night) night.note = t.value.trim();
   } catch (e) {
     alert("Could not save note: " + e.message);
+  }
+}
+
+// =====================================================================
+// TONIGHT -- the plan as a checklist (what the phone opens on)
+// =====================================================================
+// Tonight's column of the grid, one card per intervention, sized for a thumb.
+// Same data and same /api/cell writes as the grid; both views re-render after
+// a change in either, so a tick on the phone shows in the laptop's grid too.
+const TONIGHT = { dirty: false };   // a Tonight-side change the grid hasn't re-rendered yet
+function tonightLabel(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
+}
+function metricText(n) {
+  const parts = [];
+  if (n.hrv != null) parts.push(`HRV <b>${avg1(n.hrv)}</b>`);
+  if (n.lrhr != null) parts.push(`resting HR <b>${avg1(n.lrhr)}</b> bpm`);
+  if (n.tst != null) parts.push(`slept <b>${avg1(n.tst)}</b> h`);
+  return parts.join(" · ");
+}
+function renderTonight() {
+  const body = $("#tonight-body");
+  if (!body || !STATE) return;
+  const n = STATE.nights.find((x) => x.is_today);
+  if (!n) { body.innerHTML = `<p class="empty">No plan for tonight yet.</p>`; return; }
+  const cells = STATE.cells[n.date] || {};
+  const ro = READ_ONLY;
+  let h = "";
+  if (STATE_FROM_CACHE) h += `<div class="tn-banner">Offline — showing the last plan this phone saw. Ticks won't save until you're back online.</div>`;
+
+  let maxCtl = "";
+  if (!ro) {
+    maxCtl = `<button type="button" class="max-btn tn-max${n.maximize ? " on" : ""}" title="${n.maximize
+      ? "Tonight is planned for maximum benefit (not randomized). Tap to go back to the exact randomized plan."
+      : "Maximize benefit tonight: no exploration — every intervention found to help, at its best-measured dose or option. Not randomized. Reversible."}">` +
+      `⭐ ${n.maximize ? "Maximizing benefit" : "Maximize benefit"}</button>`;
+  } else if (n.maximize) {
+    maxCtl = `<span class="max-btn tn-max on static">⭐ Maximize benefit</span>`;
+  }
+  h += `<div class="tn-head"><div><h2>Tonight</h2><div class="tn-date">${esc(tonightLabel(n.date))}` +
+       `${n.city_eff ? " · " + esc(n.city_eff) : ""}</div></div>${maxCtl}</div>`;
+
+  let any = false;
+  for (const [cat, list] of groupByCategory(STATE.interventions)) {
+    const on = [], off = [];
+    for (const iv of list.slice().sort((a, b) => a.name.localeCompare(b.name))) {
+      const c = cells[iv.id];
+      if (!c) continue;
+      (cellLabel(iv, c.assigned_dose) != null ? on : off).push([iv, c]);
+    }
+    if (!on.length && !off.length) continue;
+    any = true;
+    const ex = !!n["excl_" + cat];
+    h += `<div class="tn-group">${CATEGORY_LABEL[cat]}${ex ? ` <span class="tn-excl">excluded tonight</span>` : ""}</div>`;
+    for (const [iv, c] of on) {
+      const label = cellLabel(iv, c.assigned_dose);
+      const inputType = iv.input_type || "checkbox";
+      let ctl, cls = `tn-card on${c.done ? " done" : ""}`;
+      if (inputType === "radio" && (iv.input_options || []).length) {
+        const sel = c.input_value != null ? String(c.input_value) : null;
+        ctl = `<div class="tn-radios">` + iv.input_options.map((o) => {
+          const isOn = sel === String(o.id);
+          if (ro) return isOn ? `<span class="tn-val">${esc(o.label)}</span>` : "";
+          return `<button type="button" class="${isOn ? "on" : ""}" data-oid="${o.id}">${esc(o.label)}</button>`;
+        }).join("") + `</div>`;
+      } else if (inputType === "quantity") {
+        const v = c.input_value != null ? String(c.input_value) : "";
+        ctl = ro ? (v ? `<span class="tn-val">${esc(v)}${iv.input_label ? " " + esc(iv.input_label) : ""}</span>` : "")
+                 : `<input class="tn-qty" type="text" inputmode="decimal" value="${esc(v)}" placeholder="${esc(iv.input_label || "qty")}" ` +
+                   `title="A number, or “-” for done but not measured; clear to un-mark">`;
+      } else {
+        ctl = `<span class="tn-check">✓</span>`;
+        if (!ro) cls += " tap";
+      }
+      h += `<div class="${cls}" data-iv="${iv.id}" data-date="${n.date}">` +
+           `<div class="tn-main"><div class="tn-name">${esc(iv.name)}</div><div class="tn-dose">${label}</div></div>${ctl}</div>`;
+    }
+    if (off.length) {
+      h += `<div class="tn-off">` + off.map(([iv, c]) => {
+        const cex = !!c.excluded;
+        const btn = ro ? (cex ? `<span class="tn-val bad">did it anyway</span>` : "")
+          : `<button type="button" class="tn-anyway${cex ? " on" : ""}" data-iv="${iv.id}" data-date="${n.date}" ` +
+            `title="${cex ? "Marked as done despite assigned off (excluded from results). Tap to count it as a control night again."
+                         : "Assigned off tonight. Tap if you did it anyway, so the night isn't counted as a control."}">` +
+            `${cex ? "✗ did it anyway" : "skip"}</button>`;
+        return `<div class="tn-off-row${cex ? " excl" : ""}"><span>${esc(iv.name)}</span>${btn}</div>`;
+      }).join("") + `</div>`;
+    }
+  }
+  if (!any) h += `<p class="tn-empty">Nothing is scheduled tonight${STATE.interventions.length ? "" : " — add an intervention in the Tracker"}.</p>`;
+
+  // last night's numbers (the most recent past night with any measurement)
+  const last = STATE.nights.find((x) => !x.is_today && (x.hrv != null || x.lrhr != null || x.tst != null));
+  if (last) h += `<div class="tn-last">Last night (${esc(shortDate(last.date))}): ${metricText(last)}</div>`;
+  body.innerHTML = h;
+
+  if (ro) return;
+  $$(".tn-card.tap", body).forEach((card) => card.addEventListener("click", () => tonightToggle(card)));
+  $$(".tn-radios button", body).forEach((b) => b.addEventListener("click", () => tonightRadio(b)));
+  $$(".tn-qty", body).forEach((inp) => inp.addEventListener("change", () => tonightQty(inp)));
+  $$(".tn-anyway", body).forEach((b) => b.addEventListener("click", () => tonightAnyway(b)));
+  $$("button.tn-max", body).forEach((b) => b.addEventListener("click", toggleMaximize));
+}
+async function tonightToggle(card) {
+  const done = !card.classList.contains("done");
+  card.classList.toggle("done", done);                       // optimistic
+  const cell = (STATE.cells[card.dataset.date] || {})[card.dataset.iv];
+  if (cell) cell.done = done;
+  TONIGHT.dirty = true;
+  try {
+    await post("/api/cell", { date: card.dataset.date, intervention_id: card.dataset.iv, done,
+                              client_tonight: stateTonight() });
+  } catch (e) {
+    card.classList.toggle("done", !done);
+    if (cell) cell.done = !done;
+    if (await handleStaleTick(e)) return;
+    alert("Could not save: " + e.message);
+  }
+}
+async function tonightRadio(btn) {
+  const card = btn.closest(".tn-card");
+  const cell = (STATE.cells[card.dataset.date] || {})[card.dataset.iv];
+  const value = btn.classList.contains("on") ? null : btn.dataset.oid;
+  try {
+    await post("/api/cell", { date: card.dataset.date, intervention_id: card.dataset.iv,
+                              done: value != null, input_value: value, client_tonight: stateTonight() });
+    if (cell) { cell.done = value != null; cell.input_value = value; }
+    TONIGHT.dirty = true;
+    renderTonight();
+  } catch (e) {
+    if (await handleStaleTick(e)) return;
+    alert("Could not save: " + e.message);
+  }
+}
+async function tonightQty(inp) {
+  const card = inp.closest(".tn-card");
+  const cell = (STATE.cells[card.dataset.date] || {})[card.dataset.iv];
+  const v = inp.value.trim();
+  if (v !== "" && v !== "-" && !Number.isFinite(Number(v))) {
+    alert("Enter a number, “-” for done but not measured, or clear the field.");
+    inp.value = cell && cell.input_value != null ? cell.input_value : "";
+    return;
+  }
+  const value = v === "" ? null : v;
+  try {
+    await post("/api/cell", { date: card.dataset.date, intervention_id: card.dataset.iv,
+                              done: value != null, input_value: value, client_tonight: stateTonight() });
+    if (cell) { cell.done = value != null; cell.input_value = value; }
+    TONIGHT.dirty = true;
+    card.classList.toggle("done", value != null);
+  } catch (e) {
+    if (await handleStaleTick(e)) return;
+    alert("Could not save: " + e.message);
+  }
+}
+async function tonightAnyway(btn) {
+  const cell = (STATE.cells[btn.dataset.date] || {})[btn.dataset.iv];
+  const excluded = !(cell && cell.excluded);
+  try {
+    STATE = await post("/api/exclude_cell", { date: btn.dataset.date, intervention_id: btn.dataset.iv, excluded });
+    TONIGHT.dirty = true;
+    renderTonight();
+  } catch (e) {
+    alert("Could not update exclusion: " + e.message);
   }
 }
 
@@ -2020,17 +2189,26 @@ function pairTable(pairs) {
 // views: grid | reports (effects) | interactions -- the last two are sub-pages of the
 // Reports tab, each with its own hash so they can be bookmarked.
 function switchView(view) {
-  if (!["grid", "reports", "interactions"].includes(view)) view = "grid";
-  const top = view === "grid" ? "grid" : "reports";
+  if (!["tonight", "grid", "reports", "interactions"].includes(view)) view = defaultView();
+  const top = view === "grid" || view === "tonight" ? view : "reports";
   $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === top));
+  $("#view-tonight").hidden = top !== "tonight";
   $("#view-grid").hidden = top !== "grid";
   $("#view-reports").hidden = top !== "reports";
+  if (view === "tonight") renderTonight();
+  if (view === "grid" && TONIGHT.dirty && STATE) { TONIGHT.dirty = false; renderGrid(); }
   $$(".subtab").forEach((b) => b.classList.toggle("active", b.dataset.sub === view));
   $("#reports-body").hidden = view !== "reports";
   $("#interactions-body").hidden = view !== "interactions";
   if (("#" + view) !== location.hash) location.hash = view;
+  window.scrollTo(0, 0);   // a view switch starts at the top (the tabs) -- matters on a phone
   if (view === "reports") loadReports();
   if (view === "interactions") loadInteractions();
+}
+// A phone (or the installed home-screen app) opens on Tonight; a laptop on the grid.
+const STANDALONE = (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || window.navigator.standalone === true;
+function defaultView() {
+  return (STANDALONE || (window.matchMedia && window.matchMedia("(max-width: 700px)").matches)) ? "tonight" : "grid";
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
 $$(".subtab").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.sub)));
@@ -2382,7 +2560,7 @@ $("#modal-close").addEventListener("click", closeModal);
 $("#iv-cancel").addEventListener("click", closeModal);
 $("#modal-backdrop").addEventListener("click", (e) => { if (e.target === $("#modal-backdrop")) closeModal(); });
 // row-label click opens the editor for that intervention
-$("#grid").addEventListener("click", (e) => {
+$("#grid-table").addEventListener("click", (e) => {
   if (READ_ONLY) return;
   const lab = e.target.closest(".rowlab");
   if (!lab) return;
@@ -2580,6 +2758,11 @@ $("#tags-clear").addEventListener("click", async () => {
   catch (err) { alert("Error: " + err.message); }
 });
 
+// ---- home-screen app: register the service worker (sw.js) ------------------
+if ("serviceWorker" in navigator && (location.protocol === "https:" || ["localhost", "127.0.0.1"].includes(location.hostname))) {
+  navigator.serviceWorker.register("/sw.js").catch(() => { /* optional: the site works without it */ });
+}
+
 // ---- hosted mode: what each face of the site shows -------------------------
 if (READ_ONLY) {
   // public view: no editing controls anywhere (and no way to reach the admin page)
@@ -2620,7 +2803,7 @@ if (SB.mode === "login") {
   loadGrid()
     .then(() => {
       handleOuraReturn();
-      switchView(location.hash.replace("#", "") || "grid");
+      switchView(location.hash.replace("#", "") || defaultView());
       if (!READ_ONLY) ouraAutoSync();
     })
     .catch((e) => { document.body.innerHTML = `<pre style="padding:40px;color:#ff7a7a">Failed to load: ${e.message}</pre>`; });

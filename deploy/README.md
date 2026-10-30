@@ -55,7 +55,25 @@ Oura's OAuth redirect must point at the site now. In the Oura developer portal e
 app's redirect URI to `https://elissleepbandit.com/oura/callback`, then on the admin
 page open **Oura → Save & reconnect**. (The setup text in the panel shows the right URI.)
 
-## 5. After that
+## 5. On your phone
+
+The site is also an installable app (a PWA): same code, no app store. Once the site is
+up, open it on the phone and add it to the home screen:
+
+* **iPhone** — in Safari, open the page, tap **Share → Add to Home Screen**.
+* **Android** — in Chrome, open the page, tap **⋮ → Install app** (or *Add to Home screen*).
+
+The icon opens the **Tonight** view: tonight's plan as a checklist, one card per
+intervention. Install the **admin page** (`https://elissleepbandit.com/<SB_ADMIN_PATH>`)
+to be able to tick things off from the phone — you sign in once inside the installed
+app (it keeps its own 30-day cookie, separate from Safari's). Installing the public root
+instead gives a read-only copy of the plan.
+
+With no signal the app still shows the last plan it loaded (marked "Offline"); ticks
+need a connection. The phone needs the real site: `localhost` on the Mac isn't
+reachable from it, so this only works once step 3 is done.
+
+## 6. After that
 
 * **Your Mac copy** is now a backup / dev copy. Stop its LaunchAgent so two planners don't
   diverge: `launchctl bootout gui/$UID/com.elityre.sleep-bandit`. Or keep it for

@@ -17,7 +17,7 @@ fi
 echo "== user + files"
 id -u sleepbandit >/dev/null 2>&1 || useradd --system --home "$APP" --shell /usr/sbin/nologin sleepbandit
 mkdir -p "$APP/data" "$APP/backups"
-for f in server.py store.py bandit.py oura.py auth.py public deploy; do
+for f in server.py store.py bandit.py oura.py auth.py weather.py tags.py public deploy; do
   rm -rf "$APP/$f"; cp -r "$SRC/$f" "$APP/$f"
 done
 chown -R sleepbandit:sleepbandit "$APP"
