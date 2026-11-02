@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.elityre.sleep-bandit-pull</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/elityre/sleep-bandit/pull.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/elityre/sleep-bandit</string>
+
+    <!-- ssh needs the agent / key; make sure PATH finds ssh, sqlite3, lsof. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Pull once when loaded (login), then every 6 hours while the Mac is awake. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/elityre/sleep-bandit/backups/pull.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/elityre/sleep-bandit/backups/pull.log</string>
+</dict>
+</plist>

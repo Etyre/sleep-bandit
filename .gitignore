@@ -12,3 +12,6 @@ __pycache__/
 # macOS
 .DS_Store
 backups/
+
+# Mac-side server address for pull.sh (see deploy/server.conf.example)
+deploy/server.conf
