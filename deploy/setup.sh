@@ -7,7 +7,7 @@ SRC="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "== packages"
 apt-get update -qq
-apt-get install -y -qq python3 sqlite3 debian-keyring debian-archive-keyring apt-transport-https curl >/dev/null
+apt-get install -y -qq python3 sqlite3 tzdata debian-keyring debian-archive-keyring apt-transport-https curl >/dev/null
 if ! command -v caddy >/dev/null; then
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' > /etc/apt/sources.list.d/caddy-stable.list

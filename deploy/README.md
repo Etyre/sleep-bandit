@@ -25,23 +25,28 @@ get the HTTPS certificate).
 
 ## 3. Install
 
-From this repo on your Mac (the DB is copied separately — it is never in git):
+One command from this repo on the Mac (the DB is copied separately — it is never in git):
+
+```bash
+deploy/push.sh SERVER_IP
+```
+
+It copies the code, runs `deploy/setup.sh` on the server (packages, Caddy, the
+`sleepbandit` user, systemd units), installs the prepared `/etc/sleep-bandit.env`
+(admin path + password hash, kept at `~/.config/sleep-bandit/` on the Mac, with the
+password in `admin-password.txt` there), uploads a fresh WAL-safe snapshot of the Mac's
+DB if the server has none yet, starts the service, writes the server address into
+`deploy/server.conf` for `pull.sh`, checks DNS/HTTPS, and pulls the first mirror copy
+back down. Re-running it later pushes a code update and restarts the service; it never
+overwrites the server's DB or an env file that already has a password hash.
+
+By hand instead, the steps it automates:
 
 ```bash
 rsync -a --exclude data --exclude backups --exclude .git ./ root@SERVER_IP:/root/sleep-bandit/
 ssh root@SERVER_IP 'cd /root/sleep-bandit && bash deploy/setup.sh'
-```
-
-Then on the server:
-
-```bash
-python3 /opt/sleep-bandit/auth.py           # prompts for the admin password, prints SB_PASSWORD_HASH=...
+python3 /opt/sleep-bandit/auth.py           # on the server: prompts for the admin password, prints SB_PASSWORD_HASH=...
 nano /etc/sleep-bandit.env                  # paste that line; set SB_ADMIN_PATH to something unguessable
-```
-
-Copy the database (take a fresh WAL-safe snapshot first so nothing mid-write is lost):
-
-```bash
 ./backup.sh                                                  # on the Mac: writes backups/sleep_bandit-<stamp>.db
 scp backups/sleep_bandit-<stamp>.db root@SERVER_IP:/opt/sleep-bandit/data/sleep_bandit.db
 ssh root@SERVER_IP 'chown sleepbandit:sleepbandit /opt/sleep-bandit/data/sleep_bandit.db && systemctl start sleep-bandit sleep-bandit-backup.timer && systemctl status sleep-bandit --no-pager'
@@ -75,14 +80,23 @@ reachable from it, so this only works once step 3 is done.
 
 ## 6. After that
 
-* **Your Mac copy** is now a backup / dev copy. Stop its LaunchAgent so two planners don't
-  diverge: `launchctl bootout gui/$UID/com.elityre.sleep-bandit`. Or keep it for
-  development only, on its own DB.
-* **Updating the code**: rerun the `rsync` + `bash deploy/setup.sh` lines (setup is
-  idempotent; it never touches `/etc/sleep-bandit.env` or the DB), then
-  `systemctl restart sleep-bandit`.
-* **Backups**: daily at 05:30 server time into `/opt/sleep-bandit/backups/` (newest 30
-  kept). Pull one down with `scp` whenever you like.
+* **A whole copy of the data stays on the Mac.** `pull.sh` (run every 6 hours while the
+  Mac is awake by the `com.elityre.sleep-bandit-pull` LaunchAgent, plist in `deploy/`)
+  takes a WAL-safe snapshot *on the server*, streams it down, checks its integrity,
+  keeps the newest 60 in `backups/server-<stamp>.db`, and refreshes `data/sleep_bandit.db`
+  so the local app is always ready to take over. Install the agent once with
+  `cp deploy/com.elityre.sleep-bandit-pull.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.elityre.sleep-bandit-pull.plist`;
+  log in `backups/pull.log`. **If the server is ever lost**: `launchctl bootstrap gui/$UID
+  ~/Library/LaunchAgents/com.elityre.sleep-bandit.plist` and the Mac copy is live at
+  `http://localhost:8777` with data at most 6 hours old.
+* **Your Mac copy** is now a standby. Stop its LaunchAgent so two planners don't
+  diverge (and so `pull.sh` can refresh the standby DB, which it skips while a local
+  server holds port 8777): `launchctl bootout gui/$UID/com.elityre.sleep-bandit`. For
+  development, run `server.py` on another port with `SB_DB_PATH` pointing at a copy.
+* **Updating the code**: `deploy/push.sh SERVER_IP` again (setup is idempotent; it
+  never touches `/etc/sleep-bandit.env` or the DB).
+* **Backups on the server**: daily at 05:30 server time into `/opt/sleep-bandit/backups/`
+  (newest 30 kept), in addition to the Mac mirror above.
 * **Logs**: `journalctl -u sleep-bandit -f`.
 * **Changing the password**: rerun `python3 auth.py`, update the env file, restart.
   To log every browser out, also delete the `session_secret` row from the `settings`

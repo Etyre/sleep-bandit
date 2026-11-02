@@ -254,7 +254,8 @@ prescribed it (`server._plan_context`). Rows before 2026-10-22 carry the dose on
 
 `backup.sh` takes a WAL-safe snapshot with `sqlite3 .backup` into `backups/` and
 keeps the newest 30. The database is committed to git alongside the code in this
-repo; `backups/` is not.
+repo; `backups/` is not. Once the site is hosted, `pull.sh` mirrors the server's DB
+back to this Mac every 6 hours (see `deploy/README.md` §6).
 
 ## Hosting
 
