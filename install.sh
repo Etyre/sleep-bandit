@@ -29,7 +29,7 @@ fi
 AGENTS="com.elityre.sleep-bandit com.elityre.sleep-bandit-backup"
 [ -r "$DIR/deploy/server.conf" ] && AGENTS="$AGENTS com.elityre.sleep-bandit-pull"
 
-/usr/bin/python3 "$DIR/server.py" --test >/dev/null || { echo "self-test failed; not installing"; exit 1; }
+/opt/homebrew/bin/python3 "$DIR/server.py" --test >/dev/null || { echo "self-test failed; not installing"; exit 1; }
 
 for label in $AGENTS; do
     plist="$SRC/$label.plist"

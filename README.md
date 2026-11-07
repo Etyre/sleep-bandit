@@ -387,6 +387,8 @@ llm-inbox list                         # messages the tagging model sent to Eli
 
 ## Gotchas learned
 
+- The LaunchAgent runs `/opt/homebrew/bin/python3`, not `/usr/bin/python3`: macOS denies the system Python access to `~/Documents` when launchd starts it, so the shared LLM preamble, tool and inbox check under `agent-coding/shared` could not be read (seen 2026-11-07 as `ModuleNotFoundError: llm_contact` in the log). Homebrew's Python has that access.
+
 - If you start a second copy by hand while the agent's copy holds the port, the agent's
   copy exits with "address already in use" until the port is free (KeepAlive restarts it
   every 10 s). Use another port and `SB_DB_PATH` for development.
