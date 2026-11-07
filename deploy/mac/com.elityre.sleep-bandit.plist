@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.elityre.sleep-bandit</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>server.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/elityre/sleep-bandit</string>
+
+    <!-- Unbuffered so each timestamped log line lands as it is written (buffered
+         stdout under launchd never flushed, leaving the log empty for months). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- Start at login and keep it running (restart if it ever exits). -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Don't hammer restarts if it fails fast. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- One log, every line timestamped by applog.py. -->
+    <key>StandardOutPath</key>
+    <string>/Users/elityre/Library/Logs/sleep-bandit.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/elityre/Library/Logs/sleep-bandit.log</string>
+</dict>
+</plist>

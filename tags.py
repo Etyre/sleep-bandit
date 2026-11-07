@@ -17,17 +17,26 @@ Reports flag any intervention whose nights carry a tag disproportionately often
 Pure standard library, like the rest of the app: the Claude API is called over
 raw HTTPS (urllib). The key is stored in the settings table (or read from
 ANTHROPIC_API_KEY); nothing is sent anywhere unless tagging is switched on.
+
+Every call follows the shared LLM standard (~/Documents/agent-coding/CLAUDE.md):
+the system prompt starts with shared/llm-system-prompt-preamble.md, the
+contact_eli tool is offered, and each response is checked; a contact lands in the
+LLM inbox and tagging holds (settings key tags_hold) until the panel is saved.
 """
 
 import json
 import math
 import os
+import subprocess
+import sys
 import threading
-import traceback
+import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime
 
+import applog
 import store
 
 API_URL = "https://api.anthropic.com/v1/messages"
@@ -84,6 +93,96 @@ _LOCK = threading.Lock()
 
 class TagError(Exception):
     """Readable failure for the UI."""
+
+
+class ContactRecorded(TagError):
+    """The model used contact_eli / @ELI: -- recorded in the shared LLM inbox.
+    Tagging stops (no retry) until Eli saves the Night tags panel again."""
+
+
+# ---------------------------------------------------------------------------
+# Shared LLM inbox (~/Documents/agent-coding/shared, see its README): every
+# system prompt starts with the shared preamble, every call offers the
+# contact_eli tool, and every response is checked for a contact signal.
+# llm_contact.py needs Python 3.10+, but the LaunchAgent runs /usr/bin/python3
+# (3.9), so when the import fails the same three things are done by hand: the
+# preamble and tool definition are read from their files and the check is piped
+# to llm_contact.py under a newer interpreter (a local scan is the last resort).
+# ---------------------------------------------------------------------------
+SHARED_DIR = "/Users/elityre/Documents/agent-coding/shared"
+APP_NAME = "sleep-bandit"
+CONTACT_MARKER = "@ELI:"
+
+
+def _load_llm_contact():
+    if SHARED_DIR not in sys.path:
+        sys.path.insert(0, SHARED_DIR)
+    try:
+        import llm_contact
+        return llm_contact
+    except Exception as e:   # noqa: BLE001  (TypeError under Python 3.9, ImportError if shared/ moved)
+        applog.log(f"tags: shared llm_contact unavailable ({e!r}); using the file-based fallback")
+        return None
+
+
+_LLM = _load_llm_contact()
+
+
+def preamble():
+    if _LLM:
+        return _LLM.preamble()
+    with open(os.path.join(SHARED_DIR, "llm-system-prompt-preamble.md")) as f:
+        return f.read().strip()
+
+
+def contact_tool():
+    if _LLM:
+        return _LLM.CONTACT_TOOL
+    with open(os.path.join(SHARED_DIR, "contact_eli_tool.json")) as f:
+        return json.load(f)
+
+
+def _contact_check(model, system, messages, response, tools):
+    """Record and notify if the response contains a contact signal; returns the
+    inbox record, else None. Mirrors llm_contact.check()."""
+    if _LLM:
+        return _LLM.check(app=APP_NAME, model=model, system=system, messages=messages,
+                          response=response, tools=tools)
+    payload = json.dumps({"app": APP_NAME, "model": model, "system": system, "messages": messages,
+                          "response": response, "tools": tools}, ensure_ascii=False)
+    for py in ("/opt/homebrew/bin/python3", "python3"):
+        try:
+            p = subprocess.run([py, os.path.join(SHARED_DIR, "llm_contact.py"), "check"],
+                               input=payload, capture_output=True, text=True, timeout=90)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            applog.log(f"tags: llm_contact check via {py} failed: {e!r}")
+            continue
+        if p.returncode == 0:
+            return None
+        if p.returncode == 3:
+            return json.loads(p.stdout)
+        applog.log(f"tags: llm_contact check via {py} exited {p.returncode}: {p.stderr.strip()[-300:]}")
+    # Last resort: scan locally and append the record ourselves so nothing is lost.
+    found = []
+    for b in response.get("content") or []:
+        if b.get("type") == "tool_use" and b.get("name") == "contact_eli":
+            inp = b.get("input") or {}
+            found.append((inp.get("message") if isinstance(inp, dict) else None) or json.dumps(inp))
+        elif b.get("type") == "text" and CONTACT_MARKER in (b.get("text") or ""):
+            t = b["text"]
+            found.append(t[t.index(CONTACT_MARKER) + len(CONTACT_MARKER):].strip())
+    if not found:
+        return None
+    rec = {"type": "contact", "id": time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4],
+           "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "app": APP_NAME, "model": model,
+           "via": "fallback", "message": "\n\n".join(found), "system": system, "messages": messages,
+           "response": response, "tools": tools, "cwd": os.getcwd(), "argv": sys.argv}
+    inbox = os.path.expanduser("~/Library/Application Support/LLMInbox/messages.jsonl")
+    os.makedirs(os.path.dirname(inbox), exist_ok=True)
+    with open(inbox, "a") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    applog.log(f"tags: contact {rec['id']} recorded WITHOUT notification (llm_contact unavailable): {rec['message'][:200]!r}")
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +528,7 @@ OUTPUT_SCHEMA = {
 
 def system_prompt(vocab, ref, thresh):
     vocab_lines = "\n".join(f"- {v['slug']} — {v['label']}: {v['description']}" for v in vocab) or "- (none yet)"
-    return (
+    return preamble() + "\n\n" + (
         "You read one person's overnight wearable data (Oura ring) and describe the *shape* of a "
         f"night whose overnight HRV came in below {_fmt(thresh)} ms -- a low night for this person. "
         "The aim is to sort low nights into recurring kinds, so that later analysis can ask whether "
@@ -470,17 +569,25 @@ def _post(key, body):
 
 
 def classify(key, model, system, user_text):
-    """One request; returns (parsed JSON output, usage dict)."""
+    """One request; returns (parsed JSON output, usage dict). Raises ContactRecorded
+    if the model used contact_eli or @ELI: (recorded in the shared inbox first)."""
+    tools = [contact_tool()]
+    messages = [{"role": "user", "content": user_text}]
     body = {
         "model": model,
         "max_tokens": 4000,
         "fallbacks": "default",
         "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-        "messages": [{"role": "user", "content": user_text}],
+        "tools": tools,
+        "messages": messages,
         "output_config": {"effort": "medium",
                           "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
     }
     resp = _post(key, body)
+    rec = _contact_check(model, system, messages, resp, tools)
+    if rec:
+        raise ContactRecorded(f"The model asked to talk to Eli (llm-inbox show {rec['id']}). "
+                              "Tagging is paused until the Night tags panel is saved again.")
     if resp.get("stop_reason") == "refusal":
         det = resp.get("stop_details") or {}
         raise TagError("The model declined this request" + (f" ({det.get('category')})" if det.get("category") else "") + ".")
@@ -547,6 +654,9 @@ def tag_pending(conn, limit=PER_PASS, progress=None):
     {"done": n, "remaining": n, "error": msg|None}."""
     thresh = threshold(conn)
     todo = store.nights_to_tag(conn, thresh)
+    hold = store.get_setting(conn, "tags_hold")
+    if hold and todo:
+        return {"done": 0, "remaining": len(todo), "error": hold}
     key, model = api_key(conn), model_id(conn)
     ref = reference(conn, thresh) if todo else None
     done, err = 0, None
@@ -556,6 +666,13 @@ def tag_pending(conn, limit=PER_PASS, progress=None):
             done += 1
             if progress:
                 progress(rec)
+        except ContactRecorded as e:
+            # the model wants Eli: stop here and stay stopped (the 20-minute autosync
+            # would otherwise re-send the same night) until the panel is saved again
+            err = str(e)
+            store.set_setting(conn, "tags_hold", err)
+            applog.log(f"tags: {err}")
+            break
         except TagError as e:
             err = str(e)
             break
@@ -587,7 +704,7 @@ def _run(limit):
         with _LOCK:
             _STATUS["error"] = res["error"]
     except Exception as e:
-        traceback.print_exc()
+        applog.log_exc("tags: background tagger failed")
         with _LOCK:
             _STATUS["error"] = str(e)
     finally:
@@ -626,6 +743,7 @@ def status(conn):
         "threshold": thresh,
         "model": model_id(conn),
         "pending": len(store.nights_to_tag(conn, thresh)),
+        "hold": store.get_setting(conn, "tags_hold"),
         "counts": counts,
         "vocab": vocab,
         "worker": worker_status(),

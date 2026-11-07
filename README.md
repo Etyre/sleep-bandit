@@ -4,15 +4,20 @@ A single-user, self-hosted n-of-1 experiment runner for sleep interventions. Eac
 evening it decides, per intervention, whether tonight is an ON or OFF night and at
 what dose or option; each morning it pulls HRV, resting heart rate and sleep metrics
 from an Oura ring; and it fits a Bayesian model to tell you which interventions help,
-at what dose, and how sure it is.
-
-Pure Python standard library plus SQLite. No dependencies to install.
+at what dose, and how sure it is. Built from 2026-07-07 (first commit) because
+supplements, routines and room settings were being tried one at a time with no
+control nights and no record; this randomizes them properly and keeps the record.
+Pure Python standard library plus SQLite, no dependencies to install; the UI is
+plain HTML/JS in `public/`.
 
 ```
 python3 server.py          # then open http://localhost:8777
+python3 server.py --test   # end-to-end dry run on a throwaway database
 ```
 
-## How a night works
+## How it works
+
+### How a night works
 
 1. **Plan.** When the app is opened (or on a 20-minute timer when hosted) it makes
    sure tonight has a cell for every active intervention. Each missing cell is filled
@@ -30,7 +35,10 @@ python3 server.py          # then open http://localhost:8777
 A night belongs to its **evening's date** and rolls over at 4 AM, so a routine done
 at 1 AM still files under the previous evening.
 
-## Interventions
+The **Tonight** view (what the phone opens on when the site is installed as a
+home-screen app) is tonight's column as a checklist, one card per intervention.
+
+### Interventions
 
 Each intervention has a **category** (supplement, behavioral, environmental) and a
 **kind**:
@@ -64,7 +72,7 @@ Per-intervention priors (a prior that it helps at all; a prior over which option
 best) steer early scheduling only and fade as nights accumulate. They never enter the
 reported estimates.
 
-## How the scheduler decides
+### How the scheduler decides
 
 The engine is in `bandit.py`: a conjugate Bayesian linear regression with Thompson
 sampling, no numpy. Each intervention gets one "does it help at all" effect plus a
@@ -99,7 +107,7 @@ with the all-exploit plan (every intervention at its best measured dose, or off)
 The randomized plan is parked and restored exactly if you switch it back off. Those
 nights are not evidence unless the "count maximize nights" switch is on.
 
-### Where each scheduling feature is documented
+#### Where each scheduling feature is documented
 
 Every feature below is explained in a comment block or docstring at the named
 place; the constants listed are the knobs. Names, not line numbers, so they stay
@@ -132,9 +140,10 @@ valid as the files change.
 | Deterministic report read-outs (seeded Monte Carlo) | comment above `READOUT_SEED` | `READOUT_SAMPLES`, `READOUT_SEED` |
 
 Unqualified names are in `bandit.py`; `server.` and `store.` prefixes name the other
-two modules.
+two modules. The design rationale for every planning constant is in the comment
+block above it in `bandit.py`.
 
-## What counts as evidence
+### What counts as evidence
 
 - An ON night counts only if you ticked it. An unticked ON night is dropped, not
   treated as a control.
@@ -160,7 +169,7 @@ choice intervention shows a horse race of its options. Where a choice's options 
 behaviour (e.g. fasting vs. a full meal), an **observed** table groups nights by
 what actually happened, flagged as correlational.
 
-## Oura
+### Oura
 
 Oura's API is OAuth2-only. Register a private app at cloud.ouraring.com with redirect
 URI `http://localhost:8777/oura/callback`, paste its client id and secret into the
@@ -172,7 +181,14 @@ keeps Oura's **raw within-night series** (heart rate and HRV every five minutes,
 five-minute hypnogram, 30-second movement, and the summary numbers) in
 `night_series`, for the night-shape tagger below.
 
-## Night-shape tags
+Two read-only endpoints serve other local tools (the executive-assistant agent):
+`/api/agent/summary?days=30` (recent nights with metrics, cells, tags, tonight's
+checklist and each intervention's verdict, with no planning side effect) and
+`/api/oura/collection?name=daily_readiness&days=14` (a passthrough to any Oura v2
+collection in `oura.READ_COLLECTIONS`, using this app's token so there is a single
+owner of the rotating refresh token).
+
+### Night-shape tags
 
 Not every low-HRV night is low in the same way. For each night whose HRV comes in
 below a threshold (default 42, set in the **🏷 Night tags** panel), Claude reads the
@@ -204,7 +220,20 @@ Every read is audited (`tag_night`, `tag_usage`); a new vocabulary entry is audi
 as `tag_vocab_add`. The call goes over plain HTTPS from `tags.py` -- no SDK, since
 the app stays standard-library only on the system Python.
 
-## Setting vs. outdoor temperature
+**Shared LLM standard** (`~/Documents/agent-coding/CLAUDE.md`, `shared/README.md`):
+the system prompt starts, word for word, with `shared/llm-system-prompt-preamble.md`;
+every call offers the `contact_eli` tool (alongside the JSON-schema output format,
+which the API accepts together); and every response is checked for a `contact_eli`
+call or an `@ELI:` line. A contact is recorded in the LLM inbox
+(`~/Library/Application Support/LLMInbox/messages.jsonl`, read with `llm-inbox`),
+the tagger stops, and the settings key `tags_hold` keeps it stopped, so the
+20-minute autosync cannot re-send the same night. The panel shows "Paused: …";
+saving the panel lifts the hold. `tags.py` imports `shared/llm_contact.py` when it
+can and otherwise reads the preamble and tool files directly and pipes the check to
+`llm_contact.py` under a newer interpreter (see Gotchas: the LaunchAgent's Python
+is 3.9).
+
+### Setting vs. outdoor temperature
 
 A temperature-dosed intervention (unit contains `°`: Chili Pad, air conditioning)
 gets a section at the foot of its report asking whether its best setting depends on
@@ -223,26 +252,36 @@ best with at least two nights), and fits HRV ~ setting × outdoor temperature on
 on-nights, reporting the interaction with a 90% interval. Same nights and the same
 baseline adjustment as the read-outs. `server.season_payload`.
 
-## Running locally
+### Drafts are never lost
 
-`python3 server.py` starts it on port 8777 (`SB_PORT`, `SB_HOST` override). Opening
-the app plans tonight and syncs Oura; nothing runs in the background.
+Every text field in the UI saves what you type to `localStorage` on each keystroke
+(`sb.draft.<field>.<record>`: per-night notes and metric values by date, quantity
+cells by date and intervention, the whole intervention editor by intervention id or
+"new", the Oura client id, the tag threshold) and restores it before the field is
+shown, so a grid re-render, a tab switch or a reload brings the text back. A draft
+is cleared only when its write succeeds; in the editor, **Cancel** or **Delete**
+discards it while ✕ and clicking outside keep it (the title then reads "unsaved
+draft restored"). Password fields (Claude key, Oura secret, admin login) are never
+saved. Code: `draftGet/draftSet/draftClear/withDraft` in `app.js`.
 
-On this Mac a LaunchAgent (`com.elityre.sleep-bandit`) runs `server.py` from
-`~/sleep-bandit` and keeps it alive, with logs in `~/Library/Logs/sleep-bandit.log`.
-If you start a second copy by hand while the agent's copy holds the port, the agent's
-copy exits with "address already in use" until the port is free. A second agent
-(`com.elityre.sleep-bandit-backup`) runs `backup.sh` daily.
+### Hosted mode
 
-`python3 seed_demo.py` fills an empty database with simulated history whose ground
-truth is known, so you can see the reports work before you have real data.
+`deploy/README.md` covers running it on a VPS behind Caddy at a public domain: a
+read-only public view at `/`, an unlinked password-protected admin path with the
+full app, background planning and Oura sync on a 20-minute timer, and daily backups.
+Hosted mode is off by default; locally everything is read/write with no login.
 
-## Data and backups
+Relevant environment variables: `SB_PUBLIC`, `SB_ADMIN_PATH`, `SB_PASSWORD_HASH`
+(from `python3 auth.py`), `SB_BASE_URL`, `SB_AUTOSYNC`, `SB_DB_PATH`.
+
+### Data and backups
 
 Everything is in `data/sleep_bandit.db`. Tables: `interventions`, `nights`,
 `assignments` (one row per intervention per night: assigned dose, taken dose,
-exclusion, completion input, parked randomized dose), `settings`, and an
-append-only `audit_log` recording every write with a millisecond timestamp.
+exclusion, completion input, parked randomized dose), `settings` (Oura credentials
+and tokens, the Claude key, switches, sync bookkeeping), `night_series`, `tag_vocab`,
+night tags, cities and weather, and an append-only `audit_log` recording every write
+with a millisecond timestamp.
 
 Each planned cell's audit row (`assign`; `maximize_assign` for a maximize-benefit
 override) also records its **planning provenance**: the code version (git commit,
@@ -253,33 +292,133 @@ coefficient. So every night says which scheduler, in which mode, on what evidenc
 prescribed it (`server._plan_context`). Rows before 2026-10-22 carry the dose only.
 
 `backup.sh` takes a WAL-safe snapshot with `sqlite3 .backup` into `backups/` and
-keeps the newest 30. The database is committed to git alongside the code in this
-repo; `backups/` is not. Once the site is hosted, `pull.sh` mirrors the server's DB
-back to this Mac every 6 hours (see `deploy/README.md` §6).
-
-## Hosting
-
-`deploy/README.md` covers running it on a VPS behind Caddy at a public domain: a
-read-only public view at `/`, an unlinked password-protected admin path with the
-full app, background planning and Oura sync on a 20-minute timer, and daily backups.
-Hosted mode is off by default; locally everything is read/write with no login.
-
-Relevant environment variables: `SB_PUBLIC`, `SB_ADMIN_PATH`, `SB_PASSWORD_HASH`
-(from `python3 auth.py`), `SB_BASE_URL`, `SB_AUTOSYNC`, `SB_DB_PATH`.
+keeps the newest 30. The database was committed to git alongside the code until
+2026-11-07; it is now untracked (`data/` is gitignored) because it holds the Oura
+tokens, the Oura client secret and the Claude key as well as personal data. Commits
+before that date still carry old copies with Oura tokens; the GitHub remote never
+received the file. `backups/` is not in git either. Once the site is hosted,
+`pull.sh` mirrors the server's DB back to this Mac every 6 hours (see
+`deploy/README.md` §6).
 
 ## Files
 
 | File | Role |
 |---|---|
-| `server.py` | HTTP server, planning, analysis payloads, hosted mode |
+| `server.py` | HTTP server, planning, analysis payloads, hosted mode, `--test` self-test, optional `config.env` loading |
 | `bandit.py` | the model, Thompson sampling, dose exploration, interactions |
 | `store.py` | SQLite schema, migrations, every write (audited) |
-| `oura.py` | OAuth and sync, including the raw within-night series |
-| `tags.py` | night-shape tags: features, reference, the Claude call, background tagger |
+| `oura.py` | OAuth and sync, including the raw within-night series; read-only collection passthrough |
+| `tags.py` | night-shape tags: features, reference, the Claude call (shared preamble, `contact_eli`, inbox check, hold), background tagger |
 | `weather.py` | outdoor temperature per night (Open-Meteo) for the season sections |
-| `auth.py` | password hashing and session cookies for hosted mode |
-| `public/` | the single-page UI: `index.html`, `app.js`, `styles.css` |
-| `deploy/` | VPS setup: systemd units, Caddyfile, backup timer |
+| `auth.py` | password hashing and session cookies for hosted mode; `python3 auth.py` prints `SB_PASSWORD_HASH` |
+| `applog.py` | timestamped, flushed log lines (`log`, `log_exc`) for everything that runs under launchd |
+| `icons.py` | generates the home-screen icons in `public/` |
+| `seed_demo.py` | fills an empty database with simulated history whose ground truth is known |
+| `backup.sh` | daily WAL-safe snapshot into `backups/`, newest 30 kept |
+| `pull.sh` | Mac-side mirror of the hosted DB over ssh (needs `deploy/server.conf`) |
+| `install.sh` | copies the LaunchAgent plists from `deploy/mac/` and reloads them by label (idempotent) |
+| `public/` | the single-page UI: `index.html`, `app.js`, `styles.css`, `sw.js` (service worker, network-first), icons |
+| `deploy/mac/` | this Mac's LaunchAgents (`com.elityre.sleep-bandit`, `-backup`, `-pull`) and `config.env.example` |
+| `deploy/` | VPS setup: `push.sh`, `setup.sh`, systemd units, Caddyfile, backup timer, `README.md` |
+| `data/` | `sleep_bandit.db` (gitignored) |
+| `backups/` | snapshots from `backup.sh` and `pull.sh` (gitignored) |
 
-The design rationale for every planning constant is in the comment block above it in
-`bandit.py`; the table under "How the scheduler decides" maps each feature to it.
+## Runtime locations
+
+- Installed copy and working directory: `~/sleep-bandit`; `~/Documents/agent-coding/sleep-bandit`
+  is a symlink to it, so the LaunchAgent runs this very checkout (edits to `public/`
+  are live on the next page load; Python changes need a restart).
+- Database: `~/sleep-bandit/data/sleep_bandit.db` (`SB_DB_PATH` overrides). Credentials
+  live in its `settings` table, not in files.
+- Config (optional): `~/Library/Application Support/Sleep Bandit/config.env`, KEY=VALUE
+  overrides read at startup (`SB_PORT`, `SB_HOST`, `SB_DB_PATH`, `ANTHROPIC_API_KEY`);
+  template in `deploy/mac/config.env.example`. Real environment variables win.
+- Log: `~/Library/Logs/sleep-bandit.log` (every line timestamped by `applog.py`).
+  The older plist split stdout and stderr: `sleep-bandit.err.log` holds the
+  pre-2026-11-07 tracebacks and can be deleted.
+- Backup and pull logs: `~/Library/Logs/sleep-bandit-backup.log`, `sleep-bandit-pull.log`
+  (the currently loaded backup agent still writes `backups/backup.log` until reinstalled).
+- LaunchAgents: `~/Library/LaunchAgents/com.elityre.sleep-bandit.plist` (server,
+  `RunAtLoad` + `KeepAlive`), `com.elityre.sleep-bandit-backup.plist` (daily 15:00),
+  `com.elityre.sleep-bandit-pull.plist` (every 6 h, hosted setup only). Sources in `deploy/mac/`.
+- Backups: `~/sleep-bandit/backups/`.
+- LLM inbox (contacts from the tagger): `~/Library/Application Support/LLMInbox/messages.jsonl`.
+- Hosted copy: `/opt/sleep-bandit` on the VPS, env in `/etc/sleep-bandit.env`; see `deploy/README.md`.
+
+## Common tasks
+
+```sh
+cd ~/sleep-bandit
+python3 server.py                      # run by hand on :8777 (SB_PORT, SB_HOST override)
+python3 server.py --test               # self-test: seeds a temp DB, serves it, checks state/reports/
+                                       # interactions/tags payloads and the Claude prompt preamble
+SB_PORT=8811 SB_DB_PATH=/tmp/x.db python3 server.py   # a second copy for development (see Gotchas)
+python3 seed_demo.py                   # demo history into the configured DB (--wipe to start fresh)
+
+./install.sh                           # copy plists from deploy/mac/ and reload the agents (restarts the server)
+./install.sh --no-restart              # copy the plists only
+launchctl kickstart -k gui/$UID/com.elityre.sleep-bandit      # restart the server after a code change
+launchctl bootout gui/$UID/com.elityre.sleep-bandit           # stop it (e.g. when the hosted site takes over)
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.elityre.sleep-bandit.plist   # start it again
+launchctl print gui/$UID/com.elityre.sleep-bandit | grep -E 'state|pid'
+lsof -nP -iTCP:8777 -sTCP:LISTEN       # who holds the port (kill by that PID, never pkill by name)
+tail -f ~/Library/Logs/sleep-bandit.log
+
+./backup.sh                            # snapshot now
+./pull.sh                              # mirror the hosted DB down (needs deploy/server.conf)
+open http://localhost:8777/api/export  # full JSON export
+python3 auth.py                        # hosted mode: prompts for the admin password, prints SB_PASSWORD_HASH=
+deploy/push.sh SERVER_IP               # deploy / update the hosted copy
+llm-inbox list                         # messages the tagging model sent to Eli
+```
+
+## Settings that matter
+
+- **Oura developer portal** (cloud.ouraring.com → Developer → OAuth applications): the
+  private app's redirect URI must be `http://localhost:8777/oura/callback` locally, or
+  `https://<site>/oura/callback` when hosted. Changing it means **Oura → Save & reconnect**.
+- **Claude API key**: pasted in the 🏷 Night tags panel (settings table) or `ANTHROPIC_API_KEY`
+  in the environment / `config.env`. Nothing is sent to Anthropic unless tagging is on.
+- **Login**: the LaunchAgent starts at login and is kept alive; no Login Item is needed.
+- **nightblock** closes `api.anthropic.com` from midnight to 6 am on this Mac, so a tagging
+  pass that runs in that window fails with "Could not reach the Claude API" and is retried
+  on the next Oura sync.
+- **Hosted**: DNS A records, `/etc/sleep-bandit.env`, Caddy; all in `deploy/README.md`.
+
+## Gotchas learned
+
+- If you start a second copy by hand while the agent's copy holds the port, the agent's
+  copy exits with "address already in use" until the port is free (KeepAlive restarts it
+  every 10 s). Use another port and `SB_DB_PATH` for development.
+- **Never point a second running copy at a database that holds live Oura tokens** (a
+  plain copy of `data/sleep_bandit.db` included): Oura rotates the refresh token on
+  every refresh, so the copy that refreshes first invalidates the other's token. Strip
+  the `oura_*` rows from a development copy, or use `seed_demo.py`.
+- `/usr/bin/python3` on this Mac is Xcode's **Python 3.9**, and that is what the
+  LaunchAgent runs. Code here must stay 3.9-compatible (no `X | None` annotations, no
+  `match`). `shared/llm_contact.py` is not (it fails to import on 3.9), which is why
+  `tags.py` falls back to reading the preamble/tool files and piping the inbox check to
+  `/opt/homebrew/bin/python3`. Fix at the source when convenient: add
+  `from __future__ import annotations` to `shared/llm_contact.py`, or move the plist to
+  `/opt/homebrew/bin/python3`.
+- Under launchd, `print()` to a file is block-buffered: `sleep-bandit.log` stayed empty
+  for four months while 27 MB of untimestamped tracebacks went to `.err.log`. `applog.py`
+  writes timestamped lines to stderr and flushes; the plist sets `PYTHONUNBUFFERED=1`
+  and sends both streams to one file.
+- Restart by PID or `launchctl kickstart -k` / `bootout`, never `pkill`: a pkill that
+  matches nothing exits quietly and the old code keeps running.
+- `ConnectionResetError: [Errno 54]` tracebacks in the log are a browser closing a
+  connection mid-response (tab closed, reload); harmless.
+- The DB was tracked in git until 2026-11-07 (the `.gitignore` even said "the .db
+  itself is kept"), so Oura tokens were in every commit. `git rm --cached` fixed the
+  future; history was not rewritten. Rotate the Oura client secret if the repo is ever
+  pushed somewhere public.
+- The hosted and Mac copies must not both plan: stop the Mac agent while the site is
+  live, or the two planners diverge and `pull.sh` cannot refresh the standby DB (it
+  skips while a local server holds :8777).
+- Structured output plus a tool: the tagger asks for a JSON schema **and**
+  offers `contact_eli`; the Messages API accepts both at once (verified 2026-11-07).
+  If the model calls the tool there is no text block, so the inbox check runs before
+  the "returned no text" error.
+- A night belongs to the evening's date (4 AM rollover) but Oura's day is the morning:
+  night d = Oura day d+1. Naps are never used.

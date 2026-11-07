@@ -155,6 +155,39 @@ def fetch_sleep(conn, start_date, end_date):
             return docs
 
 
+COLLECTION_URL = "https://api.ouraring.com/v2/usercollection/"
+READ_COLLECTIONS = ("sleep", "daily_sleep", "daily_readiness", "daily_activity", "daily_stress",
+                    "daily_spo2", "heartrate", "workout", "session", "daily_resilience", "vo2_max")
+
+
+def fetch_collection(conn, name, start_date, end_date):
+    """Read-only passthrough for other local tools (the executive-assistant agent): every document
+    of one Oura v2 collection with start_date <= day <= end_date, pagination followed, one token
+    refresh retried. Uses this app's token so there is a single owner of the rotating refresh token."""
+    if name not in READ_COLLECTIONS:
+        raise OuraError(f"unknown collection {name!r}")
+    token = _access_token(conn)
+    docs, next_token, refreshed = [], None, False
+    while True:
+        key = "start_datetime" if name == "heartrate" else "start_date"
+        key_end = "end_datetime" if name == "heartrate" else "end_date"
+        params = {key: start_date, key_end: end_date}
+        if next_token:
+            params["next_token"] = next_token
+        url = COLLECTION_URL + name + "?" + urllib.parse.urlencode(params)
+        try:
+            page = _http_json(url, headers={"Authorization": "Bearer " + token})
+        except OuraError as e:
+            if "401" in str(e) and not refreshed:
+                token, refreshed = _refresh(conn), True
+                continue
+            raise
+        docs.extend(page.get("data", []))
+        next_token = page.get("next_token")
+        if not next_token:
+            return docs
+
+
 def _main_sleep_by_day(docs):
     """Oura day -> the night's main sleep session (type 'long_sleep'; if the night was
     split into several, the longest one)."""

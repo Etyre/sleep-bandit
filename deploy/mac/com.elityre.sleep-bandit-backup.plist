@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.elityre.sleep-bandit-backup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/elityre/sleep-bandit/backup.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/elityre/sleep-bandit</string>
+
+    <!-- Back up once when loaded, then every day at 15:00 (mid-afternoon: well past
+         the 4 AM night rollover, so the current night's column is stable). If the
+         Mac is asleep at 15:00, launchd runs it at the next wake. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>15</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/elityre/Library/Logs/sleep-bandit-backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/elityre/Library/Logs/sleep-bandit-backup.log</string>
+</dict>
+</plist>

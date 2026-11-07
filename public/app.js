@@ -11,6 +11,19 @@ const api = async (path, opts) => {
 };
 const post = (path, body) =>
   api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+
+// ---- drafts are never lost -------------------------------------------------
+// Everything typed into a text field is saved to localStorage on every keystroke
+// under "sb.draft.<field>.<record>", restored before the field is first shown,
+// and cleared only when the write that it was for succeeds (or the user
+// explicitly cancels an editor). Password fields are never saved. A re-render of
+// the grid, a page reload or a tab switch therefore brings the same text back.
+const DRAFT_PREFIX = "sb.draft.";
+const draftGet = (key) => { try { return localStorage.getItem(DRAFT_PREFIX + key); } catch (e) { return null; } };
+const draftSet = (key, value) => { try { localStorage.setItem(DRAFT_PREFIX + key, value == null ? "" : String(value)); } catch (e) { /* private mode, quota */ } };
+const draftClear = (key) => { try { localStorage.removeItem(DRAFT_PREFIX + key); } catch (e) { /* ignore */ } };
+// value to render for a field: the unsent draft if there is one, else the saved value
+const withDraft = (key, saved) => { const d = draftGet(key); return d == null ? saved : d; };
 const el = (tag, cls, html) => { const n = document.createElement(tag); if (cls) n.className = cls; if (html != null) n.innerHTML = html; return n; };
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const signed = (x) => (x >= 0 ? "+" : "") + Number(x).toFixed(1);
@@ -278,7 +291,8 @@ function renderGrid() {
             }
             body += `<td class="${cls} has-input" data-date="${n.date}" data-iv="${iv.id}">${core}${controls}</td>`;
           } else if (inputType === "quantity") {
-            const v = c.input_value != null ? String(c.input_value) : "";
+            const saved = c.input_value != null ? String(c.input_value) : "";
+            const v = READ_ONLY ? saved : withDraft(`cell.${n.date}.${iv.id}`, saved);
             const controls = READ_ONLY
               ? (v ? `<span class="in-val">${esc(v)}${iv.input_label ? " " + esc(iv.input_label) : ""}</span>` : "")
               : `<input class="in-qty" type="text" inputmode="decimal" value="${esc(v)}" ` +
@@ -326,11 +340,12 @@ function renderGrid() {
         ` title="${manual ? "entered by hand" : "synced from Oura"}"`;
       // Oura values are measured to one decimal, so a trailing .0 is significant --
       // show it. Hand-typed values display exactly as typed.
-      const val = n[m.key] == null ? "" :
+      const saved = n[m.key] == null ? "" :
         (manual ? n[m.key] : Number(n[m.key]).toFixed(1));
+      const val = READ_ONLY ? saved : withDraft(`metric.${n.date}.${m.key}`, String(saved));
       body += `<td class="hrvcell${n.is_today ? " col-today" : ""}${manual ? " manual" : ""}">` +
         `<input type="number" step="any" min="0" data-date="${n.date}" data-metric="${m.key}" ` +
-        `value="${val}" placeholder="—"${title}${READ_ONLY ? " readonly tabindex=\"-1\"" : ""}></td>`;
+        `value="${esc(val)}" placeholder="—"${title}${READ_ONLY ? " readonly tabindex=\"-1\"" : ""}></td>`;
     }
     body += `</tr>`;
   }
@@ -340,7 +355,7 @@ function renderGrid() {
       `<span class="rmeta">per night</span></th>`;
     for (const n of nights) {
       body += `<td class="notecell${n.is_today ? " col-today" : ""}">` +
-        `<textarea rows="2" data-date="${n.date}" placeholder="—">${esc(n.note || "")}</textarea></td>`;
+        `<textarea rows="2" data-date="${n.date}" placeholder="—">${esc(withDraft(`note.${n.date}`, n.note || ""))}</textarea></td>`;
     }
     body += `</tr>`;
   }
@@ -353,10 +368,20 @@ function renderGrid() {
     // not a whole-cell click
     $$(".cell.active:not(.has-input)", table).forEach((td) => td.addEventListener("click", () => toggleCell(td)));
     $$(".cell .in-radio", table).forEach((b) => b.addEventListener("click", () => saveCellRadio(b)));
-    $$(".cell .in-qty", table).forEach((inp) => inp.addEventListener("change", () => saveCellQty(inp)));
+    $$(".cell .in-qty", table).forEach((inp) => {
+      const td = inp.closest("td");
+      inp.addEventListener("input", () => draftSet(`cell.${td.dataset.date}.${td.dataset.iv}`, inp.value));
+      inp.addEventListener("change", () => saveCellQty(inp));
+    });
     $$(".cell.off.togglable", table).forEach((td) => td.addEventListener("click", () => toggleCellExclusion(td)));
-    $$(".hrvcell input", table).forEach((inp) => inp.addEventListener("change", () => saveMetric(inp)));
-    $$(".notecell textarea", table).forEach((t) => t.addEventListener("change", () => saveNote(t)));
+    $$(".hrvcell input", table).forEach((inp) => {
+      inp.addEventListener("input", () => draftSet(`metric.${inp.dataset.date}.${inp.dataset.metric}`, inp.value));
+      inp.addEventListener("change", () => saveMetric(inp));
+    });
+    $$(".notecell textarea", table).forEach((t) => {
+      t.addEventListener("input", () => draftSet(`note.${t.dataset.date}`, t.value));
+      t.addEventListener("change", () => saveNote(t));
+    });
     $$(".excl-btn", table).forEach((b) => b.addEventListener("click", () => toggleExclusion(b)));
     $$("button.max-btn", table).forEach((b) => b.addEventListener("click", toggleMaximize));
     $$(".city-sel", table).forEach((sel) => sel.addEventListener("change", () => saveCity(sel)));
@@ -568,6 +593,7 @@ async function saveCellQty(inp) {
   try {
     await post("/api/cell", { date: td.dataset.date, intervention_id: td.dataset.iv,
                               done: value != null, input_value: value, client_tonight: stateTonight() });
+    draftClear(`cell.${td.dataset.date}.${td.dataset.iv}`);
     if (cell) { cell.done = value != null; cell.input_value = value; }
     td.classList.toggle("done", value != null);
   } catch (e) {
@@ -583,6 +609,7 @@ async function saveMetric(inp) {
   const night = STATE.nights.find((n) => n.date === inp.dataset.date);
   try {
     await post("/api/metric", { date: inp.dataset.date, metric, value: num });
+    draftClear(`metric.${inp.dataset.date}.${metric}`);
     if (night) { night[metric] = num; night[metric + "_src"] = num == null ? null : "manual"; }
     // reflect the source marker without a full re-render (which would drop focus)
     const td = inp.closest("td");
@@ -597,6 +624,7 @@ async function saveNote(t) {
   const night = STATE.nights.find((n) => n.date === t.dataset.date);
   try {
     await post("/api/note", { date: t.dataset.date, note: t.value });
+    draftClear(`note.${t.dataset.date}`);
     if (night) night.note = t.value.trim();
   } catch (e) {
     alert("Could not save note: " + e.message);
@@ -667,7 +695,8 @@ function renderTonight() {
           return `<button type="button" class="${isOn ? "on" : ""}" data-oid="${o.id}">${esc(o.label)}</button>`;
         }).join("") + `</div>`;
       } else if (inputType === "quantity") {
-        const v = c.input_value != null ? String(c.input_value) : "";
+        const saved = c.input_value != null ? String(c.input_value) : "";
+        const v = ro ? saved : withDraft(`cell.${n.date}.${iv.id}`, saved);
         ctl = ro ? (v ? `<span class="tn-val">${esc(v)}${iv.input_label ? " " + esc(iv.input_label) : ""}</span>` : "")
                  : `<input class="tn-qty" type="text" inputmode="decimal" value="${esc(v)}" placeholder="${esc(iv.input_label || "qty")}" ` +
                    `title="A number, or “-” for done but not measured; clear to un-mark">`;
@@ -700,7 +729,11 @@ function renderTonight() {
   if (ro) return;
   $$(".tn-card.tap", body).forEach((card) => card.addEventListener("click", () => tonightToggle(card)));
   $$(".tn-radios button", body).forEach((b) => b.addEventListener("click", () => tonightRadio(b)));
-  $$(".tn-qty", body).forEach((inp) => inp.addEventListener("change", () => tonightQty(inp)));
+  $$(".tn-qty", body).forEach((inp) => {
+    const card = inp.closest(".tn-card");
+    inp.addEventListener("input", () => draftSet(`cell.${card.dataset.date}.${card.dataset.iv}`, inp.value));
+    inp.addEventListener("change", () => tonightQty(inp));
+  });
   $$(".tn-anyway", body).forEach((b) => b.addEventListener("click", () => tonightAnyway(b)));
   $$("button.tn-max", body).forEach((b) => b.addEventListener("click", toggleMaximize));
 }
@@ -748,6 +781,7 @@ async function tonightQty(inp) {
   try {
     await post("/api/cell", { date: card.dataset.date, intervention_id: card.dataset.iv,
                               done: value != null, input_value: value, client_tonight: stateTonight() });
+    draftClear(`cell.${card.dataset.date}.${card.dataset.iv}`);
     if (cell) { cell.done = value != null; cell.input_value = value; }
     TONIGHT.dirty = true;
     card.classList.toggle("done", value != null);
@@ -2215,6 +2249,40 @@ $$(".subtab").forEach((b) => b.addEventListener("click", () => switchView(b.data
 window.addEventListener("hashchange", () => switchView(location.hash.replace("#", "")));
 
 let editingId = null;
+// The editor's draft: every named field plus the option lists, keyed by the
+// intervention being edited ("new" for a fresh one). Written on each change,
+// restored in openModal, cleared by a successful save, Cancel, or Delete.
+const IV_DRAFT_FIELDS = ["name", "category", "kind", "unit", "default_dose", "unit_dose", "dose_noun", "noun_amount",
+                         "min_dose", "max_dose", "explore_doses", "delay_explore", "open_arm", "open_arm_label",
+                         "test_skip", "prior_helps", "note", "input_type", "input_label"];
+const ivDraftKey = () => `iv.${editingId == null ? "new" : editingId}`;
+let IV_RESTORING = false;   // suppress draft writes while openModal fills the form
+function saveIvDraft() {
+  if (IV_RESTORING || $("#modal-backdrop").hidden) return;
+  const f = $("#iv-form");
+  const fields = {};
+  for (const name of IV_DRAFT_FIELDS) fields[name] = f[name].type === "checkbox" ? f[name].checked : f[name].value;
+  draftSet(ivDraftKey(), JSON.stringify({ fields, options: modalOptions, inputOptions,
+    newOption: $("#new-option").value, newInputOption: $("#new-input-option").value }));
+}
+function restoreIvDraft() {
+  const raw = draftGet(ivDraftKey());
+  if (!raw) return false;
+  let d;
+  try { d = JSON.parse(raw); } catch (e) { draftClear(ivDraftKey()); return false; }
+  const f = $("#iv-form");
+  for (const name of IV_DRAFT_FIELDS) {
+    if (!(name in (d.fields || {}))) continue;
+    if (f[name].type === "checkbox") f[name].checked = !!d.fields[name]; else f[name].value = d.fields[name];
+  }
+  if (Array.isArray(d.options)) modalOptions = d.options;
+  if (Array.isArray(d.inputOptions)) inputOptions = d.inputOptions;
+  $("#new-option").value = d.newOption || "";
+  $("#new-input-option").value = d.newInputOption || "";
+  return true;
+}
+$("#iv-form").addEventListener("input", saveIvDraft);
+$("#iv-form").addEventListener("change", saveIvDraft);
 function syncKind() {
   const k = $("#iv-kind").value;
   const dosed = k === "dose" || k === "choice_dose", choice = k === "choice" || k === "choice_dose";
@@ -2290,6 +2358,7 @@ function refreshPriorPlaceholders() {
 }
 
 function renderOptions() {
+  saveIvDraft();   // option lists change outside the form's own input events
   const list = $("#options-list");
   list.innerHTML = "";
   const live = liveModalOptions();
@@ -2388,6 +2457,7 @@ const INPUT_TYPES = ["checkbox", "radio", "quantity"];
 let inputOptions = [];  // [{id: number|null, label}]
 
 function renderInputOptions() {
+  saveIvDraft();
   const list = $("#input-options-list");
   list.innerHTML = "";
   if (!inputOptions.length) {
@@ -2443,6 +2513,7 @@ $("#iv-input-type").addEventListener("change", syncInputType);
 
 function openModal(iv) {
   editingId = iv ? iv.id : null;
+  IV_RESTORING = true;
   $("#modal-title").textContent = iv ? "Edit intervention" : "Add intervention";
   const f = $("#iv-form");
   f.name.value = iv ? iv.name : "";
@@ -2465,14 +2536,17 @@ function openModal(iv) {
   f.note.value = iv ? iv.note : "";
   modalOptions = iv && isChoiceKind(iv) ? (iv.options || []).map((o) => ({ id: o.id, label: o.label, prior: o.prior > 0 ? o.prior : null, retired: !!o.retired })) : [];
   $("#new-option").value = "";
-  renderOptions();
   f.input_type.value = iv && INPUT_TYPES.includes(iv.input_type) ? iv.input_type : "checkbox";
   f.input_label.value = iv ? (iv.input_label || "") : "";
   inputOptions = iv ? (iv.input_options || []).map((o) => ({ id: o.id, label: o.label })) : [];
   $("#new-input-option").value = "";
+  const restored = restoreIvDraft();   // unsent edits from last time win over the saved record
+  $("#modal-title").textContent += restored ? " (unsaved draft restored)" : "";
+  renderOptions();
   renderInputOptions();
   syncInputType();
   syncKind();
+  IV_RESTORING = false;
   const del = $("#iv-delete");
   del.hidden = !iv;
   if (iv) { del.textContent = "Delete"; del.onclick = () => deleteIv(iv); }
@@ -2483,6 +2557,8 @@ function openModal(iv) {
   f.name.focus();
 }
 function closeModal() { $("#modal-backdrop").hidden = true; editingId = null; }
+// Cancel is an explicit discard; closing with ✕ or the backdrop keeps the draft
+function cancelModal() { draftClear(ivDraftKey()); closeModal(); }
 
 // Pause/resume: paused interventions stop being suggested on future nights (a night
 // that's already planned is left unchanged) and keep all their data; pass dose_levels
@@ -2498,7 +2574,7 @@ async function togglePause(iv) {
 async function deleteIv(iv) {
   if (!confirm(`Remove “${iv.name}” from your tracker?\n\nIts recorded data is kept — nothing is deleted, and it stops being suggested.`)) return;
   await api(`/api/interventions/${iv.id}`, { method: "DELETE" });
-  closeModal(); loadGrid();
+  draftClear(ivDraftKey()); closeModal(); loadGrid();
 }
 
 $("#iv-form").addEventListener("submit", async (e) => {
@@ -2551,13 +2627,13 @@ $("#iv-form").addEventListener("submit", async (e) => {
   try {
     if (editingId) STATE = await api(`/api/interventions/${editingId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     else STATE = await post("/api/interventions", payload);
-    closeModal(); renderGrid();
+    draftClear(ivDraftKey()); closeModal(); renderGrid();
   } catch (err) { alert("Error: " + err.message); }
 });
 
 $("#add-btn").addEventListener("click", () => openModal(null));
 $("#modal-close").addEventListener("click", closeModal);
-$("#iv-cancel").addEventListener("click", closeModal);
+$("#iv-cancel").addEventListener("click", cancelModal);
 $("#modal-backdrop").addEventListener("click", (e) => { if (e.target === $("#modal-backdrop")) closeModal(); });
 // row-label click opens the editor for that intervention
 $("#grid-table").addEventListener("click", (e) => {
@@ -2604,7 +2680,7 @@ function renderOuraUI() {
   $("#oura-save").hidden = OURA.connected;
   $("#oura-save").textContent = OURA.connected ? "Save & reconnect" : "Save & connect";
   const f = $("#oura-form");
-  if (document.activeElement !== f.client_id) f.client_id.value = OURA.client_id || "";
+  if (document.activeElement !== f.client_id) f.client_id.value = withDraft("oura.client_id", OURA.client_id || "");
   f.client_secret.placeholder = OURA.configured ? "(unchanged — leave blank to keep)" : "";
 }
 
@@ -2631,6 +2707,7 @@ function closeOuraModal() { $("#oura-backdrop").hidden = true; }
 
 for (const field of ["client_id", "client_secret"])
   $("#oura-form")[field].addEventListener("input", () => { $("#oura-save").hidden = false; });
+$("#oura-form").client_id.addEventListener("input", (e) => draftSet("oura.client_id", e.target.value));
 
 $("#oura-btn").addEventListener("click", openOuraModal);
 $("#oura-close").addEventListener("click", closeOuraModal);
@@ -2645,6 +2722,7 @@ $("#oura-form").addEventListener("submit", async (e) => {
       client_id: f.client_id.value.trim(),
       client_secret: f.client_secret.value,   // blank = keep stored secret
     });
+    draftClear("oura.client_id");
     if (!OURA.configured) { renderOuraUI(); return; }
     window.location.href = "/oura/connect";   // hand off to Oura's authorize page
   } catch (err) { alert("Error: " + err.message); }
@@ -2698,9 +2776,11 @@ function renderTagsUI() {
     (w.last_date ? ` — last: ${esc(shortDate(w.last_date))} → ${(w.last_tags || []).map(tagLabel).map(esc).join(", ") || "no tags"}` : "");
   else if (w.started && w.done) html += `<br>Last run: ${w.done} night${w.done === 1 ? "" : "s"} tagged.`;
   if (w.error) html += `<br><span class="oura-err">${esc(w.error)}</span>`;
+  // the model used contact_eli / @ELI: -- tagging is paused until this panel is saved
+  if (TAGS.hold && TAGS.hold !== w.error) html += `<br><span class="oura-err">Paused: ${esc(TAGS.hold)}</span>`;
   st.innerHTML = html;
   if (document.activeElement !== f.enabled) f.enabled.checked = !!TAGS.enabled;
-  if (document.activeElement !== f.threshold) f.threshold.value = TAGS.threshold;
+  if (document.activeElement !== f.threshold) f.threshold.value = withDraft("tags.threshold", String(TAGS.threshold));
   f.api_key.placeholder = TAGS.configured ? "(saved — leave blank to keep)" : "sk-ant-…";
   $("#tags-run").hidden = !TAGS.configured || !TAGS.pending || w.running;
   $("#tags-run").textContent = `Tag ${TAGS.pending} pending night${TAGS.pending === 1 ? "" : "s"} now`;
@@ -2732,6 +2812,7 @@ $("#tags-close").addEventListener("click", closeTagsModal);
 $("#tags-cancel").addEventListener("click", closeTagsModal);
 $("#tags-backdrop").addEventListener("click", (e) => { if (e.target === $("#tags-backdrop")) closeTagsModal(); });
 
+$("#tags-form").threshold.addEventListener("input", (e) => draftSet("tags.threshold", e.target.value));
 $("#tags-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target;
@@ -2741,6 +2822,7 @@ $("#tags-form").addEventListener("submit", async (e) => {
       threshold: Number(f.threshold.value),
       enabled: f.enabled.checked,
     });
+    draftClear("tags.threshold");
     f.api_key.value = "";
     renderTagsUI();
     await loadGrid();   // the row appears/disappears with the switch

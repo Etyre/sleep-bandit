@@ -81,12 +81,12 @@ reachable from it, so this only works once step 3 is done.
 ## 6. After that
 
 * **A whole copy of the data stays on the Mac.** `pull.sh` (run every 6 hours while the
-  Mac is awake by the `com.elityre.sleep-bandit-pull` LaunchAgent, plist in `deploy/`)
+  Mac is awake by the `com.elityre.sleep-bandit-pull` LaunchAgent, plist in `deploy/mac/`)
   takes a WAL-safe snapshot *on the server*, streams it down, checks its integrity,
   keeps the newest 60 in `backups/server-<stamp>.db`, and refreshes `data/sleep_bandit.db`
-  so the local app is always ready to take over. Install the agent once with
-  `cp deploy/com.elityre.sleep-bandit-pull.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.elityre.sleep-bandit-pull.plist`;
-  log in `backups/pull.log`. **If the server is ever lost**: `launchctl bootstrap gui/$UID
+  so the local app is always ready to take over. `./install.sh` installs the agent
+  once `deploy/server.conf` exists (or by hand: `cp deploy/mac/com.elityre.sleep-bandit-pull.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.elityre.sleep-bandit-pull.plist`);
+  log in `~/Library/Logs/sleep-bandit-pull.log`. **If the server is ever lost**: `launchctl bootstrap gui/$UID
   ~/Library/LaunchAgents/com.elityre.sleep-bandit.plist` and the Mac copy is live at
   `http://localhost:8777` with data at most 6 hours old.
 * **Your Mac copy** is now a standby. Stop its LaunchAgent so two planners don't

@@ -1,14 +1,31 @@
 """
-server.py -- Sleep Bandit web app (pure Python standard library).
+server.py -- Sleep Bandit: a single-user n-of-1 experiment runner for sleep
+interventions (pure Python standard library + SQLite).
 
-Run:  python3 server.py         then open http://localhost:8777
+Each evening it decides, per intervention, whether tonight is ON or OFF and at
+what dose (Thompson sampling over a Bayesian model, bandit.py); each morning it
+pulls HRV, resting heart rate and sleep metrics from an Oura ring (oura.py);
+the Reports tab fits the model to say what helps. Low-HRV nights are read and
+tagged by Claude (tags.py), outdoor temperature comes from Open-Meteo
+(weather.py). Everything the browser sees is served from public/.
 
-Spreadsheet UI: rows are interventions, columns are nights. Each night the app
-decides (a simple coin flip, for now) whether each intervention is "on"; if so
-it suggests the default dose and you tick a checkmark once you've done it.
+Run:   python3 server.py            then open http://localhost:8777
+Test:  python3 server.py --test     end-to-end dry run on a throwaway database
 
-The Bayesian bandit engine still lives in bandit.py for later; right now planning
-is a plain coin flip per the current design.
+On this Mac the LaunchAgent com.elityre.sleep-bandit keeps it running from
+~/sleep-bandit (a symlink target of ~/Documents/agent-coding/sleep-bandit).
+
+Where things live:
+  data/sleep_bandit.db                              every night, setting and
+                                                    credential (Oura tokens,
+                                                    Claude key); SB_DB_PATH moves it
+  ~/Library/Application Support/Sleep Bandit/config.env
+                                                    optional KEY=VALUE overrides
+                                                    (SB_PORT, SB_HOST, SB_DB_PATH,
+                                                    ANTHROPIC_API_KEY, ...)
+  ~/Library/Logs/sleep-bandit.log                   timestamped log (applog.py)
+  backups/                                          daily WAL-safe snapshots
+Hosted mode (SB_PUBLIC=1 and friends) is described below and in deploy/README.md.
 """
 
 import json
@@ -17,14 +34,39 @@ import os
 import secrets
 import statistics
 import subprocess
+import sys
 import threading
 import time
-import traceback
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 
-import auth
+import applog
+
+# Optional per-machine config: KEY=VALUE lines, read before the local modules
+# below look at their environment (store.py reads SB_DB_PATH at import). A
+# variable already set in the real environment (launchd plist, shell) wins.
+CONFIG_DIR = os.path.expanduser("~/Library/Application Support/Sleep Bandit")
+CONFIG_ENV = os.path.join(CONFIG_DIR, "config.env")
+
+
+def _load_config_env():
+    try:
+        with open(CONFIG_ENV) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"'))
+
+
+_load_config_env()
+
+import auth   # noqa: E402  (after the config file so SB_* overrides apply)
 import bandit
 import oura
 import tags
@@ -893,6 +935,44 @@ def tag_associations(iv, all_nights, tags_by_date, vocab):
     return out
 
 
+def agent_summary_payload(conn, days=30):
+    """What an outside assistant needs to know, without touching the plan: the last `days`
+    nights with their metrics and which interventions were on/done, tonight's checklist,
+    the readiness status, and each active intervention's current verdict."""
+    d_today = today_str()
+    ivs = store.list_interventions(conn)
+    by_id = {iv["id"]: iv for iv in ivs}
+    nights = []
+    for n in store.recent_nights(conn, days + 1):
+        cells = []
+        for a in n["assignments"]:
+            iv = by_id.get(a["intervention_id"])
+            if not iv:
+                continue
+            assigned = a["assigned_dose"] or 0
+            cells.append({"intervention": iv["name"], "unit": iv.get("unit"), "assigned_dose": assigned,
+                          "on": assigned > 0, "done": a["taken_dose"] is not None and (a["taken_dose"] or 0) > 0,
+                          "taken_dose": a["taken_dose"], "excluded": bool(a["excluded"]),
+                          "input_value": a["input_value"]})
+        nights.append({"date": n["date"], "is_tonight": n["date"] == d_today, "status": n["status"],
+                       "hrv": n["hrv"], "lowest_resting_hr": n["lrhr"], "total_sleep_hours": n["tst"],
+                       "latency_min": n["lat"], "efficiency": n["eff"], "note": n["note"],
+                       "city": n["city"], "cells": cells})
+    tags_by_date = store.night_tags(conn)
+    for n in nights:
+        tg = tags_by_date.get(n["date"]) or {}
+        n["tags"] = tg.get("tags", [])
+        n["tags_summary"] = tg.get("summary", "")
+    reports = reports_payload(conn)
+    verdicts = [{k: iv.get(k) for k in ("id", "name", "category", "kind", "unit", "active", "readout",
+                                         "readout_lrhr", "readout_tst", "readout_lat", "readout_eff",
+                                         "observational", "p_scheduled")}
+                for iv in reports.get("interventions", [])]
+    trend = reports.get("hrv_trend") or {}
+    return {"today": d_today, "n_completed_nights": reports.get("n_completed"),
+            "hrv_trend_latest": trend.get("latest"), "nights": nights, "interventions": verdicts}
+
+
 def reports_payload(conn):
     """Per-intervention efficacy read-outs for BOTH metrics (HRV: higher better;
     LRHR: lower better). Each intervention is fit on its own compliant nights.
@@ -1300,6 +1380,27 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/") or path.startswith("/oura/"):
                 if not writer:
                     return self._forbid()
+            if path == "/api/agent/summary":
+                # Read-only view for the executive-assistant agent: recent nights, tonight's cells
+                # (no planning side effect), per-intervention verdicts and the HRV readiness trend.
+                q = parse_qs(urlparse(self.path).query)
+                days = max(1, min(400, int(q.get("days", ["30"])[0])))
+                return self._send_json(agent_summary_payload(conn, days))
+            if path == "/api/oura/collection":
+                q = parse_qs(urlparse(self.path).query)
+                name = q.get("name", ["daily_readiness"])[0]
+                days = max(1, min(400, int(q.get("days", ["14"])[0])))
+                end = date.today() + timedelta(days=1)
+                start = end - timedelta(days=days + 1)
+                if name == "heartrate":
+                    start_s, end_s = start.isoformat() + "T00:00:00", end.isoformat() + "T00:00:00"
+                else:
+                    start_s, end_s = start.isoformat(), end.isoformat()
+                try:
+                    return self._send_json({"collection": name, "start": start_s, "end": end_s,
+                                            "data": oura.fetch_collection(conn, name, start_s, end_s)})
+                except oura.OuraError as e:
+                    return self._send_json({"error": str(e)}, 502)
             if path == "/api/export":
                 return self._send_json({
                     "interventions": store.list_interventions(conn),
@@ -1464,7 +1565,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:   # fetch that city's weather for the nights now attributed to it
                     weather.sync(conn, today_str(), force=True)
                 except Exception:
-                    traceback.print_exc()
+                    applog.log_exc("weather sync after city change failed")
                 return self._send_json(state_payload(conn))
 
             if path == "/api/cities":
@@ -1533,7 +1634,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     weather.sync(conn, today_str())
                 except Exception:
-                    traceback.print_exc()
+                    applog.log_exc("weather sync failed")
                 if tags.enabled(conn) and tags.api_key(conn) \
                         and store.nights_to_tag(conn, tags.threshold(conn)):
                     tags.run_pending_async(limit=tags.PER_PASS)
@@ -1567,6 +1668,9 @@ class Handler(BaseHTTPRequestHandler):
                 if body.get("forget_key"):
                     store.set_setting(conn, "anthropic_api_key", None)
                     store.set_setting(conn, "tags_enabled", "0")
+                # saving the panel is Eli's acknowledgement after a contact_eli /
+                # @ELI: message paused tagging (tags.ContactRecorded)
+                store.set_setting(conn, "tags_hold", None)
                 st = tags.status(conn)
                 if st["enabled"] and st["pending"]:
                     tags.run_pending_async()
@@ -1676,7 +1780,7 @@ def _autosync_loop():
             finally:
                 conn.close()
         except Exception:
-            traceback.print_exc()
+            applog.log_exc("autosync pass failed")
         time.sleep(AUTOSYNC_MINUTES * 60)
 
 
@@ -1684,19 +1788,70 @@ def main():
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     if PUBLIC_MODE:
         if not PASSWORD_HASH:
-            print("WARNING: SB_PUBLIC=1 but SB_PASSWORD_HASH is unset -- the admin page cannot be used.")
-        print(f"Sleep Bandit (hosted, read-only root; admin at {ADMIN_PATH}) on {HOST}:{PORT}")
+            applog.log("WARNING: SB_PUBLIC=1 but SB_PASSWORD_HASH is unset -- the admin page cannot be used.")
+        applog.log(f"Sleep Bandit (hosted, read-only root; admin at {ADMIN_PATH}) on {HOST}:{PORT}, code {CODE_VERSION}")
     else:
-        print("Sleep Bandit is running.")
-        print(f"  Open http://localhost:{PORT} in your browser.")
-        print("  Press Ctrl+C to stop.")
+        applog.log(f"Sleep Bandit is running on http://localhost:{PORT} (Ctrl+C to stop), code {CODE_VERSION}, db {store.DB_PATH}")
     if AUTOSYNC:
         threading.Thread(target=_autosync_loop, name="autosync", daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopped.")
+        applog.log("Stopped.")
+
+
+def selftest():
+    """`python3 server.py --test`: prove the app works end to end without touching
+    the real database or any running copy. Seeds a throwaway DB (seed_demo), serves
+    it on a free port, fetches the three pages' payloads over HTTP, and checks the
+    Claude system prompt starts with the shared preamble and offers contact_eli.
+    No Oura, Claude or weather call is made (nothing is configured in the test DB)."""
+    import tempfile
+    import urllib.request
+    import seed_demo
+    tmp = tempfile.mkdtemp(prefix="sleep-bandit-test-")
+    store.DB_PATH = os.path.join(tmp, "test.db")
+    seed_demo.main()
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    def get(path):
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=120) as r:
+            return json.loads(r.read())
+
+    ok = True
+
+    def check(label, cond):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(("  ok   " if cond else "  FAIL ") + label)
+
+    try:
+        st = get("/api/state")
+        check(f"/api/state: {len(st['nights'])} nights, {len(st['interventions'])} interventions, "
+              f"tonight planned", st["nights"] and st["interventions"] and any(n["is_today"] for n in st["nights"]))
+        rep = get("/api/reports")
+        check(f"/api/reports: {len(rep['interventions'])} read-outs", rep["interventions"])
+        inter = get("/api/interactions")
+        check("/api/interactions answers", isinstance(inter, dict))
+        tg = get("/api/tags/status")
+        check(f"/api/tags/status: {len(tg['vocab'])} vocabulary entries, tagging off", tg["vocab"] and not tg["enabled"])
+        conn = store.connect()
+        try:
+            sp = tags.system_prompt(store.tag_vocab(conn), tags.reference(conn, tags.DEFAULT_THRESHOLD), tags.DEFAULT_THRESHOLD)
+        finally:
+            conn.close()
+        check("Claude system prompt starts with the shared preamble", sp.startswith(tags.preamble()) and len(tags.preamble()) > 100)
+        check("contact_eli tool definition loads", tags.contact_tool()["name"] == "contact_eli")
+        applog.log("selftest: all requests answered")
+    finally:
+        httpd.shutdown()
+    print("PASS" if ok else "FAIL", f"(test db: {store.DB_PATH})")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
+    if "--test" in sys.argv:
+        sys.exit(selftest())
     main()
