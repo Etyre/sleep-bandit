@@ -91,7 +91,9 @@ away, even on a small sample.
 - **Slow climb** (the default). The standard dose most nights; the chance of
   deviating ramps with the warm-up. Deviating nights either exploit the minimum
   viable dose (the smallest within 95% of the best measured effect) or probe one
-  unit dose at a time (supplements) or in bigger jumps (time-based).
+  unit dose at a time (supplements) or in bigger jumps (time-based). A supplement
+  probe steps past an edge of the measured doses, or into a never-tried rung between
+  two measured doses while a neighbour is viable.
 - **Fast sweep** (delay off and both min and max set). Every ON night is a Thompson
   draw over the whole grid, smoothed across neighbouring rungs with an optimism bonus
   where data is thin. On grids of more than ten rungs it goes **coarse-first**:

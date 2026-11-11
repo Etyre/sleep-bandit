@@ -1844,6 +1844,16 @@ def selftest():
             conn.close()
         check("Claude system prompt starts with the shared preamble", sp.startswith(tags.preamble()) and len(tags.preamble()) > 100)
         check("contact_eli tool definition loads", tags.contact_tool()["name"] == "contact_eli")
+        # Engine: a never-tried rung between two measured doses is a probe target
+        # (glycine's 2000 mg hole, 2026-11), and a gap below viability is not.
+        seen, counts = [1000.0, 3000.0, 4000.0], {1000.0: 34, 3000.0: 44, 4000.0: 3}
+        effs = {1000.0: 3.9, 3000.0: 2.8, 4000.0: 2.6}
+        picks = {bandit._supp_probe(seen, counts, effs, 3.9, 3000.0, 1000.0) for _ in range(400)}
+        check(f"slow climb probes the gap at 2000 (targets seen: {sorted(picks)})",
+              2000.0 in picks and 5000.0 not in picks and 4000.0 in picks)
+        check("no gap probe when both neighbours are below viable",
+              bandit._gap_probes([1000.0, 3000.0], {1000.0: 1.0, 3000.0: 1.5}, 1000.0, 3.8) == []
+              and bandit._gap_probes([1000.0, 3000.0], {1000.0: 1.0, 3000.0: 1.5}, 1000.0, None) == [2000.0])
         applog.log("selftest: all requests answered")
     finally:
         httpd.shutdown()

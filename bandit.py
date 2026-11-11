@@ -109,7 +109,11 @@ WARMUP_ON_NIGHTS = 64
 # When we do deviate, this fraction of those nights are exploratory probes (mapping the
 # dose-response curve) and the rest exploit the best (minimum viable) dose so far.
 # Supplements probe ONE unit dose at a time, for safety; time-based ones jump several
-# rungs (TIME_MAX_JUMP) at once to find a far-off optimum faster.
+# rungs (TIME_MAX_JUMP) at once to find a far-off optimum faster. A supplement probe
+# steps past an EDGE of the measured doses, or into a GAP between two of them: a
+# never-tried rung between measured neighbours (history recorded out of order, a dose
+# list edited later) is a hole the peak could hide in, so while either neighbour is
+# viable the rung next to the better one is a probe target too.
 PROBE_SHARE = 0.4
 TIME_MAX_JUMP = 4
 
@@ -938,11 +942,29 @@ def _min_viable_dose(effs):
     return min(d for d, e in effs.items() if e >= thr)
 
 
+def _gap_probes(seen, effs, step, thr):
+    """Probe targets INSIDE the measured range: for each pair of adjacent measured
+    doses with at least one never-tried unit-dose rung between them, the rung next to
+    the better-scoring neighbour -- while that neighbour is viable (or nothing clears
+    baseline yet, thr None). Rungs are laid from the lower dose; a gap of under one
+    whole rung is not a hole."""
+    targets = []
+    for a, b in zip(seen, seen[1:]):
+        if _d(a + step) >= _d(b - step / 2):          # no whole rung fits between
+            continue
+        ea, eb = effs[a], effs[b]
+        if thr is not None and max(ea, eb) < thr:
+            continue                                  # both sides below viable -> skip
+        targets.append(_d(a + step) if ea >= eb else _d(b - step))
+    return targets
+
+
 def _supp_probe(seen, counts, effs, best, std, step, lo=None, hi=None):
     """A supplement's one-rung exploration probe: firm up an edge dose with a few
     readings (MIN_PROBES), then step exactly ONE unit dose past it -- up while the top is
-    still rising, down while the bottom is still viable. Never jumps more than one rung,
-    and never outside the optional [lo, hi] bounds."""
+    still rising, down while the bottom is still viable -- or ONE unit dose into a gap
+    between measured doses (see _gap_probes). Never jumps more than one rung from a
+    measured dose, and never outside the optional [lo, hi] bounds."""
     if not seen:
         targets = [std - step, std + step]
     else:
@@ -957,6 +979,7 @@ def _supp_probe(seen, counts, effs, best, std, step, lo=None, hi=None):
             targets.append(bot)                       # firm up the bottom
         elif thr is None or effs[bot] >= thr:
             targets.append(bot - step)                # still viable -> reach down
+        targets.extend(_gap_probes(seen, effs, step, thr))   # holes inside the range
     targets = [_d(d) for d in targets if d > 0 and _in_bounds(_d(d), lo, hi)]
     return random.choice(targets) if targets else std
 
