@@ -759,7 +759,7 @@ def valences(conn):
     Each number is rounded to the precision it has: a nightly HRV is recorded to
     0.1 ms, so a mean or gap whose standard error is under 1 ms keeps one decimal
     and anything looser is given in whole ms (dp_with / dp_without / dp_diff say
-    which, so the UI prints 41.0 and not 41)."""
+    which). The UI prints them without a padded .0."""
     import bandit   # stdlib-only Student t; imported here so tags.py loads without it
     hrv = {r["date"]: r["hrv"] for r in conn.execute("SELECT date, hrv FROM nights WHERE hrv IS NOT NULL")}
     read = [(hrv[d], set(rec["tags"])) for d, rec in store.night_tags(conn).items() if d in hrv]

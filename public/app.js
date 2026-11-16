@@ -41,6 +41,11 @@ const isChoiceKind = (iv) => iv.kind === "choice" || iv.kind === "choice_dose";
 const sameLevel = (a, b) => Math.abs(Number(a) - Number(b)) < 1e-6;
 const openLabel = (iv) => (iv.open_arm_label || "").trim() || "no timer";
 const avg1 = (x) => Number(x).toFixed(1);   // raw metric averages, one decimal
+// One night's measurement, printed at the resolution it was recorded with and no
+// padding: the stored value already carries exactly the figures we have (HRV to
+// 0.1 ms, resting HR and efficiency whole, latency to half a minute, total sleep
+// to 0.01 h), so 6.5 shows as 6.5 and 6 as 6, never 6.0.
+const meas = (x) => String(+Number(x).toFixed(2));
 const shortDate = (iso) => { const [y, m, d] = iso.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString(undefined, { month: "short", day: "numeric" }); };
 const weekday = (iso) => { const [y, m, d] = iso.split("-").map(Number); return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "short" }); };
 
@@ -338,10 +343,9 @@ function renderGrid() {
       const manual = n[m.key] != null && n[m.key + "_src"] !== "oura";
       const title = n[m.key] == null ? "" :
         ` title="${manual ? "entered by hand" : "synced from Oura"}"`;
-      // Oura values are measured to one decimal, so a trailing .0 is significant --
-      // show it. Hand-typed values display exactly as typed.
-      const saved = n[m.key] == null ? "" :
-        (manual ? n[m.key] : Number(n[m.key]).toFixed(1));
+      // each value shows the figures it was measured with, no padded .0 (see meas);
+      // hand-typed values display exactly as typed.
+      const saved = n[m.key] == null ? "" : (manual ? n[m.key] : meas(n[m.key]));
       const val = READ_ONLY ? saved : withDraft(`metric.${n.date}.${m.key}`, String(saved));
       body += `<td class="hrvcell${n.is_today ? " col-today" : ""}${manual ? " manual" : ""}">` +
         `<input type="number" step="any" min="0" data-date="${n.date}" data-metric="${m.key}" ` +
@@ -449,9 +453,9 @@ const tagDesc = (slug) => tagMeta(slug).description || "";
 // Tag statistics are printed with only the figures they have. A p-value gets one
 // significant figure (two when one would land it exactly on the 0.05 line, so a
 // flagged 0.047 doesn't read as 0.05); a ratio of counts gets one when either
-// count is under ten, else two. HRV means and gaps arrive from the server with
-// their own decimal places (tags.valences: one decimal if the standard error is
-// under 1 ms, else whole ms).
+// count is under ten, else two. HRV means and gaps arrive from the server already
+// rounded (tags.valences: to 0.1 ms if the standard error is under 1 ms, else
+// whole ms) and print without a padded .0.
 function fmtP(p) {
   if (p == null) return "";
   if (p < 0.0001) return "p < 0.0001";
@@ -466,9 +470,9 @@ function fmtRatio(r, nA, nB) {
 // One line on how a tag's nights compare on HRV; v is a vocab entry.
 function valenceText(v) {
   if (!v || v.hrv_diff == null) return "Neutral so far: not enough read nights to compare HRV.";
-  const gap = `${Math.abs(v.hrv_diff).toFixed(v.dp_diff)} ms ${v.hrv_diff >= 0 ? "higher" : "lower"}`;
-  const basis = `${v.hrv_with.toFixed(v.dp_with)} over ${v.n_with} night${v.n_with === 1 ? "" : "s"} with it vs ` +
-    `${v.hrv_without.toFixed(v.dp_without)} over ${v.n_without} without` + (v.p != null ? `, ${fmtP(v.p)}` : "");
+  const gap = `${Math.abs(v.hrv_diff)} ms ${v.hrv_diff >= 0 ? "higher" : "lower"}`;
+  const basis = `${v.hrv_with} over ${v.n_with} night${v.n_with === 1 ? "" : "s"} with it vs ` +
+    `${v.hrv_without} over ${v.n_without} without` + (v.p != null ? `, ${fmtP(v.p)}` : "");
   if (v.valence === "positive") return `Positive: HRV averages ${gap} on nights with this tag (${basis}).`;
   if (v.valence === "negative") return `Negative: HRV averages ${gap} on nights with this tag (${basis}).`;
   return `Neutral: no clear HRV gap (${gap}; ${basis}).`;
@@ -679,9 +683,9 @@ function tonightLabel(iso) {
 }
 function metricText(n) {
   const parts = [];
-  if (n.hrv != null) parts.push(`HRV <b>${avg1(n.hrv)}</b>`);
-  if (n.lrhr != null) parts.push(`resting HR <b>${avg1(n.lrhr)}</b> bpm`);
-  if (n.tst != null) parts.push(`slept <b>${avg1(n.tst)}</b> h`);
+  if (n.hrv != null) parts.push(`HRV <b>${meas(n.hrv)}</b>`);
+  if (n.lrhr != null) parts.push(`resting HR <b>${meas(n.lrhr)}</b> bpm`);
+  if (n.tst != null) parts.push(`slept <b>${meas(n.tst)}</b> h`);
   return parts.join(" · ");
 }
 function renderTonight() {
@@ -1152,7 +1156,7 @@ function appendSeason(card, iv) {
   }
   for (const p of pts) {
     const col = colorOf(p.dose);
-    const title = `${shortDate(p.date)} · ${fmtDose(p.dose)} · HRV ${p.hrv.toFixed(1)} · ${p.city ? p.city + " " : ""}${p.out.toFixed(1)}${deg} outside`;
+    const title = `${shortDate(p.date)} · ${fmtDose(p.dose)} · HRV ${meas(p.hrv)} · ${p.city ? p.city + " " : ""}${p.out.toFixed(1)}${deg} outside`;
     parts.push(p.dose > 0
       ? `<circle cx="${px(p.out)}" cy="${py(p.hrv)}" r="4.5" style="fill:${col};stroke:var(--panel)" stroke-width="1.5"><title>${esc(title)}</title></circle>`
       : `<circle cx="${px(p.out)}" cy="${py(p.hrv)}" r="4" fill="none" style="stroke:${col}" stroke-width="1.6"><title>${esc(title)}</title></circle>`);
@@ -1971,7 +1975,7 @@ function hrvTrendChart(days, windowDays, appStart) {
   days.forEach((d, i) => {
     if (d.hrv == null) return;
     parts.push(`<circle cx="${px(i)}" cy="${py(d.hrv)}" r="2.5" style="fill:var(--muted);opacity:.55">` +
-      `<title>${shortDate(d.date)}: ${avg1(d.hrv)} ms</title></circle>`);
+      `<title>${shortDate(d.date)}: ${meas(d.hrv)} ms</title></circle>`);
   });
 
   // the 7-day rolling average -- the readiness signal itself
