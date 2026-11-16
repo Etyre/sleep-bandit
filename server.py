@@ -543,6 +543,7 @@ def state_payload(conn):
             "maximize": bool(n["maximize"]),
             "is_today": n["date"] == d_today,
             "tags": _vocab_order((tags_by_date.get(n["date"]) or {}).get("tags", []), vocab_rank),
+            "tagged": n["date"] in tags_by_date,   # read by the tagger (possibly with no tags)
             # where the night was slept: the explicit choice (None = inherited) and the
             # effective city after carry-forward from earlier nights
             "city": n["city"],
@@ -860,9 +861,12 @@ def season_payload(iv, all_nights, wx):
 
 def tags_info(conn):
     """What every payload carries about night-shape tags: whether tagging is on,
-    the HRV threshold, and the vocabulary (slug -> label/description)."""
+    the low-night HRV line, and the vocabulary (slug -> label/description plus the
+    tag's data-derived valence, see tags.valences)."""
+    val = tags.valences(conn)
     return {"enabled": tags.enabled(conn), "threshold": tags.threshold(conn),
-            "vocab": {v["slug"]: {"label": v["label"], "description": v["description"]}
+            "vocab": {v["slug"]: {"label": v["label"], "description": v["description"],
+                                  **val.get(v["slug"], {})}
                       for v in store.tag_vocab(conn)}}
 
 
@@ -886,24 +890,29 @@ TAG_FLAG_P = 0.05        # flag an intervention-tag association at this two-side
 TAG_FLAG_MIN_TAGGED = 3  # ... and only when at least this many of its nights carry the tag
 
 
-def tag_associations(iv, all_nights, tags_by_date, vocab):
+def tag_associations(iv, all_nights, tags_by_date, vocab, thresh):
     """Does this intervention's presence go with a kind of night? For every tag,
     compare how often the intervention's confirmed-on nights carry it with how
     often its assigned-off nights do (same nights that count for its HRV read-out:
     category exclusions and cell exclusions respected; recency weights ignored --
     these are raw counts). Fisher's exact test; flagged in either direction.
 
-    Nights above the HRV threshold are never tagged, so an intervention that
-    lowers HRV outright will tend to pick up every tag -- the per-flag counts
-    among LOW nights only are included so the reader can tell "more bad nights"
-    from "a different kind of bad night"."""
+    Only nights the tagger has read count, on either side: an unread night is
+    unknown, not tag-free. Every night is read, good or bad, so a tag that goes
+    with low HRV will follow any intervention that lowers HRV -- the per-flag
+    counts among LOW nights only (HRV below the low-night line) are included so
+    the reader can tell "more bad nights" from "a different kind of bad night".
+    Each flag carries the tag's valence (tags.valences) so the UI can say whether
+    more of it is good or bad news."""
     on_dates, off_dates = [], []
     cat = iv.get("category")
+    hrv_of = {}
     for n in all_nights:
         if cat and n.get("excl_" + cat):
             continue
-        if n.get("hrv") is None:
+        if n.get("hrv") is None or n["date"] not in tags_by_date:
             continue
+        hrv_of[n["date"]] = n["hrv"]
         st = _on_state(n, iv["id"])
         if st == 1:
             on_dates.append(n["date"])
@@ -911,12 +920,13 @@ def tag_associations(iv, all_nights, tags_by_date, vocab):
             off_dates.append(n["date"])
     if not on_dates or not off_dates:
         return []
-    low_on = [d for d in on_dates if d in tags_by_date]
-    low_off = [d for d in off_dates if d in tags_by_date]
+    low_on = [d for d in on_dates if hrv_of[d] < thresh]
+    low_off = [d for d in off_dates if hrv_of[d] < thresh]
+    has = lambda d, slug: slug in tags_by_date[d]["tags"]
     out = []
     for slug, meta in vocab.items():
-        a = sum(1 for d in on_dates if slug in tags_by_date.get(d, {}).get("tags", []))
-        c = sum(1 for d in off_dates if slug in tags_by_date.get(d, {}).get("tags", []))
+        a = sum(1 for d in on_dates if has(d, slug))
+        c = sum(1 for d in off_dates if has(d, slug))
         if a + c < TAG_FLAG_MIN_TAGGED:
             continue
         b, dd = len(on_dates) - a, len(off_dates) - c
@@ -927,7 +937,9 @@ def tag_associations(iv, all_nights, tags_by_date, vocab):
         out.append({
             "slug": slug, "label": meta["label"], "direction": "more" if r_on > r_off else "less",
             "on_tag": a, "on_n": len(on_dates), "off_tag": c, "off_n": len(off_dates),
-            "low_on_tag": a, "low_on_n": len(low_on), "low_off_tag": c, "low_off_n": len(low_off),
+            "low_on_tag": sum(1 for d in low_on if has(d, slug)), "low_on_n": len(low_on),
+            "low_off_tag": sum(1 for d in low_off if has(d, slug)), "low_off_n": len(low_off),
+            "valence": meta.get("valence", "neutral"),
             "ratio": (r_on / r_off) if r_off > 0 else None, "p": round(p, 4),
         })
     rank = {slug: i for i, slug in enumerate(vocab)}   # vocab is insertion-ordered
@@ -962,6 +974,7 @@ def agent_summary_payload(conn, days=30):
     for n in nights:
         tg = tags_by_date.get(n["date"]) or {}
         n["tags"] = tg.get("tags", [])
+        n["tagged"] = n["date"] in tags_by_date
         n["tags_summary"] = tg.get("summary", "")
     reports = reports_payload(conn)
     verdicts = [{k: iv.get(k) for k in ("id", "name", "category", "kind", "unit", "active", "readout",
@@ -990,7 +1003,7 @@ def reports_payload(conn):
     for iv in ivs:
         out.append({
             **iv,
-            "tag_flags": tag_associations(iv, all_nights, tags_by_date, tinfo["vocab"]),
+            "tag_flags": tag_associations(iv, all_nights, tags_by_date, tinfo["vocab"], tinfo["threshold"]),
             "season": season_payload(iv, all_nights, wx) if is_temperature_dosed(iv) else None,
             "readout": _readout(iv, all_nights, "hrv", negate=False),
             "readout_lrhr": _readout(iv, all_nights, "lrhr", negate=True),
@@ -1635,8 +1648,7 @@ class Handler(BaseHTTPRequestHandler):
                     weather.sync(conn, today_str())
                 except Exception:
                     applog.log_exc("weather sync failed")
-                if tags.enabled(conn) and tags.api_key(conn) \
-                        and store.nights_to_tag(conn, tags.threshold(conn)):
+                if tags.enabled(conn) and tags.api_key(conn) and store.nights_to_tag(conn):
                     tags.run_pending_async(limit=tags.PER_PASS)
                 return self._send_json(res)
 
@@ -1678,10 +1690,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(st)
 
             if path == "/api/tags/run":
-                # tag every pending low night in the background; the panel polls status
+                # tag every pending night in the background; the panel polls status
                 if not tags.api_key(conn):
                     return self._send_json({"error": "No API key saved."}, 400)
-                if tags.status(conn)["counts"]["low"] > tags.status(conn)["counts"]["low_with_series"]:
+                if store.nights_missing_series(conn):
                     oura.backfill_series(conn)
                 tags.run_pending_async(limit=body.get("limit"))
                 return self._send_json(tags.status(conn))
@@ -1774,8 +1786,7 @@ def _autosync_loop():
                 if oura.status(conn).get("connected"):
                     oura.sync(conn, today_str())
                 weather.sync(conn, today_str())
-                if tags.enabled(conn) and tags.api_key(conn) \
-                        and store.nights_to_tag(conn, tags.threshold(conn)):
+                if tags.enabled(conn) and tags.api_key(conn) and store.nights_to_tag(conn):
                     tags.run_pending_async(limit=tags.PER_PASS)
             finally:
                 conn.close()

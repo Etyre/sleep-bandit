@@ -1,14 +1,20 @@
 """
-tags.py -- night-shape tags for low-HRV nights.
+tags.py -- night-shape tags for every recorded night.
 
 Every night Oura records a within-night series: heart rate and HRV every five
 minutes, a five-minute hypnogram, and movement every thirty seconds (pulled by
-oura.py into store.night_series). For each night whose HRV came in below a
-threshold (default 42) an LLM reads that raw series, side by side with what a
-typical night of yours looks like, and assigns one or more *shape* tags --
-"HR starts high", "HR slow to settle", "restless night", "late sleep onset", ...
+oura.py into store.night_series). For every night with an HRV value an LLM reads
+that raw series, side by side with what a typical night of yours looks like, and
+assigns zero to four *shape* tags -- "HR starts high", "HR slow to settle",
+"restless night", "late sleep onset", ... (none when the night looks typical).
 The tagger reuses the shared vocabulary (tag_vocab) and may add a tag when none
 fits; the vocabulary is seeded from an initial read of the recorded history.
+Until 2026-11-16 only nights below the low-night line (default 42) were read;
+that line now only splits the reference into typical and low nights.
+
+Each tag is then rated positive, negative or neutral from the data: the HRV of
+the nights that carry it against the HRV of the read nights that don't
+(valences()).
 
 Tags show on the Tracker between the resting-HR and total-sleep rows, and the
 Reports flag any intervention whose nights carry a tag disproportionately often
@@ -46,6 +52,8 @@ DEFAULT_THRESHOLD = 42.0
 HTTP_TIMEOUT = 240          # seconds; one night is a single request
 PER_PASS = 4                # nights tagged per background autosync pass
 MAX_TAGS_PER_NIGHT = 4
+VALENCE_P = 0.05            # a tag is positive/negative when its HRV gap is this unlikely by chance
+VALENCE_MIN_NIGHTS = 5      # ... and at least this many read nights carry it (and lack it)
 
 # Seed vocabulary: drawn from a read of the first 713 recorded nights (242 below
 # 42) -- see README "Night-shape tags". The tagger can extend it.
@@ -468,11 +476,17 @@ def reference_text(ref):
     return "\n".join(lines)
 
 
-def night_text(d, doc, hrv_value, ref):
+def night_text(d, doc, hrv_value, ref, thresh):
     """The one night, as the tagger sees it: summary features against the typical
     reference, then the full 5-minute series."""
     f = features(doc)
-    lines = [f"Night of {d} (evening date). Overnight HRV: {hrv_value} ms.",
+    if hrv_value is None:
+        kind = ""
+    elif hrv_value < thresh:
+        kind = f" -- a low night for this person (below {_fmt(thresh)} ms)"
+    else:
+        kind = f" -- not a low night for this person (at or above {_fmt(thresh)} ms)"
+    lines = [f"Night of {d} (evening date). Overnight HRV: {hrv_value} ms{kind}.",
              f"Bedtime {doc.get('bedtime_start')} to {doc.get('bedtime_end')}.", "",
              "Summary features (value, and where it sits among your typical nights):"]
     for key, label in FEATURE_LABELS:
@@ -505,7 +519,7 @@ OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
         "summary": {"type": "string",
-                    "description": "One sentence (under 160 characters) on what made this night's shape unusual."},
+                    "description": "One sentence (under 160 characters) on this night's shape: what was unusual about it, or that it looked typical."},
         "tags": {
             "type": "array",
             "items": {
@@ -529,17 +543,22 @@ OUTPUT_SCHEMA = {
 def system_prompt(vocab, ref, thresh):
     vocab_lines = "\n".join(f"- {v['slug']} — {v['label']}: {v['description']}" for v in vocab) or "- (none yet)"
     return preamble() + "\n\n" + (
-        "You read one person's overnight wearable data (Oura ring) and describe the *shape* of a "
-        f"night whose overnight HRV came in below {_fmt(thresh)} ms -- a low night for this person. "
-        "The aim is to sort low nights into recurring kinds, so that later analysis can ask whether "
-        "a given intervention produces one kind of bad night more than another.\n\n"
-        "Assign one to " + str(MAX_TAGS_PER_NIGHT) + " tags that describe what is unusual about the "
-        "night compared with this person's typical nights. Prefer tags from the vocabulary below; "
+        "You read one person's overnight wearable data (Oura ring) and describe the *shape* of one "
+        "night. Every recorded night is read this way, good and bad alike: the message gives the "
+        f"night's overnight HRV and says whether it was a low night for this person (below {_fmt(thresh)} ms). "
+        "The aim is to sort nights into recurring kinds, so that later analysis can ask which kinds "
+        "go with high or low HRV and whether a given intervention produces one kind of night more "
+        "than another.\n\n"
+        "Assign zero to " + str(MAX_TAGS_PER_NIGHT) + " tags that describe what is unusual about the "
+        "night compared with this person's typical nights, in either direction. Apply a tag whenever "
+        "the series shows its pattern, whatever the night's HRV: the same standard for a good night "
+        "as for a bad one, since the comparison between them is the point. A night that looks "
+        "typical gets an empty tag list. Prefer tags from the vocabulary below; "
         "reuse a slug exactly when it fits. Add a new tag only when no existing one captures a clear, "
         "recurring-looking pattern you can point to in the data -- give it a kebab-case slug, a short "
         "label and a one-sentence description of the data pattern. Do not invent causes (illness, "
-        "alcohol, stress): tag only what the series shows. If nothing stands out apart from HRV "
-        "being low, use the tag that best describes the HRV profile itself.\n\n"
+        "alcohol, stress): tag only what the series shows. On a low night where nothing else stands "
+        "out, use the tag that best describes the HRV profile itself.\n\n"
         "Current vocabulary:\n" + vocab_lines + "\n\n" + reference_text(ref)
     )
 
@@ -626,7 +645,7 @@ def tag_night(conn, d, key=None, model=None, ref=None, thresh=None):
     ref = ref or reference(conn, thresh)
     vocab = store.tag_vocab(conn)
     known = {v["slug"] for v in vocab}
-    out, usage = classify(key, model, system_prompt(vocab, ref, thresh), night_text(d, doc, hrv_value, ref))
+    out, usage = classify(key, model, system_prompt(vocab, ref, thresh), night_text(d, doc, hrv_value, ref, thresh))
     slugs = []
     for t in (out.get("tags") or [])[:MAX_TAGS_PER_NIGHT]:
         slug = _slugify(t.get("slug"))
@@ -649,11 +668,11 @@ def tag_night(conn, d, key=None, model=None, ref=None, thresh=None):
 
 
 def tag_pending(conn, limit=PER_PASS, progress=None):
-    """Tag up to `limit` untagged low-HRV nights (newest first). Stops at the first
+    """Tag up to `limit` unread nights (newest first). Stops at the first
     API error so a bad key doesn't burn through every night. Returns
     {"done": n, "remaining": n, "error": msg|None}."""
     thresh = threshold(conn)
-    todo = store.nights_to_tag(conn, thresh)
+    todo = store.nights_to_tag(conn)
     hold = store.get_setting(conn, "tags_hold")
     if hold and todo:
         return {"done": 0, "remaining": len(todo), "error": hold}
@@ -690,8 +709,7 @@ def worker_status():
 def _run(limit):
     conn = store.connect()
     try:
-        thresh = threshold(conn)
-        todo = store.nights_to_tag(conn, thresh)
+        todo = store.nights_to_tag(conn)
         with _LOCK:
             _STATUS.update(total=min(len(todo), limit) if limit else len(todo), done=0)
 
@@ -725,6 +743,45 @@ def run_pending_async(limit=None):
 
 
 # ---------------------------------------------------------------------------
+# Is a tag good or bad news? Read off the data, not the tag's name.
+# ---------------------------------------------------------------------------
+def valences(conn):
+    """{slug: {"valence": "positive"|"negative"|"neutral", "hrv_diff", "hrv_with",
+    "hrv_without", "n_with", "n_without", "p"}} for every vocabulary tag.
+
+    Over the nights that have been read and have an HRV value: mean HRV of the
+    nights carrying the tag minus mean HRV of those that don't, Welch's t-test,
+    two-sided. Positive / negative when p < VALENCE_P with at least
+    VALENCE_MIN_NIGHTS nights on each side; otherwise neutral (which covers both
+    "no real gap" and "too few nights to say"). Raw and unadjusted: no correction
+    for the number of tags, for trend, or for which interventions were on."""
+    import bandit   # stdlib-only Student t; imported here so tags.py loads without it
+    hrv = {r["date"]: r["hrv"] for r in conn.execute("SELECT date, hrv FROM nights WHERE hrv IS NOT NULL")}
+    read = [(hrv[d], set(rec["tags"])) for d, rec in store.night_tags(conn).items() if d in hrv]
+    out = {}
+    for v in store.tag_vocab(conn):
+        slug = v["slug"]
+        a = [h for h, ts in read if slug in ts]
+        b = [h for h, ts in read if slug not in ts]
+        rec = {"valence": "neutral", "hrv_diff": None, "hrv_with": None, "hrv_without": None,
+               "n_with": len(a), "n_without": len(b), "p": None}
+        if a and b:
+            rec["hrv_with"], rec["hrv_without"] = round(_mean(a), 1), round(_mean(b), 1)
+            rec["hrv_diff"] = round(_mean(a) - _mean(b), 1)
+        if len(a) >= 2 and len(b) >= 2:
+            va, vb = _std(a) ** 2 / len(a), _std(b) ** 2 / len(b)
+            if va + vb > 0:
+                t = (_mean(a) - _mean(b)) / math.sqrt(va + vb)
+                nu = (va + vb) ** 2 / (va ** 2 / (len(a) - 1) + vb ** 2 / (len(b) - 1))
+                p = 2 * (1 - bandit._student_t_cdf(abs(t), nu))
+                rec["p"] = round(p, 4)
+                if p < VALENCE_P and min(len(a), len(b)) >= VALENCE_MIN_NIGHTS:
+                    rec["valence"] = "positive" if t > 0 else "negative"
+        out[slug] = rec
+    return out
+
+
+# ---------------------------------------------------------------------------
 # What the UI needs
 # ---------------------------------------------------------------------------
 def status(conn):
@@ -735,14 +792,15 @@ def status(conn):
     for rec in store.night_tags(conn).values():
         for s in rec["tags"]:
             use[s] = use.get(s, 0) + 1
-    vocab = [{**v, "n": use.get(v["slug"], 0)} for v in store.tag_vocab(conn)]
+    val = valences(conn)
+    vocab = [{**v, "n": use.get(v["slug"], 0), **val.get(v["slug"], {})} for v in store.tag_vocab(conn)]
     return {
         "enabled": enabled(conn),
         "configured": bool(api_key(conn)),
         "key_from_env": not store.get_setting(conn, "anthropic_api_key") and bool(os.environ.get("ANTHROPIC_API_KEY")),
         "threshold": thresh,
         "model": model_id(conn),
-        "pending": len(store.nights_to_tag(conn, thresh)),
+        "pending": len(store.nights_to_tag(conn)),
         "hold": store.get_setting(conn, "tags_hold"),
         "counts": counts,
         "vocab": vocab,

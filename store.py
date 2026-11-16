@@ -1055,7 +1055,7 @@ def latest_unrecorded(conn, today):
 
 # ---------------------------------------------------------------------------
 # Within-night raw series (Oura's 5-minute HR / HRV samples, hypnogram, movement)
-# and the night-shape tags an LLM assigns to low-HRV nights (see tags.py)
+# and the night-shape tags an LLM assigns to every recorded night (see tags.py)
 # ---------------------------------------------------------------------------
 def set_night_series(conn, d, doc):
     """Store (or refresh) a night's raw Oura series document. Returns True if it
@@ -1142,19 +1142,20 @@ def clear_night_tags(conn):
     return n
 
 
-def nights_to_tag(conn, threshold):
-    """Recorded nights with HRV below the threshold that have a raw series but no
-    tags yet -- newest first, so the experiment nights get tagged before the
-    backfilled history."""
+def nights_to_tag(conn):
+    """Recorded nights (any HRV) that have a raw series but have not been read yet
+    -- newest first, so the experiment nights get tagged before the backfilled
+    history. A night read and given no tags has a night_tags row with an empty
+    list, so it is not pending."""
     return [r["date"] for r in conn.execute(
         "SELECT n.date FROM nights n JOIN night_series s ON s.date = n.date "
         "LEFT JOIN night_tags t ON t.date = n.date "
-        "WHERE n.hrv IS NOT NULL AND n.hrv < ? AND t.date IS NULL ORDER BY n.date DESC",
-        (float(threshold),))]
+        "WHERE n.hrv IS NOT NULL AND t.date IS NULL ORDER BY n.date DESC")]
 
 
 def tag_counts(conn, threshold):
-    """Bookkeeping for the tags panel."""
+    """Bookkeeping for the tags panel. `tagged` counts nights that have been read,
+    including those given no tags."""
     low = conn.execute("SELECT COUNT(*) FROM nights WHERE hrv IS NOT NULL AND hrv < ?",
                        (float(threshold),)).fetchone()[0]
     low_series = conn.execute(

@@ -436,27 +436,45 @@ async function saveCity(sel) {
 }
 
 // ---- night-shape tags row --------------------------------------------------
-// Low-HRV nights (below STATE.tags.threshold) get one or more shape tags from
-// Claude's read of the raw within-night series (tags.py). Row appears once
-// tagging is on or any shown night carries a tag; a low night still waiting for
-// its read shows a dashed "…".
-const tagLabel = (slug) => ((STATE && STATE.tags && STATE.tags.vocab[slug]) || {}).label || slug;
-const tagDesc = (slug) => ((STATE && STATE.tags && STATE.tags.vocab[slug]) || {}).description || "";
+// Every recorded night gets zero or more shape tags from Claude's read of the
+// raw within-night series (tags.py). Row appears once tagging is on or any shown
+// night carries a tag; a night still waiting for its read shows a dashed "…",
+// a night read and found typical a quiet "–".
+// Chips are coloured by the tag's valence, which the server works out from the
+// data (tags.valences): green when the nights carrying it have higher HRV than
+// the other read nights, red when lower, grey when there is no clear gap.
+const tagMeta = (slug) => (STATE && STATE.tags && STATE.tags.vocab[slug]) || {};
+const tagLabel = (slug) => tagMeta(slug).label || slug;
+const tagDesc = (slug) => tagMeta(slug).description || "";
+// One line on how a tag's nights compare on HRV; v is a vocab entry.
+function valenceText(v) {
+  if (!v || v.hrv_diff == null) return "Neutral so far: not enough read nights to compare HRV.";
+  const gap = `${Math.abs(v.hrv_diff).toFixed(1)} ms ${v.hrv_diff >= 0 ? "higher" : "lower"}`;
+  const basis = `${v.hrv_with} over ${v.n_with} night${v.n_with === 1 ? "" : "s"} with it vs ` +
+    `${v.hrv_without} over ${v.n_without} without` + (v.p != null ? (v.p < 0.0001 ? ", p < 0.0001" : `, p = ${v.p}`) : "");
+  if (v.valence === "positive") return `Positive: HRV averages ${gap} on nights with this tag (${basis}).`;
+  if (v.valence === "negative") return `Negative: HRV averages ${gap} on nights with this tag (${basis}).`;
+  return `Neutral: no clear HRV gap (${gap}; ${basis}).`;
+}
+const valenceClass = (v) => (v && v.valence === "positive" ? " pos" : v && v.valence === "negative" ? " neg" : "");
 function tagChip(slug, extraTitle) {
-  const t = tagDesc(slug) + (extraTitle ? "\n\n" + extraTitle : "");
-  return `<span class="ntag" title="${esc(t)}">${esc(tagLabel(slug))}</span>`;
+  const m = tagMeta(slug);
+  const t = tagDesc(slug) + "\n\n" + valenceText(m) + (extraTitle ? "\n\n" + extraTitle : "");
+  return `<span class="ntag${valenceClass(m)}" title="${esc(t)}">${esc(tagLabel(slug))}</span>`;
 }
 function tagsRow(nights) {
   const info = (STATE && STATE.tags) || { enabled: false, threshold: 42, vocab: {} };
   if (!info.enabled && !nights.some((n) => (n.tags || []).length)) return "";
   let row = `<tr class="metric-row minor tags-row"><th class="rowlab metric-lab">Night shape` +
-    `<span class="rmeta">low-HRV nights (&lt; ${esc(info.threshold)}) · tagged by Claude</span></th>`;
+    `<span class="rmeta">every night · tagged by Claude</span></th>`;
   for (const n of nights) {
     const ts = n.tags || [];
     let inner = "";
     if (ts.length) inner = ts.map((s) => tagChip(s, n.tags_summary || "")).join("");
-    else if (info.enabled && n.hrv != null && n.hrv < info.threshold)
-      inner = `<span class="ntag pending" title="Low night — not read yet (tagging runs in the background)">…</span>`;
+    else if (n.tagged)
+      inner = `<span class="ntag none" title="${esc("Read by Claude: nothing unusual." + (n.tags_summary ? "\n\n" + n.tags_summary : ""))}">–</span>`;
+    else if (info.enabled && n.hrv != null)
+      inner = `<span class="ntag pending" title="Not read yet (tagging runs in the background)">…</span>`;
     row += `<td class="tagcell${n.is_today ? " col-today" : ""}"><div class="tagwrap">${inner}</div></td>`;
   }
   return row + `</tr>`;
@@ -1179,10 +1197,13 @@ function appendTagFlags(card, iv) {
     const times = f.ratio == null ? "" : `${(f.ratio >= 1 ? f.ratio : 1 / f.ratio).toFixed(1)}× `;
     const tip = `Among this intervention's ${f.on_n} confirmed-on nights, ${f.on_tag} were tagged “${tagLabel(f.slug)}”; ` +
       `among its ${f.off_n} assigned-off (control) nights, ${f.off_tag}. Two-sided Fisher exact p = ${f.p}. ` +
-      `Only low-HRV nights get tags, so an intervention that simply lowers HRV picks up every tag — ` +
-      `restricted to low nights the split is ${f.low_on_tag} of ${f.low_on_n} on vs ${f.low_off_tag} of ${f.low_off_n} off.`;
+      `Counts cover the nights Claude has read. A tag that goes with low HRV follows any intervention that lowers HRV — ` +
+      `among low nights alone (HRV below ${STATE && STATE.tags ? STATE.tags.threshold : 42}) the split is ${f.low_on_tag} of ${f.low_on_n} on vs ${f.low_off_tag} of ${f.low_off_n} off.`;
+    // more of a negative tag (or less of a positive one) is bad news; a neutral tag takes no colour
+    const more = f.direction === "more";
+    const tone = f.valence === "negative" ? (more ? "bad" : "good") : f.valence === "positive" ? (more ? "good" : "bad") : "";
     card.appendChild(el("p", "iv-tagflag",
-      `🏷 Tagged ${tagChip(f.slug, tip)} <b class="${f.direction === "more" ? "bad" : "good"}">${times}${f.direction === "more" ? "more" : "less"} often:</b> ` +
+      `🏷 Tagged ${tagChip(f.slug, tip)} <b class="${tone}">${times}${more ? "more" : "less"} often:</b> ` +
       `${f.on_tag} of ${f.on_n} on-nights vs ${f.off_tag} of ${f.off_n} off-nights, p = ${f.p}.`));
   }
 }
@@ -2769,8 +2790,8 @@ function renderTagsUI() {
   let html = TAGS.enabled
     ? `<b class="oura-ok">On.</b> `
     : (TAGS.configured ? `<b>Off</b> — key saved; tick the box to start tagging. ` : `<b>Off</b> — paste a Claude API key to start. `);
-  html += `${c.tagged} tagged · ${TAGS.pending} pending of ${c.low} low night${c.low === 1 ? "" : "s"} ` +
-    `(${c.recorded} recorded, ${c.series} with raw series) · model <code>${esc(TAGS.model)}</code>` +
+  html += `${c.tagged} read · ${TAGS.pending} pending of ${c.recorded} recorded night${c.recorded === 1 ? "" : "s"} ` +
+    `(${c.series} with raw series, ${c.low} low) · model <code>${esc(TAGS.model)}</code>` +
     (TAGS.key_from_env ? " · key from ANTHROPIC_API_KEY" : "");
   if (w.running) html += `<br><b>Tagging…</b> ${w.done} of ${w.total}` +
     (w.last_date ? ` — last: ${esc(shortDate(w.last_date))} → ${(w.last_tags || []).map(tagLabel).map(esc).join(", ") || "no tags"}` : "");
@@ -2787,8 +2808,9 @@ function renderTagsUI() {
   $("#tags-clear").hidden = !c.tagged;
   $("#tags-vocab-n").textContent = `· ${TAGS.vocab.length} tags`;
   $("#tags-vocab").innerHTML = TAGS.vocab.map((v) =>
-    `<li><span class="ntag">${esc(v.label)}</span> <b>${v.n}</b> night${v.n === 1 ? "" : "s"}` +
-    `${v.created_by !== "seed" ? ` <span class="muted">· added by ${esc(v.created_by)}</span>` : ""}<br>${esc(v.description)}</li>`).join("");
+    `<li><span class="ntag${valenceClass(v)}">${esc(v.label)}</span> <b>${v.n}</b> night${v.n === 1 ? "" : "s"}` +
+    `${v.created_by !== "seed" ? ` <span class="muted">· added by ${esc(v.created_by)}</span>` : ""}<br>${esc(v.description)}` +
+    `<br><span class="valence${valenceClass(v)}">${esc(valenceText(v))}</span></li>`).join("");
   // keep polling while the background tagger runs, then refresh the grid once
   if (w.running && !TAGS_POLL) {
     TAGS_POLL = setInterval(async () => {
@@ -2835,7 +2857,7 @@ $("#tags-run").addEventListener("click", async () => {
 });
 
 $("#tags-clear").addEventListener("click", async () => {
-  if (!confirm("Clear every night's tags?\n\nThe vocabulary is kept. Low nights will be re-read on the next run.")) return;
+  if (!confirm("Clear every night's tags?\n\nThe vocabulary is kept. Every night will be re-read on the next run.")) return;
   try { TAGS = await post("/api/tags/clear", {}); renderTagsUI(); await loadGrid(); }
   catch (err) { alert("Error: " + err.message); }
 });

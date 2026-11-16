@@ -484,8 +484,15 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .ntag {
   display: inline-block; margin: 1px 2px; padding: 1px 7px; border-radius: 4px;
   font-size: 10.5px; font-weight: 600; white-space: nowrap; cursor: help;
-  color: var(--warn); background: rgba(255,170,80,.12); border: 1px solid rgba(255,170,80,.45);
+  color: var(--muted); background: rgba(154,162,192,.10); border: 1px solid rgba(154,162,192,.40);
 }
+/* valence from the data (tags.valences): nights with the tag have higher HRV (pos),
+   lower HRV (neg), or no clear gap (the grey default) */
+.ntag.pos { color: var(--good); background: rgba(87,217,126,.12); border-color: rgba(87,217,126,.45); }
+.ntag.neg { color: var(--bad); background: rgba(255,122,122,.12); border-color: rgba(255,122,122,.45); }
+.ntag.none { background: transparent; border-color: transparent; opacity: .6; }
+.valence.pos { color: var(--good); }
+.valence.neg { color: var(--bad); }
 /* in the grid the chips flow side by side while they fit and wrap onto further
    lines when they don't; a label never widens the column -- the row grows taller */
 .tagcell .tagwrap { display: flex; flex-wrap: wrap; justify-content: center; gap: 3px; width: 0; min-width: 100%; }  /* width 0 keeps the chips from widening the column (table auto-layout); min-width fills it */
@@ -495,7 +502,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .iv-tagflag { font-size: 12.5px; margin: 10px 0 0; color: var(--muted); line-height: 1.5; }
 .iv-tagflag + .iv-tagflag { margin-top: 4px; }
 .iv-tagflag b { color: var(--text); }
-/* tags describe bad nights: carrying one less often is good, more often is bad */
+/* coloured by the tag's valence: more of a negative tag or less of a positive one is bad */
 .iv-tagflag b.good { color: var(--good); }
 .iv-tagflag b.bad { color: var(--bad); }
 .tags-modal { max-width: 560px; }

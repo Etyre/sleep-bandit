@@ -192,11 +192,13 @@ owner of the rotating refresh token).
 
 ### Night-shape tags
 
-Not every low-HRV night is low in the same way. For each night whose HRV comes in
-below a threshold (default 42, set in the **🏷 Night tags** panel), Claude reads the
-raw series next to a per-feature summary of your typical nights (p10 / median / p90
-over every recorded night at or above the threshold) and assigns one to four
-**shape tags**. It works from a shared vocabulary (`tag_vocab`) and adds a tag when
+Nights differ in shape, not only in their HRV number. For every recorded night,
+Claude reads the raw series next to a per-feature summary of your typical nights
+(p10 / median / p90 over every recorded night at or above the low-night line,
+default 42, set in the **🏷 Night tags** panel) and assigns zero to four
+**shape tags** -- none when the night looks typical. (Until 2026-11-16 only nights
+below that line were read; those earlier reads are kept.) It works from a shared
+vocabulary (`tag_vocab`) and adds a tag when
 none fits; the vocabulary was seeded from a read of the first 713 recorded nights,
 where low nights differed from typical ones mainly in heart rate that starts high
 and settles late and in a missing early-night HRV rise, with restlessness, late
@@ -204,14 +206,26 @@ onset, long wake bouts and short nights as rarer kinds (`tags.SEED_TAGS` lists t
 with the measured cut-offs). Tags only describe what the series shows, never
 causes.
 
+**Valence.** Whether a tag is good or bad news is read off the data rather than its
+name (`tags.valences`): over the nights that have been read, mean HRV of the
+nights carrying the tag minus mean HRV of those that don't, Welch's t-test. A tag
+is **positive** or **negative** when p < 0.05 with at least five nights on each
+side, otherwise **neutral** (no clear gap, or too few nights). Chips are green,
+red or grey accordingly, and the panel's vocabulary list gives the numbers. It is
+a raw comparison: no correction for the number of tags, the HRV trend, or which
+interventions were on. While the older good nights are still being read, the
+comparison leans on low nights and will shift as the backlog clears.
+
 Tags appear on the Tracker in a **Night shape** row between resting HR and total
 sleep (hover for the tagger's one-line reading). On the Reports page each
 intervention is tested against every tag: the share of its confirmed-on nights
 carrying the tag versus its assigned-off nights, same nights as its HRV read-out,
 two-sided Fisher exact test on raw counts. Anything at p < 0.05 with at least three
-tagged nights is flagged, in either direction. Because only low nights are tagged,
-an intervention that lowers HRV outright tends to pick up every tag; the flag's
-tooltip therefore also gives the split among low nights alone.
+tagged nights is flagged, in either direction, and coloured by the tag's valence
+(more of a negative tag is bad, more of a positive one good). Only nights that
+have been read count. A tag that goes with low HRV follows any intervention that
+lowers HRV outright; the flag's tooltip therefore also gives the split among low
+nights alone.
 
 Setup: paste a Claude API key into the panel (stored in the settings table, or read
 from `ANTHROPIC_API_KEY`), tick the switch. Pending nights are then read newest
