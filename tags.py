@@ -754,7 +754,12 @@ def valences(conn):
     two-sided. Positive / negative when p < VALENCE_P with at least
     VALENCE_MIN_NIGHTS nights on each side; otherwise neutral (which covers both
     "no real gap" and "too few nights to say"). Raw and unadjusted: no correction
-    for the number of tags, for trend, or for which interventions were on."""
+    for the number of tags, for trend, or for which interventions were on.
+
+    Each number is rounded to the precision it has: a nightly HRV is recorded to
+    0.1 ms, so a mean or gap whose standard error is under 1 ms keeps one decimal
+    and anything looser is given in whole ms (dp_with / dp_without / dp_diff say
+    which, so the UI prints 41.0 and not 41)."""
     import bandit   # stdlib-only Student t; imported here so tags.py loads without it
     hrv = {r["date"]: r["hrv"] for r in conn.execute("SELECT date, hrv FROM nights WHERE hrv IS NOT NULL")}
     read = [(hrv[d], set(rec["tags"])) for d, rec in store.night_tags(conn).items() if d in hrv]
@@ -765,11 +770,17 @@ def valences(conn):
         b = [h for h, ts in read if slug not in ts]
         rec = {"valence": "neutral", "hrv_diff": None, "hrv_with": None, "hrv_without": None,
                "n_with": len(a), "n_without": len(b), "p": None}
+        # squared standard error of each mean (None for a single night: just that reading)
+        va = _std(a) ** 2 / len(a) if len(a) >= 2 else None
+        vb = _std(b) ** 2 / len(b) if len(b) >= 2 else None
+        dp = lambda var: 1 if var is None or math.sqrt(var) < 0.95 else 0
         if a and b:
-            rec["hrv_with"], rec["hrv_without"] = round(_mean(a), 1), round(_mean(b), 1)
-            rec["hrv_diff"] = round(_mean(a) - _mean(b), 1)
-        if len(a) >= 2 and len(b) >= 2:
-            va, vb = _std(a) ** 2 / len(a), _std(b) ** 2 / len(b)
+            rec["dp_with"], rec["dp_without"] = dp(va), dp(vb)
+            rec["dp_diff"] = dp((va or 0) + (vb or 0)) if (va is not None or vb is not None) else 1
+            rec["hrv_with"] = round(_mean(a), rec["dp_with"])
+            rec["hrv_without"] = round(_mean(b), rec["dp_without"])
+            rec["hrv_diff"] = round(_mean(a) - _mean(b), rec["dp_diff"])
+        if va is not None and vb is not None:
             if va + vb > 0:
                 t = (_mean(a) - _mean(b)) / math.sqrt(va + vb)
                 nu = (va + vb) ** 2 / (va ** 2 / (len(a) - 1) + vb ** 2 / (len(b) - 1))

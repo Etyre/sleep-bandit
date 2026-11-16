@@ -446,12 +446,29 @@ async function saveCity(sel) {
 const tagMeta = (slug) => (STATE && STATE.tags && STATE.tags.vocab[slug]) || {};
 const tagLabel = (slug) => tagMeta(slug).label || slug;
 const tagDesc = (slug) => tagMeta(slug).description || "";
+// Tag statistics are printed with only the figures they have. A p-value gets one
+// significant figure (two when one would land it exactly on the 0.05 line, so a
+// flagged 0.047 doesn't read as 0.05); a ratio of counts gets one when either
+// count is under ten, else two. HRV means and gaps arrive from the server with
+// their own decimal places (tags.valences: one decimal if the standard error is
+// under 1 ms, else whole ms).
+function fmtP(p) {
+  if (p == null) return "";
+  if (p < 0.0001) return "p < 0.0001";
+  let s = Number(p.toPrecision(1));
+  if (s === 0.05 && p !== 0.05) s = Number(p.toPrecision(2));
+  return `p = ${s}`;
+}
+function fmtRatio(r, nA, nB) {
+  const one = Number(r.toPrecision(1));
+  return String(Math.min(nA, nB) < 10 && one !== 1 ? one : Number(r.toPrecision(2)));
+}
 // One line on how a tag's nights compare on HRV; v is a vocab entry.
 function valenceText(v) {
   if (!v || v.hrv_diff == null) return "Neutral so far: not enough read nights to compare HRV.";
-  const gap = `${Math.abs(v.hrv_diff).toFixed(1)} ms ${v.hrv_diff >= 0 ? "higher" : "lower"}`;
-  const basis = `${v.hrv_with} over ${v.n_with} night${v.n_with === 1 ? "" : "s"} with it vs ` +
-    `${v.hrv_without} over ${v.n_without} without` + (v.p != null ? (v.p < 0.0001 ? ", p < 0.0001" : `, p = ${v.p}`) : "");
+  const gap = `${Math.abs(v.hrv_diff).toFixed(v.dp_diff)} ms ${v.hrv_diff >= 0 ? "higher" : "lower"}`;
+  const basis = `${v.hrv_with.toFixed(v.dp_with)} over ${v.n_with} night${v.n_with === 1 ? "" : "s"} with it vs ` +
+    `${v.hrv_without.toFixed(v.dp_without)} over ${v.n_without} without` + (v.p != null ? `, ${fmtP(v.p)}` : "");
   if (v.valence === "positive") return `Positive: HRV averages ${gap} on nights with this tag (${basis}).`;
   if (v.valence === "negative") return `Negative: HRV averages ${gap} on nights with this tag (${basis}).`;
   return `Neutral: no clear HRV gap (${gap}; ${basis}).`;
@@ -1194,9 +1211,9 @@ function appendSeason(card, iv) {
 // Fisher exact test on raw counts (server.tag_associations). Flagged either way.
 function appendTagFlags(card, iv) {
   for (const f of iv.tag_flags || []) {
-    const times = f.ratio == null ? "" : `${(f.ratio >= 1 ? f.ratio : 1 / f.ratio).toFixed(1)}× `;
+    const times = f.ratio == null ? "" : `${fmtRatio(f.ratio >= 1 ? f.ratio : 1 / f.ratio, f.on_tag, f.off_tag)}× `;
     const tip = `Among this intervention's ${f.on_n} confirmed-on nights, ${f.on_tag} were tagged “${tagLabel(f.slug)}”; ` +
-      `among its ${f.off_n} assigned-off (control) nights, ${f.off_tag}. Two-sided Fisher exact p = ${f.p}. ` +
+      `among its ${f.off_n} assigned-off (control) nights, ${f.off_tag}. Two-sided Fisher exact ${fmtP(f.p)}. ` +
       `Counts cover the nights Claude has read. A tag that goes with low HRV follows any intervention that lowers HRV — ` +
       `among low nights alone (HRV below ${STATE && STATE.tags ? STATE.tags.threshold : 42}) the split is ${f.low_on_tag} of ${f.low_on_n} on vs ${f.low_off_tag} of ${f.low_off_n} off.`;
     // more of a negative tag (or less of a positive one) is bad news; a neutral tag takes no colour
@@ -1204,7 +1221,7 @@ function appendTagFlags(card, iv) {
     const tone = f.valence === "negative" ? (more ? "bad" : "good") : f.valence === "positive" ? (more ? "good" : "bad") : "";
     card.appendChild(el("p", "iv-tagflag",
       `🏷 Tagged ${tagChip(f.slug, tip)} <b class="${tone}">${times}${more ? "more" : "less"} often:</b> ` +
-      `${f.on_tag} of ${f.on_n} on-nights vs ${f.off_tag} of ${f.off_n} off-nights, p = ${f.p}.`));
+      `${f.on_tag} of ${f.on_n} on-nights vs ${f.off_tag} of ${f.off_n} off-nights, ${fmtP(f.p)}.`));
   }
 }
 
