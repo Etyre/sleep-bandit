@@ -833,6 +833,7 @@ def set_taken(conn, d, iid, done, input_value=None):
 
 
 METRICS = ("hrv", "lrhr", "tst", "lat", "eff")  # hrv/tst/eff: higher is better; lrhr/lat: lower is better
+HAND_METRICS = ("hrv", "lrhr")   # may be typed in the Tracker; the rest are written by the Oura sync only
 
 
 def set_metric(conn, d, metric, value):

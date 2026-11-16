@@ -76,10 +76,12 @@ const priorPct = (frac) => Math.round((Number(frac) || 0) * 100);
 const METRICS = [
   { key: "hrv", label: "HRV", hint: "higher is better" },
   { key: "lrhr", label: "Resting HR", hint: "lower is better · bpm" },
-  // the three sleep-architecture metrics are minor next to HRV / resting HR: shown smaller
-  { key: "tst", label: "Total sleep", hint: "higher is better · hours", minor: true },
-  { key: "lat", label: "Sleep latency", hint: "lower is better · min", minor: true },
-  { key: "eff", label: "Sleep efficiency", hint: "higher is better · %", minor: true },
+  // the three sleep-architecture metrics are minor next to HRV / resting HR: shown smaller.
+  // They come from Oura only and cannot be typed over (locked; the server refuses too) --
+  // a stray arrow key in the cell once turned 7.97 h into 8.97 (2026-11-16).
+  { key: "tst", label: "Total sleep", hint: "higher is better · hours", minor: true, locked: true },
+  { key: "lat", label: "Sleep latency", hint: "lower is better · min", minor: true, locked: true },
+  { key: "eff", label: "Sleep efficiency", hint: "higher is better · %", minor: true, locked: true },
 ];
 
 // Report-card charts fill their column (about half the card) instead of hugging
@@ -353,10 +355,11 @@ function renderGrid() {
       // each value shows the figures its metric is measured to (see meas);
       // hand-typed values display exactly as typed.
       const saved = n[m.key] == null ? "" : (manual ? n[m.key] : meas(n[m.key], m.key));
-      const val = READ_ONLY ? saved : withDraft(`metric.${n.date}.${m.key}`, String(saved));
+      const fixed = READ_ONLY || m.locked;
+      const val = fixed ? saved : withDraft(`metric.${n.date}.${m.key}`, String(saved));
       body += `<td class="hrvcell${n.is_today ? " col-today" : ""}${manual ? " manual" : ""}">` +
         `<input type="number" step="any" min="0" data-date="${n.date}" data-metric="${m.key}" ` +
-        `value="${esc(val)}" placeholder="—"${title}${READ_ONLY ? " readonly tabindex=\"-1\"" : ""}></td>`;
+        `value="${esc(val)}" placeholder="—"${title}${fixed ? " readonly tabindex=\"-1\"" : ""}></td>`;
     }
     body += `</tr>`;
   }
