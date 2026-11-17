@@ -299,6 +299,17 @@ from any of your Tailscale devices at `http://atlas:8777` (or the long form `htt
 answers. It is the ordinary local mode (no login: only Tailscale devices can reach it), in a Docker container
 named `bandit` with `SB_AUTOSYNC=1`, so it plans tonight and syncs Oura every 20 minutes without the page open.
 The agent reaches it at `http://bandit:8777` on the shared Docker network. The Mac's LaunchAgents are disabled.
+Port 80 of the server's Tailscale address also leads to it, so a DNS name pointed at `100.78.78.49`
+(for example `sleep.elityre.com`) opens it without a port number, on Tailscale devices only.
+
+**The public site is prepared and off.** `deploy/tailnet/server.sh public-on elissleepbandit.com --yes` starts a
+Caddy web server on the droplet (ports 80 and 443 opened in its firewall) that serves the read-only public view
+at `https://elissleepbandit.com/` and the password-protected admin page, using the admin path and password hash
+prepared in `~/.config/sleep-bandit/sleep-bandit.env`. It needs the domain's A records pointed at the droplet's
+public address first. The app then runs with `SB_PUBLIC=1` and `SB_PRIVATE_DIRECT=1`: only requests Caddy marks
+(`X-SB-Public: 1`) are treated as public; the Tailscale address and the agent keep the full app with no login.
+`public-off` reverses it. Not yet tried end to end: Caddy has never been started on this server.
+
 Everything is driven by `deploy/tailnet/server.sh` (`deploy`, `move`, `home`, `backup`, `fetch`, `status`, `logs`).
 
 ### Data and backups
