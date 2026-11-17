@@ -27,7 +27,8 @@ python3 server.py --test   # end-to-end dry run on a throwaway database
    are ON; tap one when you have done it. A cell's completion input is a checkbox by
    default, or a row of buttons or a number if the intervention is set up that way.
 3. **Morning.** Oura sync fills in last night's HRV, lowest resting HR, sleep
-   efficiency, total sleep and latency. You can also type values by hand.
+   efficiency, total sleep and latency. These come from Oura only; the cells are
+   read-only.
 4. **Reports.** The Effects tab gives each intervention a verdict, its estimated
    effect on HRV and resting HR, a dose-response chart, and the sleep metrics. The
    Interactions tab fits pairs for synergy or interference.
