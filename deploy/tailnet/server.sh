@@ -30,6 +30,8 @@ deploy() {
   git -C "$REPO" log -1 --format='%h %s' > "$stage/VERSION"
   r "mkdir -p $ROOT/app $ROOT/data $ROOT/backups '/opt/atlas/data/home/Library/Application Support/LLMInbox' && chown 1000:1000 $ROOT/data $ROOT/backups '/opt/atlas/data/home/Library' '/opt/atlas/data/home/Library/Application Support' '/opt/atlas/data/home/Library/Application Support/LLMInbox' && { [ -f $ROOT/env ] || echo SB_TZ=$(mac_tz) > $ROOT/env; }"
   rsync -az --delete "$stage/" "$SERVER:$ROOT/app/"; rm -rf "$stage"
+  # mktemp makes the staging folder private, and rsync copies that; the container's user 1000 must be able to read the code
+  r "chmod -R a+rX $ROOT/app"
   r "$COMPOSE build -q"
   if srv_running; then r "$COMPOSE up -d --force-recreate" && echo "restarted on the server: $(r cat $ROOT/app/VERSION)"
   else echo "shipped $(r cat $ROOT/app/VERSION). Not started: it has not been moved to the server ($0 move)."; fi
