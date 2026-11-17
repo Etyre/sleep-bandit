@@ -1,0 +1,34 @@
+# Sleep Bandit beside the executive-assistant agent on the same server. Reached two ways: by the agent on the
+# shared Docker network (http://bandit:8777), and by Eli's own devices over Tailscale (`tailscale serve` hands the
+# tailnet's port 8777 to 127.0.0.1:8777). Never published on a public address: Docker bypasses ufw.
+services:
+  bandit:
+    build: .
+    image: sleep-bandit
+    container_name: bandit
+    restart: unless-stopped
+    init: true
+    environment:
+      SB_HOST: 0.0.0.0
+      SB_PORT: "8777"
+      SB_AUTOSYNC: "1"                       # nobody opens the page on the server, so it plans and syncs Oura by itself
+      SB_SHARED_DIR: /app/shared
+      TZ: ${SB_TZ:-America/Los_Angeles}
+      HOME: /home/bandit                     # ~/Library/Application Support/LLMInbox, shared with the agent (below)
+    volumes:
+      - ${SB_ROOT:-/opt/sleep-bandit}/app:/app:ro
+      - ${SB_ROOT:-/opt/sleep-bandit}/data:/app/data
+      - ${SB_ROOT:-/opt/sleep-bandit}/backups:/app/backups
+      # Only the LLM inbox is shared with the agent: a message from the tagging model to Eli lands in the same
+      # file the agent relays to the Mac. Nothing else of the agent's is visible here.
+      - ${ATLAS_INBOX:-/opt/atlas/data/home/Library/Application Support/LLMInbox}:/home/bandit/Library/Application Support/LLMInbox
+    ports:
+      - "127.0.0.1:8777:8777"
+    networks: [atlas]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+networks:
+  atlas:
+    name: ${ATLAS_NETWORK:-deploy_default}
+    external: true

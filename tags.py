@@ -117,7 +117,7 @@ class ContactRecorded(TagError):
 # preamble and tool definition are read from their files and the check is piped
 # to llm_contact.py under a newer interpreter (a local scan is the last resort).
 # ---------------------------------------------------------------------------
-SHARED_DIR = "/Users/elityre/Documents/agent-coding/shared"
+SHARED_DIR = os.environ.get("SB_SHARED_DIR") or "/Users/elityre/Documents/agent-coding/shared"   # the server sets SB_SHARED_DIR
 APP_NAME = "sleep-bandit"
 CONTACT_MARKER = "@ELI:"
 
