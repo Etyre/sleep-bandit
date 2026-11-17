@@ -432,6 +432,12 @@ llm-inbox list                         # messages the tagging model sent to Eli
   itself is kept"), so Oura tokens were in every commit. `git rm --cached` fixed the
   future; history was not rewritten. Rotate the Oura client secret if the repo is ever
   pushed somewhere public.
+- Never push `main` to GitHub: its history holds those tokens. The public repo gets the
+  local `github` branch instead, a parallel history with the same commits minus `data/`
+  (it shares no ancestor with `main`). As a guard, `origin`'s push URL is set to
+  `no_push`, so a plain `git push` fails. To publish: replay the new `main` commits onto
+  `github` with `data/` stripped, check `git rev-list --objects github | grep -c '\.db'`
+  prints 0, then `git push https://github.com/Etyre/sleep-bandit.git github:main`.
 - The hosted and Mac copies must not both plan: stop the Mac agent while the site is
   live, or the two planners diverge and `pull.sh` cannot refresh the standby DB (it
   skips while a local server holds :8777).
