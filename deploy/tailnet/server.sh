@@ -4,7 +4,7 @@
 #   deploy/tailnet/server.sh move [--yes]  one time: stop it on this Mac, copy the database, start it on the server
 #   deploy/tailnet/server.sh home [--yes]  the reverse: stop it there, bring the database back, start it here
 #   deploy/tailnet/server.sh backup        take a backup on the server now (a daily one is scheduled by `move`)
-#   deploy/tailnet/server.sh fetch         copy the server's newest backup into backups/ on this Mac
+#   deploy/tailnet/server.sh fetch [--fresh]  copy the server's newest backup into backups/ on this Mac (--fresh: take one first)
 #   deploy/tailnet/server.sh status | logs
 # Only one copy may run: both would refresh the same Oura token and invalidate each other's.
 set -euo pipefail
@@ -83,9 +83,11 @@ home)
   echo "Sleep Bandit is back on this Mac: http://localhost:8777"
   ;;
 backup) r "docker exec bandit python deploy/backup.py" ;;
-fetch)
+fetch)   # also run daily by the LaunchAgent com.elityre.sleep-bandit-fetch (deploy/tailnet/install-fetch.sh)
+  [ "${2:-}" = "--fresh" ] && r "docker exec bandit python deploy/backup.py" >/dev/null
   newest="$(r "ls -t $ROOT/backups/sleep_bandit-*.db | head -1")"
-  rsync -az "$SERVER:$newest" "$REPO/backups/server-$(basename "$newest")" && echo "fetched $(basename "$newest") into backups/"
+  rsync -az "$SERVER:$newest" "$REPO/backups/server-$(basename "$newest")" && echo "$(date "+%F %T") fetched $(basename "$newest") into backups/"
+  ls -t "$REPO"/backups/server-sleep_bandit-*.db 2>/dev/null | tail -n +61 | while read -r old; do rm -f "$old"; done   # newest 60 kept
   ;;
 status)
   if srv_running; then echo "on the server ($(r cat $ROOT/app/VERSION)); time zone $(r cat $ROOT/env)"; elif mac_running; then echo "on this Mac"; else echo "not running anywhere"; fi ;;

@@ -295,7 +295,7 @@ Relevant environment variables: `SB_PUBLIC`, `SB_ADMIN_PATH`, `SB_PASSWORD_HASH`
 
 Since 2026-11-17 the app runs on the same private server as the executive-assistant agent (a DigitalOcean
 droplet, ssh host `atlas-server`), so the agent can read sleep data and Oura while the Mac is asleep. Open it
-from any of your Tailscale devices at `http://atlas.tail5a9488.ts.net:8777`; `localhost:8777` on the Mac no longer
+from any of your Tailscale devices at `http://atlas:8777` (or the long form `http://atlas.tail5a9488.ts.net:8777`); `localhost:8777` on the Mac no longer
 answers. It is the ordinary local mode (no login: only Tailscale devices can reach it), in a Docker container
 named `bandit` with `SB_AUTOSYNC=1`, so it plans tonight and syncs Oura every 20 minutes without the page open.
 The agent reaches it at `http://bandit:8777` on the shared Docker network. The Mac's LaunchAgents are disabled.
@@ -383,7 +383,8 @@ cd ~/sleep-bandit
 deploy/tailnet/server.sh status        # where it is running
 deploy/tailnet/server.sh deploy        # after committing: ship HEAD to the server and restart it there
 deploy/tailnet/server.sh logs          # follow the server's log
-deploy/tailnet/server.sh fetch         # copy the server's newest daily backup into backups/ here
+deploy/tailnet/server.sh fetch --fresh # take a backup on the server now and copy it into backups/ here (also runs daily)
+deploy/tailnet/install-fetch.sh        # (re)install that daily job; tail ~/Library/Logs/sleep-bandit-fetch.log
 deploy/tailnet/server.sh home --yes    # bring it back to this Mac (stops it on the server, copies the database)
 python3 server.py                      # run by hand on :8777 (SB_PORT, SB_HOST override)
 python3 server.py --test               # self-test: seeds a temp DB, serves it, checks state/reports/
@@ -423,6 +424,10 @@ llm-inbox list                         # messages the tagging model sent to Eli
 
 ## Gotchas learned
 
+- **Backups still arrive on the Mac.** The LaunchAgent `com.elityre.sleep-bandit-fetch` (15:00 daily and at login)
+  has the server take a backup and copies it to `backups/server-sleep_bandit-*.db` here, newest 60 kept. The old
+  local job (`com.elityre.sleep-bandit-backup`) is disabled while the app is on the server: it would only copy the
+  stale local database.
 - **Only one copy may run.** Both would refresh the same Oura token and invalidate each other's. `move` and `home`
   stop one before starting the other; to try the server image without that risk, run it with `SB_AUTOSYNC=0`.
 - **The time zone on the server is fixed** in `/opt/sleep-bandit/env` (`SB_TZ`, set from the Mac's zone when first
