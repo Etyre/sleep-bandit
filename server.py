@@ -1561,8 +1561,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(res)
 
             if path == "/api/metric":
-                # only HRV and resting HR can be entered by hand (the fallback when
-                # Oura has no reading); the sleep metrics are Oura's alone
+                # no outcome metric can be entered by hand any more (HAND_METRICS is
+                # empty): they all come straight from the Oura sync
                 if body.get("metric", "hrv") not in store.HAND_METRICS:
                     return self._send_json({"error": "That metric comes from Oura and cannot be edited."}, 400)
                 store.set_metric(conn, body["date"], body.get("metric", "hrv"),
