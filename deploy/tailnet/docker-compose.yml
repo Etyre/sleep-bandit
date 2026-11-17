@@ -14,6 +14,13 @@ services:
       SB_AUTOSYNC: "1"                       # nobody opens the page on the server, so it plans and syncs Oura by itself
       SB_SHARED_DIR: /app/shared
       TZ: ${SB_TZ:-America/Los_Angeles}
+      # The public face, off unless `server.sh public-on` filled these in (/opt/sleep-bandit/env). SB_PRIVATE_DIRECT:
+      # only what comes through Caddy is treated as public; the tailnet and the agent keep the full app.
+      SB_PUBLIC: ${SB_PUBLIC:-}
+      SB_PRIVATE_DIRECT: "1"
+      SB_BASE_URL: ${SB_BASE_URL:-}
+      SB_ADMIN_PATH: ${SB_ADMIN_PATH:-admin}
+      SB_PASSWORD_HASH: ${SB_PASSWORD_HASH:-}
       HOME: /home/bandit                     # ~/Library/Application Support/LLMInbox, shared with the agent (below)
     volumes:
       - ${SB_ROOT:-/opt/sleep-bandit}/app:/app:ro
@@ -28,6 +35,22 @@ services:
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
+  # Only started by `server.sh public-on` (compose profile "public"): the one thing on this machine that listens
+  # on the public internet besides ssh.
+  caddy:
+    image: caddy:2
+    container_name: bandit-caddy
+    profiles: [public]
+    restart: unless-stopped
+    environment:
+      SB_DOMAIN: ${SB_DOMAIN:-elissleepbandit.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${SB_ROOT:-/opt/sleep-bandit}/caddy:/data
+    ports:
+      - "80:80"
+      - "443:443"
+    networks: [atlas]
 networks:
   atlas:
     name: ${ATLAS_NETWORK:-deploy_default}

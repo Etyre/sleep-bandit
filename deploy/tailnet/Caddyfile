@@ -1,0 +1,15 @@
+# The public face (deploy/tailnet/server.sh public-on). Caddy gets the HTTPS certificate by itself and marks every
+# request it passes on with X-SB-Public, which is what makes the app treat it as a stranger's: read-only unless
+# signed in on the admin path. A header of that name sent by the visitor is replaced, never trusted.
+{$SB_DOMAIN}, www.{$SB_DOMAIN} {
+    encode gzip
+    reverse_proxy bandit:8777 {
+        header_up X-SB-Public 1
+    }
+    header {
+        Strict-Transport-Security "max-age=31536000"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+    }
+}

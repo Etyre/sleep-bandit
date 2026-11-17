@@ -88,11 +88,16 @@ GRID_NIGHTS = 21          # how many night-columns to show (newest first)
 #   SB_BASE_URL=https://.. the public URL (Oura's redirect goes back here)
 #   SB_AUTOSYNC=1          plan tonight + Oura-sync in the background (default on
 #                          when hosted, off locally where opening the app does it)
+#   SB_PRIVATE_DIRECT=1    with SB_PUBLIC=1: only requests that came through the public
+#                          proxy (it adds "X-SB-Public: 1") are hosted mode; a request made
+#                          straight to the app (private network) is the full local app.
+#                          The app's port must then be unreachable from the internet.
 # ---------------------------------------------------------------------------
 PUBLIC_MODE = os.environ.get("SB_PUBLIC", "") == "1"
 ADMIN_PATH = "/" + os.environ.get("SB_ADMIN_PATH", "admin").strip("/")
 BASE_URL = os.environ.get("SB_BASE_URL", "").rstrip("/") or None
 PASSWORD_HASH = os.environ.get("SB_PASSWORD_HASH", "")
+PRIVATE_DIRECT = os.environ.get("SB_PRIVATE_DIRECT", "") == "1"
 AUTOSYNC = os.environ.get("SB_AUTOSYNC", "1" if PUBLIC_MODE else "0") == "1"
 AUTOSYNC_MINUTES = 20
 
@@ -1278,8 +1283,14 @@ class Handler(BaseHTTPRequestHandler):
         xff = self.headers.get("X-Forwarded-For", "")
         return (xff.split(",")[0].strip() if xff else self.client_address[0])
 
+    def _public(self):
+        """Is this request to be treated as hosted mode (read-only unless signed in)? Always, when SB_PUBLIC=1,
+        unless SB_PRIVATE_DIRECT=1: then only requests the public reverse proxy marked with X-SB-Public are, and a
+        request that reached the app directly (the owner's private network, the agent beside it) is local mode."""
+        return PUBLIC_MODE and (not PRIVATE_DIRECT or self.headers.get("X-SB-Public") == "1")
+
     def _session_ok(self):
-        if not PUBLIC_MODE:
+        if not self._public():
             return True
         tok = auth.cookie_from_header(self.headers.get("Cookie"))
         if not tok:
@@ -1291,7 +1302,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
     def _can_write(self):
-        return (not PUBLIC_MODE) or self._session_ok()
+        return (not self._public()) or self._session_ok()
 
     def _forbid(self):
         return self._send_json({"error": "read-only"}, 403)
@@ -1305,7 +1316,7 @@ class Handler(BaseHTTPRequestHandler):
         except FileNotFoundError:
             return self.send_error(404)
         base = (ADMIN_PATH if mode in ("login", "admin") else "/")
-        cfg = {"mode": mode, "base": base, "hosted": PUBLIC_MODE,
+        cfg = {"mode": mode, "base": base, "hosted": self._public(),
                "redirect_uri": oura.redirect_uri(PORT, BASE_URL)}
         html = html.replace("<!--SB_CONFIG-->",
                             f'<link rel="manifest" href="/manifest.webmanifest?start={quote(base, safe="")}">'
@@ -1323,7 +1334,7 @@ class Handler(BaseHTTPRequestHandler):
         face: the public root and (hosted) the admin page are separate apps, each
         opening on its own Tonight view."""
         start = parse_qs(urlparse(self.path).query).get("start", ["/"])[0]
-        if not (start == "/" or (PUBLIC_MODE and start == ADMIN_PATH)):
+        if not (start == "/" or (self._public() and start == ADMIN_PATH)):
             start = "/"
         admin = start != "/"
         m = {
@@ -1363,8 +1374,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
-            return self._send_page("public" if PUBLIC_MODE else "local")
-        if PUBLIC_MODE and path == ADMIN_PATH:
+            return self._send_page("public" if self._public() else "local")
+        if self._public() and path == ADMIN_PATH:
             return self._send_page("admin" if self._session_ok() else "login")
         statics = {
             "/styles.css": ("styles.css", "text/css; charset=utf-8"),
@@ -1432,7 +1443,7 @@ class Handler(BaseHTTPRequestHandler):
                 store.set_setting(conn, "oura_state", state)
                 return self._redirect(oura.authorize_url(client_id, state, PORT, BASE_URL))
             if path == "/oura/callback":
-                home = (ADMIN_PATH if PUBLIC_MODE else "/")
+                home = (ADMIN_PATH if self._public() else "/")
                 q = parse_qs(urlparse(self.path).query)
                 want = store.get_setting(conn, "oura_state")
                 store.set_setting(conn, "oura_state", None)
@@ -1454,7 +1465,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         body = self._read_body()
-        if PUBLIC_MODE and path == "/api/login":
+        if self._public() and path == "/api/login":
             ip = self._client_ip()
             if not auth.login_allowed(ip):
                 return self._send_json({"error": "Too many attempts — try again in a few minutes."}, 429)
@@ -1477,7 +1488,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             return self.wfile.write(payload)
-        if PUBLIC_MODE and path == "/api/logout":
+        if self._public() and path == "/api/logout":
             payload = json.dumps({"ok": True}).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
