@@ -291,6 +291,16 @@ Hosted mode is off by default; locally everything is read/write with no login.
 Relevant environment variables: `SB_PUBLIC`, `SB_ADMIN_PATH`, `SB_PASSWORD_HASH`
 (from `python3 auth.py`), `SB_BASE_URL`, `SB_AUTOSYNC`, `SB_DB_PATH`.
 
+### On the private server (where it runs since 2026-11-17)
+
+Since 2026-11-17 the app runs on the same private server as the executive-assistant agent (a DigitalOcean
+droplet, ssh host `atlas-server`), so the agent can read sleep data and Oura while the Mac is asleep. Open it
+from any of your Tailscale devices at `http://atlas.tail5a9488.ts.net:8777`; `localhost:8777` on the Mac no longer
+answers. It is the ordinary local mode (no login: only Tailscale devices can reach it), in a Docker container
+named `bandit` with `SB_AUTOSYNC=1`, so it plans tonight and syncs Oura every 20 minutes without the page open.
+The agent reaches it at `http://bandit:8777` on the shared Docker network. The Mac's LaunchAgents are disabled.
+Everything is driven by `deploy/tailnet/server.sh` (`deploy`, `move`, `home`, `backup`, `fetch`, `status`, `logs`).
+
 ### Data and backups
 
 Everything is in `data/sleep_bandit.db`. Tables: `interventions`, `nights`,
@@ -321,6 +331,7 @@ received the file. `backups/` is not in git either. Once the site is hosted,
 
 | File | Role |
 |---|---|
+| `deploy/tailnet/` | the private-server setup: `Dockerfile`, `docker-compose.yml`, `server.sh` (move there and back, deploy, backups) |
 | `server.py` | HTTP server, planning, analysis payloads, hosted mode, `--test` self-test, optional `config.env` loading |
 | `bandit.py` | the model, Thompson sampling, dose exploration, interactions |
 | `store.py` | SQLite schema, migrations, every write (audited) |
@@ -345,6 +356,9 @@ received the file. `backups/` is not in git either. Once the site is hosted,
 - Installed copy and working directory: `~/sleep-bandit`; `~/Documents/agent-coding/sleep-bandit`
   is a symlink to it, so the LaunchAgent runs this very checkout (edits to `public/`
   are live on the next page load; Python changes need a restart).
+- On the server: code `/opt/sleep-bandit/app` (read-only in the container), database `/opt/sleep-bandit/data/sleep_bandit.db`,
+  daily backups `/opt/sleep-bandit/backups` (cron, 05:30, 30 kept), settings `/opt/sleep-bandit/env`. The copy on the Mac
+  below is where it lived before, and where `home` puts it back.
 - Database: `~/sleep-bandit/data/sleep_bandit.db` (`SB_DB_PATH` overrides). Credentials
   live in its `settings` table, not in files.
 - Config (optional): `~/Library/Application Support/Sleep Bandit/config.env`, KEY=VALUE
@@ -366,6 +380,11 @@ received the file. `backups/` is not in git either. Once the site is hosted,
 
 ```sh
 cd ~/sleep-bandit
+deploy/tailnet/server.sh status        # where it is running
+deploy/tailnet/server.sh deploy        # after committing: ship HEAD to the server and restart it there
+deploy/tailnet/server.sh logs          # follow the server's log
+deploy/tailnet/server.sh fetch         # copy the server's newest daily backup into backups/ here
+deploy/tailnet/server.sh home --yes    # bring it back to this Mac (stops it on the server, copies the database)
 python3 server.py                      # run by hand on :8777 (SB_PORT, SB_HOST override)
 python3 server.py --test               # self-test: seeds a temp DB, serves it, checks state/reports/
                                        # interactions/tags payloads and the Claude prompt preamble
@@ -403,6 +422,15 @@ llm-inbox list                         # messages the tagging model sent to Eli
 - **Hosted**: DNS A records, `/etc/sleep-bandit.env`, Caddy; all in `deploy/README.md`.
 
 ## Gotchas learned
+
+- **Only one copy may run.** Both would refresh the same Oura token and invalidate each other's. `move` and `home`
+  stop one before starting the other; to try the server image without that risk, run it with `SB_AUTOSYNC=0`.
+- **The time zone on the server is fixed** in `/opt/sleep-bandit/env` (`SB_TZ`, set from the Mac's zone when first
+  deployed). The 4 AM night rollover uses it; after moving to another zone, change it and run `deploy`.
+- **The first server start failed with "Permission denied: /app/server.py"**: `mktemp -d` makes a private folder
+  and rsync copied that mode; `deploy` now makes the shipped code readable.
+- **The phone PWA needs HTTPS**, and the Tailscale address is plain HTTP, so the page works in a browser on the
+  phone but does not install as an offline app.
 
 - The LaunchAgent runs `/opt/homebrew/bin/python3`, not `/usr/bin/python3`: macOS denies the system Python access to `~/Documents` when launchd starts it, so the shared LLM preamble, tool and inbox check under `agent-coding/shared` could not be read (seen 2026-11-07 as `ModuleNotFoundError: llm_contact` in the log). Homebrew's Python has that access.
 
