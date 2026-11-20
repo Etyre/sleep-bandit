@@ -302,6 +302,10 @@ The agent reaches it at `http://bandit:8777` on the shared Docker network. The M
 Port 80 of the server's Tailscale address also leads to it, so a DNS name pointed at `100.78.78.49`
 (for example `sleep.elityre.com`) opens it without a port number, on Tailscale devices only.
 
+**On the phone** it is a home-screen app: with Tailscale on, open `https://atlas.tail5a9488.ts.net:8778` in Safari,
+then Share → Add to Home Screen. It opens full screen on the Tonight view and keeps the last plan readable with no
+signal (`public/sw.js`). The HTTPS address is `tailscale serve --https=8778` on the server, set up by `server.sh move`.
+
 **The public site is prepared and off.** `deploy/tailnet/server.sh public-on elissleepbandit.com --yes` starts a
 Caddy web server on the droplet (ports 80 and 443 opened in its firewall) that serves the read-only public view
 at `https://elissleepbandit.com/` and the password-protected admin page, using the admin path and password hash
@@ -445,8 +449,9 @@ llm-inbox list                         # messages the tagging model sent to Eli
   deployed). The 4 AM night rollover uses it; after moving to another zone, change it and run `deploy`.
 - **The first server start failed with "Permission denied: /app/server.py"**: `mktemp -d` makes a private folder
   and rsync copied that mode; `deploy` now makes the shipped code readable.
-- **The phone PWA needs HTTPS**, and the Tailscale address is plain HTTP, so the page works in a browser on the
-  phone but does not install as an offline app.
+- **The phone app needs HTTPS** (a service worker will not register on plain HTTP), so it is installed from
+  `https://atlas.tail5a9488.ts.net:8778`, not from the `http://atlas:8777` address. That port is tailnet only and
+  deliberately not 443: Funnel is on for 443 on this server (another service's webhook), and Funnel cannot use 8778.
 
 - The LaunchAgent runs `/opt/homebrew/bin/python3`, not `/usr/bin/python3`: macOS denies the system Python access to `~/Documents` when launchd starts it, so the shared LLM preamble, tool and inbox check under `agent-coding/shared` could not be read (seen 2026-11-07 as `ModuleNotFoundError: llm_contact` in the log). Homebrew's Python has that access.
 

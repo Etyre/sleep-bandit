@@ -61,6 +61,9 @@ move)
   say "starting it on the server"
   r "$COMPOSE up -d"
   r "tailscale serve --bg --tcp=8777 tcp://localhost:8777 >/dev/null; tailscale serve --bg --tcp=80 tcp://localhost:8777 >/dev/null"   # 80: for a name without a port (sleep.<your domain>)
+  # HTTPS for the phone's home-screen app (a service worker needs it). Port 8778 on purpose: Funnel is on for this
+  # server's port 443 and can only ever use 443, 8443 or 10000, so 8778 cannot be opened to the internet by mistake.
+  r "tailscale serve --bg --https=8778 http://127.0.0.1:8777 >/dev/null"
   # a daily backup at 05:30 server time, kept 30 deep in $ROOT/backups (deploy/backup.py)
   r "echo '30 5 * * * root docker exec bandit python deploy/backup.py >> /var/log/sleep-bandit-backup.log 2>&1' > /etc/cron.d/sleep-bandit-backup"
   for _ in $(seq 1 20); do r "curl -fsS -o /dev/null -m 4 http://127.0.0.1:8777/" 2>/dev/null && ok=1 && break; sleep 2; done
