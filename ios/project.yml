@@ -1,0 +1,53 @@
+# xcodegen spec for the iPhone app: `xcodegen generate` (brew install xcodegen) writes SleepBandit.xcodeproj.
+# The .xcodeproj is not committed; build-ios.sh regenerates it every time.
+name: SleepBandit
+options:
+  bundleIdPrefix: com.elityre
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: DW72928GK6
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"        # build-ios.sh passes the commit count instead
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  SleepBandit:
+    type: application
+    platform: iOS
+    sources:
+      - path: SleepBandit
+        excludes: ["Info.plist"]
+    info:
+      path: SleepBandit/Info.plist
+      properties:
+        CFBundleDisplayName: Sleep Bandit
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.healthcare-fitness
+        # Where the app lives: the tailnet-only HTTPS address (README "On the private server"), opening on Tonight.
+        # The host is repeated in WKAppBoundDomains, which is what allows the page's service worker in a web view.
+        SBServerURL: "https://atlas.tail5a9488.ts.net:8778/#tonight"
+        WKAppBoundDomains: [atlas.tail5a9488.ts.net]
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait, UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight]
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.elityre.sleepbandit
+        PRODUCT_NAME: SleepBandit
+        TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+schemes:
+  SleepBandit:
+    build:
+      targets: { SleepBandit: all }
+    run:
+      config: Debug

@@ -2,7 +2,7 @@
 """Draw the home-screen icons (public/icon-*.png, apple-touch-icon.png) with the
 standard library only: a dark square with a teal crescent moon and three die pips.
 Full-bleed, art inside the centre ~80% so Android's circular mask and iOS's rounded
-mask both keep it whole.  Run:  python3 icons.py"""
+mask both keep it whole. Also writes the iPhone app's 1024 px icon.  Run:  python3 icons.py"""
 import os
 import struct
 import zlib
@@ -56,3 +56,9 @@ if __name__ == "__main__":
         with open(os.path.join(here, name), "wb") as f:
             f.write(png(size, draw(size)))
         print("wrote", name)
+    # the iPhone app's icon (ios/): one full-bleed 1024 px square, no alpha; iOS rounds the corners itself
+    ios = os.path.join(os.path.dirname(here), "ios", "SleepBandit", "Assets.xcassets", "AppIcon.appiconset")
+    if os.path.isdir(ios):
+        with open(os.path.join(ios, "icon-1024.png"), "wb") as f:
+            f.write(png(1024, draw(1024)))
+        print("wrote ios icon-1024.png")

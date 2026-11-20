@@ -302,9 +302,15 @@ The agent reaches it at `http://bandit:8777` on the shared Docker network. The M
 Port 80 of the server's Tailscale address also leads to it, so a DNS name pointed at `100.78.78.49`
 (for example `sleep.elityre.com`) opens it without a port number, on Tailscale devices only.
 
-**On the phone** it is a home-screen app: with Tailscale on, open `https://atlas.tail5a9488.ts.net:8778` in Safari,
-then Share → Add to Home Screen. It opens full screen on the Tonight view and keeps the last plan readable with no
-signal (`public/sw.js`). The HTTPS address is `tailscale serve --https=8778` on the server, set up by `server.sh move`.
+**On the phone** it is a real iPhone app (`ios/`, installed 2026-11-20): a native shell whose single full-screen
+web view shows `https://atlas.tail5a9488.ts.net:8778`, opening on the Tonight view. The phone needs Tailscale on;
+without it the app shows a "can't reach it" screen with a retry instead of a blank page. Because the interface is
+the server's own page, `server.sh deploy` updates what the app shows with no rebuild. Only a change under `ios/`
+needs `ios/build-ios.sh`, which builds, signs (team in `ios/project.yml`, profile good for a year) and installs on
+the paired phone over cable or Wi-Fi; `--sim` runs it in the simulator and saves a screenshot instead. The shell
+also supplies the page's alert/confirm dialogs, pull-down-to-reload, and sends links that leave the server to
+Safari. The same address still installs from Safari (Share → Add to Home Screen) on a device without the app.
+The HTTPS address is `tailscale serve --https=8778` on the server, set up by `server.sh move`.
 
 **The public site is prepared and off.** `deploy/tailnet/server.sh public-on elissleepbandit.com --yes` starts a
 Caddy web server on the droplet (ports 80 and 443 opened in its firewall) that serves the read-only public view
@@ -351,6 +357,7 @@ received the file. `backups/` is not in git either. Once the site is hosted,
 | `bandit.py` | the model, Thompson sampling, dose exploration, interactions |
 | `store.py` | SQLite schema, migrations, every write (audited) |
 | `oura.py` | OAuth and sync, including the raw within-night series; read-only collection passthrough |
+| `ios/` | the iPhone app: `SleepBandit/SleepBanditApp.swift` (the whole shell), `project.yml` (xcodegen: server address, bundle id, signing), `build-ios.sh` |
 | `tags.py` | night-shape tags: features, reference, the Claude call (shared preamble, `contact_eli`, inbox check, hold), background tagger |
 | `weather.py` | outdoor temperature per night (Open-Meteo) for the season sections |
 | `auth.py` | password hashing and session cookies for hosted mode; `python3 auth.py` prints `SB_PASSWORD_HASH` |

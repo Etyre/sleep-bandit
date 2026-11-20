@@ -27,3 +27,7 @@ config.env
 node_modules/
 dist/
 build/
+
+# iPhone app: generated project and build output (ios/build-ios.sh)
+ios/*.xcodeproj
+ios/SleepBandit/Info.plist
