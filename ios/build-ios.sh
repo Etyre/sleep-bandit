@@ -40,5 +40,8 @@ echo "built $APP (build $NUMBER)"
 DEVICE="${SB_IPHONE_UDID:-$(xcrun devicectl list devices 2>/dev/null | grep physical | grep -o '[0-9A-F]\{8\}-[0-9A-F]\{16\}' | head -1)}"
 [ -n "$DEVICE" ] || { echo "no paired iPhone found (xcrun devicectl list devices)"; exit 1; }
 echo "installing on $DEVICE ..."
-xcrun devicectl device install app --device "$DEVICE" "$APP" 2>&1 | grep -E "installed|error|Error|unavailable|App is|bundleID" | head -5
+if ! LOG="$(xcrun devicectl device install app --device "$DEVICE" "$APP" 2>&1)"; then
+  echo "$LOG" | tail -8; echo "install failed (is the phone unlocked, and on this network or plugged in?)"; exit 1
+fi
+echo "$LOG" | grep -E "installed|bundleID" | head -3 || true
 xcrun devicectl device process launch --device "$DEVICE" "$BUNDLE" 2>&1 | grep -E "Launched|error|Error|locked" | head -3 || true

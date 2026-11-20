@@ -593,7 +593,7 @@ def prior_variances(p, cols):
 # ---------------------------------------------------------------------------
 # Posterior fit (closed form) and sampling.
 # ---------------------------------------------------------------------------
-def fit(X, y, p, V0_diag, m0=None, w=None):
+def fit(X, y, p, V0_diag, m0=None, w=None, noise_var=None):
     """Conjugate Normal-Inverse-Gamma posterior. m0 is the prior MEAN vector (default
     zeros -> the uninformative centered-on-zero prior). A non-zero m0 shifts the
     posterior mean toward the prior and adds the m0^T Lambda0 m0 term to bN; it does
@@ -637,7 +637,9 @@ def fit(X, y, p, V0_diag, m0=None, w=None):
     n_eff = float(n) if w is None else sum(w)
     mAm = sum(rhs[i] * mN[i] for i in range(p))   # mN^T A mN = mN . rhs
     aN = SIGMA2_PRIOR_A + n_eff / 2.0
-    bN = SIGMA2_PRIOR_B + 0.5 * (yty + m0Lam0m0 - mAm)
+    # the default prior mean of sigma^2 (144) is HRV's scale; a metric in other units passes its own
+    b0 = (SIGMA2_PRIOR_A - 1.0) * noise_var if noise_var and noise_var > 0 else SIGMA2_PRIOR_B
+    bN = b0 + 0.5 * (yty + m0Lam0m0 - mAm)
     if bN < 1e-9:
         bN = 1e-9
     return {"L": L, "mN": mN, "aN": aN, "bN": bN, "p": p, "n": n}
@@ -739,7 +741,8 @@ def _dose_step(iv):
     if u > 0:
         return u
     s = float(iv.get("default_dose") or 0)
-    return 0.5 * s if s > 0 else 0.0
+    # a standard dose of 1 or less with no unit is an on/off behaviour (store.dose_levels_from): no half doses
+    return 0.5 * s if s > 1 else 0.0
 
 
 def _bounds(iv):
@@ -894,7 +897,8 @@ def _plan_combo(iv, beta, entry, measured, noise_sd):
                 continue
             counts[xd] = counts.get(xd, 0) + 1
             real[xd] = _d(x)
-        g = sorted(set(grid) | set(counts))     # measured doses stay exploitable
+        # measured doses stay exploitable, unless the bounds have since been moved past them
+        g = sorted(set(grid) | {d for d in counts if _in_bounds(d, lo, hi)})
         coarse = _coarse_rungs(g, step, std)
         if _coarse_night(coarse):
             g = [r for r in g if _rung_open(r, coarse, counts)]
@@ -1071,6 +1075,8 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
         # that can't be set below its minimum temperature).
         std = _d(iv.get("default_dose") or 0)
         lo, hi = _bounds(iv)
+        if std > 0:
+            std = _clamp(std, lo, hi)                    # a standard dose outside min/max is never assigned
         if not iv.get("explore_doses", True):
             plan[iv["id"]] = std
             continue
@@ -1113,6 +1119,9 @@ def plan_night(post, cols, active_interventions, n_on=None, measured=None, n_off
             xd = _d(x)
             if xd <= 0 or (is_open(xd) and not open_ok):
                 continue                                 # open-arm nights of a now-closed arm
+            if not is_open(xd) and not _in_bounds(xd, lo, hi):
+                continue                                 # measured before the bounds moved: no longer on the grid
+                                                         # (above the max it would also pass for the open arm)
             p = pos(xd)
             counts[p] = counts.get(p, 0) + 1
             real[p] = xd
@@ -1184,6 +1193,11 @@ def plan_exploit(post, cols, interventions, measured=None):
         kind = iv.get("kind")
         seen = sorted({_d(x) for x in measured.get(iv["id"], ()) if x and float(x) > 0
                        if not (is_open(x) and not has_open_arm(iv))})
+        lo, hi = _bounds(iv)                             # never a dose the bounds have since ruled out
+        if kind == "dose":
+            seen = [x for x in seen if is_open(x) or _in_bounds(x, lo, hi)]
+        elif kind == "choice_dose":
+            seen = [x for x in seen if _in_bounds(combo_decode(x)[1], lo, hi)]
         skip_ok = kind in ("dose", "boolean") or iv.get("test_skip")
         if skip_ok and alpha <= 0:
             out[iv["id"]] = {"dose": 0.0, "effect": alpha, "on_effect": alpha}
@@ -1281,14 +1295,18 @@ def readouts(interventions, betas, cols, observed=None):
             # choice+dose: pick the option whose best pair has the highest mean effect,
             # then the minimum viable dose WITHIN that option.
             by_opt = {}
+            lo, hi = _bounds(iv)                 # every measured dose is shown; only one inside min/max is recommended
             for row in dose_rows:
                 o, dd = combo_decode(row["dose"])
-                by_opt.setdefault(o, {})[dd] = row["mean_effect"]
-            best_opt = max(by_opt, key=lambda o: max(by_opt[o].values()))
-            mv = _min_viable_dose(by_opt[best_opt])
+                if _in_bounds(dd, lo, hi):
+                    by_opt.setdefault(o, {})[dd] = row["mean_effect"]
+            best_opt = max(by_opt, key=lambda o: max(by_opt[o].values())) if by_opt else None
+            mv = _min_viable_dose(by_opt[best_opt]) if by_opt else None
             rec_dose = combo_encode(best_opt, mv) if mv is not None else 0.0
         else:
-            rec_dose = _min_viable_dose({row["dose"]: row["mean_effect"] for row in dose_rows}) or 0.0
+            lo, hi = _bounds(iv) if iv.get("kind") == "dose" else (None, None)
+            rec_dose = _min_viable_dose({row["dose"]: row["mean_effect"] for row in dose_rows
+                                         if is_open(row["dose"]) or _in_bounds(row["dose"], lo, hi)}) or 0.0
         rec_p = best_counts.get(rec_dose, 0) / S
 
         on_sorted = sorted(on_samples)
@@ -1306,7 +1324,7 @@ def readouts(interventions, betas, cols, observed=None):
     return out
 
 
-def group_best(groups, negate=False):
+def group_best(groups, negate=False, noise_var=None):
     """P(best) across OBSERVED groups of nights -- e.g. the behavior states in a
     report card's observed section. groups: {key: [(w, y)]}, each night in exactly
     one group. Fits one mean per group (flat prior, shared noise posterior -- the
@@ -1330,7 +1348,7 @@ def group_best(groups, negate=False):
             y.append(-float(yv) if negate else float(yv))
             w.append(float(wv))
     post = fit(X, y, len(keys), [INTERCEPT_PRIOR_VAR] * len(keys),
-               w=(w if any(x != 1.0 for x in w) else None))
+               w=(w if any(x != 1.0 for x in w) else None), noise_var=noise_var)
     state = random.getstate()
     random.seed(READOUT_SEED)
     try:
@@ -1343,7 +1361,7 @@ def group_best(groups, negate=False):
     return {k: wins[idx[k]] / READOUT_SAMPLES for k in keys}
 
 
-def pair_interaction(nights):
+def pair_interaction(nights, noise_var=None):
     """Interaction read-out for one pair. nights: [{"y": metric (higher = better),
     "a": 0/1, "b": 0/1}] -- only nights where both A and B are determined.
 
@@ -1380,7 +1398,7 @@ def pair_interaction(nights):
     V0 = [INTERCEPT_PRIOR_VAR, ON_PRIOR_VAR, ON_PRIOR_VAR, INTERACTION_PRIOR_VAR]
     if base_center is not None:
         V0.append(BASE_PRIOR_VAR)
-    post = fit(X, y, len(V0), V0, w=(w if any(x != 1.0 for x in w) else None))
+    post = fit(X, y, len(V0), V0, w=(w if any(x != 1.0 for x in w) else None), noise_var=noise_var)
     state = random.getstate()
     random.seed(READOUT_SEED)
     try:
@@ -1430,7 +1448,7 @@ def pair_interaction(nights):
     }
 
 
-def fit_model(interventions, completed_nights, priors=None):
+def fit_model(interventions, completed_nights, priors=None, noise_var=None):
     """Fit the posterior only (no read-out sampling) -- enough for planning.
 
     priors: optional {iv_id: prior_mean} giving a NON-zero prior mean on that
@@ -1475,15 +1493,15 @@ def fit_model(interventions, completed_nights, priors=None):
                     return float(opt_means.get(oid, 0.0))
                 for j, col in enumerate(entry["dev"]):
                     m0[col] = sum(crow[j] * level_mean(level) for level, crow in entry["contrast"].items())
-    post = fit(X, y, p, V0, m0, w=(w if any(x != 1.0 for x in w) else None))
+    post = fit(X, y, p, V0, m0, w=(w if any(x != 1.0 for x in w) else None), noise_var=noise_var)
     return {"post": post, "cols": cols, "n": post["n"], "base_col": base_col,
             "base_coef": (post["mN"][base_col] if base_col is not None else None)}
 
 
-def analyze(interventions, completed_nights, priors=None):
+def analyze(interventions, completed_nights, priors=None, noise_var=None):
     """Fit + the Monte-Carlo read-outs used by the Reports tab. priors is passed through
     to fit_model (used for the scheduling probability; efficacy read-outs pass none)."""
-    m = fit_model(interventions, completed_nights, priors)
+    m = fit_model(interventions, completed_nights, priors, noise_var)
     # Seed the read-out draws so the reported numbers are stable across page loads;
     # save/restore the global RNG so planning (Thompson sampling) stays random.
     state = random.getstate()

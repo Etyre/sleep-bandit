@@ -21,6 +21,7 @@ Pure standard library, like the rest of the app.
 """
 
 import json
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -73,7 +74,9 @@ def _http_json(url, data=None, headers=None):
             body = e.read().decode()[:300]
         except Exception:
             pass
-        raise OuraError(f"Oura API returned {e.code}: {body or e.reason}") from e
+        err = OuraError(f"Oura API returned {e.code}: {body or e.reason}")
+        err.code = e.code            # _refresh tells a rejected token (400/401) from an outage by this
+        raise err from e
     except urllib.error.URLError as e:
         raise OuraError(f"Could not reach Oura: {e.reason}") from e
 
@@ -100,24 +103,30 @@ def exchange_code(conn, code, port, base=None):
     _save_tokens(conn, tok)
 
 
+_REFRESH_LOCK = threading.Lock()   # Oura rotates refresh tokens: two refreshes at once would spend the same one
+
+
 def _refresh(conn):
-    refresh_token = store.get_setting(conn, "oura_refresh_token")
-    if not refresh_token:
-        raise OuraError("Not connected to Oura — click Connect to authorize.")
-    try:
-        tok = _http_json(TOKEN_URL, data={
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": store.get_setting(conn, "oura_client_id", ""),
-            "client_secret": store.get_setting(conn, "oura_client_secret", ""),
-        })
-    except OuraError as e:
-        # a dead refresh token means the authorization was revoked -> reconnect
-        store.set_setting(conn, "oura_access_token", None)
-        store.set_setting(conn, "oura_refresh_token", None)
-        raise OuraError("Oura authorization expired — click Connect to re-authorize.") from e
-    _save_tokens(conn, tok)
-    return tok["access_token"]
+    with _REFRESH_LOCK:
+        refresh_token = store.get_setting(conn, "oura_refresh_token")   # read inside the lock: the newest one
+        if not refresh_token:
+            raise OuraError("Not connected to Oura — click Connect to authorize.")
+        try:
+            tok = _http_json(TOKEN_URL, data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": store.get_setting(conn, "oura_client_id", ""),
+                "client_secret": store.get_setting(conn, "oura_client_secret", ""),
+            })
+        except OuraError as e:
+            if getattr(e, "code", None) not in (400, 401):
+                raise   # Oura unreachable or having a bad moment: the tokens are still good, keep them
+            # a dead refresh token means the authorization was revoked -> reconnect
+            store.set_setting(conn, "oura_access_token", None)
+            store.set_setting(conn, "oura_refresh_token", None)
+            raise OuraError("Oura authorization expired — click Connect to re-authorize.") from e
+        _save_tokens(conn, tok)
+        return tok["access_token"]
 
 
 def _access_token(conn):

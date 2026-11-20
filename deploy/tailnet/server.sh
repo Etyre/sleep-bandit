@@ -101,11 +101,13 @@ public-on)
     echo "Run again as: $0 public-on $domain --yes     ('$0 public-off' undoes it)"; exit 0
   fi
   srv_running || die "it is not running on the server"
+  envtmp="$(mktemp)"; trap 'rm -f "$envtmp"' EXIT     # holds the password hash: private, and removed however this ends
   { r "grep -v -E '^(SB_PUBLIC|SB_BASE_URL|SB_ADMIN_PATH|SB_PASSWORD_HASH|SB_DOMAIN)=' $ROOT/env"
     echo "SB_PUBLIC=1"; echo "SB_DOMAIN=$domain"; echo "SB_BASE_URL=https://$domain"
     # single quotes: the hash contains $ signs, which Compose would otherwise read as variables
     for k in SB_ADMIN_PATH SB_PASSWORD_HASH; do v="$(sed -n "s/^$k=//p" "$PREP" | head -1)"; [ -n "$v" ] || die "$k is empty in $PREP"; echo "$k='$v'"; done
-  } > /tmp/sb-env.$$ && scp -q /tmp/sb-env.$$ "$SERVER:$ROOT/env"; rm -f /tmp/sb-env.$$
+  } > "$envtmp"
+  scp -q "$envtmp" "$SERVER:$ROOT/env"
   r "chmod 600 $ROOT/env && mkdir -p $ROOT/caddy && ufw allow 80/tcp >/dev/null && ufw allow 443/tcp >/dev/null && $COMPOSE --profile public up -d" 2>&1 | tail -2
   echo "public at https://$domain (the certificate can take a minute); admin page: https://$domain/$(sed -n 's/^SB_ADMIN_PATH=//p' "$PREP")"
   ;;

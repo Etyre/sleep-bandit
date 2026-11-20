@@ -95,6 +95,11 @@ final class WebModel: NSObject, ObservableObject, WKNavigationDelegate, WKUIDele
             UIApplication.shared.open(url)
             return decisionHandler(.cancel)
         }
+        // mailto:, tel: and the like: the web view cannot load them and would show the "can't reach" screen
+        if mainFrame && !["http", "https", "about", "blob", "data"].contains((url.scheme ?? "").lowercased()) {
+            UIApplication.shared.open(url)
+            return decisionHandler(.cancel)
+        }
         decisionHandler(.allow)
     }
 

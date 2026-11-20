@@ -19,7 +19,8 @@ self.addEventListener("activate", (e) => {
 // one read the Tonight view needs. Writes and everything else stay network-only.
 function cacheable(req, url) {
   if (req.method !== "GET") return false;
-  if (req.mode === "navigate") return true;
+  // the page, not a data link opened as a page (Export is /api/export in a new tab: never keep that)
+  if (req.mode === "navigate") return !url.pathname.startsWith("/api/") && !url.pathname.startsWith("/oura/");
   if (SHELL.includes(url.pathname) || url.pathname === "/manifest.webmanifest") return true;
   return url.pathname === "/api/state";
 }

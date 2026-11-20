@@ -339,7 +339,8 @@ def features(doc):
         half = max(3, len(v) // 2)
         f["hr_first_half_mean"] = round(_mean(v[:half]), 1)
         f["hr_second_half_mean"] = round(_mean(v[half:]) if v[half:] else _mean(v), 1)
-        f["hr_first_half_slope_per_h"] = round(_slope(v[:half], step_h), 2) if half >= 3 else None
+        s = _slope(v[:half], step_h)                       # None with fewer than three samples
+        f["hr_first_half_slope_per_h"] = round(s, 2) if s is not None else None
         # how long until HR first gets within 3 bpm of its overnight minimum
         settle = next((t for t, x in hr if x <= f["hr_min"] + 3), None)
         f["hr_settle_h"] = round(settle, 2) if settle is not None else None
@@ -358,7 +359,8 @@ def features(doc):
         half = max(3, len(v) // 2)
         f["hrv_first_half_mean"] = round(_mean(v[:half]), 1)
         f["hrv_second_half_mean"] = round(_mean(v[half:]) if v[half:] else _mean(v), 1)
-        f["hrv_slope_per_h"] = round(_slope(v, step_h), 2)
+        s = _slope(v, step_h)
+        f["hrv_slope_per_h"] = round(s, 2) if s is not None else None
         f["hrv_first2h_max"] = max(v[:24]) if v[:24] else None
     # hypnogram (5-minute): 1 deep, 2 light, 3 REM, 4 awake
     hyp = doc.get("sleep_phase_5_min") or ""
@@ -657,13 +659,18 @@ def classify(key, model, system, user_text):
     if not text:
         raise TagError("The model returned no text.")
     try:
-        return json.loads(text), resp.get("usage") or {}
+        out = json.loads(text)
     except ValueError as e:
         raise TagError("The model's answer was not valid JSON.") from e
+    if not isinstance(out, dict) or not isinstance(out.get("tags") or [], list) \
+            or not all(isinstance(t, dict) for t in out.get("tags") or []) \
+            or not isinstance(out.get("summary") or "", str):
+        raise TagError("The model's answer was not in the expected shape.")
+    return out, resp.get("usage") or {}
 
 
 def _slugify(s):
-    out = "".join(c if c.isalnum() else "-" for c in (s or "").lower())
+    out = "".join(c if c.isalnum() else "-" for c in str(s or "").lower())
     while "--" in out:
         out = out.replace("--", "-")
     return out.strip("-")[:48]
@@ -693,8 +700,8 @@ def tag_night(conn, d, key=None, model=None, ref=None, thresh=None):
         if not slug:
             continue
         if slug not in known:
-            store.upsert_tag_vocab(conn, slug, (t.get("label") or slug).strip()[:60],
-                                   (t.get("description") or "").strip()[:300], model)
+            store.upsert_tag_vocab(conn, slug, str(t.get("label") or slug).strip()[:60],
+                                   str(t.get("description") or "").strip()[:300], model)
             known.add(slug)
         if slug not in slugs:
             slugs.append(slug)

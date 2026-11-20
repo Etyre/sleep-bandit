@@ -76,7 +76,7 @@ def check_token(secret, token):
             return False
         want = hmac.new(secret, exp.encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(want, sig)
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):   # TypeError: non-ASCII signature
         return False
 
 

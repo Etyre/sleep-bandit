@@ -428,7 +428,7 @@ def maximize_tonight(conn, mode):
         a = cur.get(iv["id"]) or {}
         rows.append({"id": iv["id"], "name": iv["name"], "kind": iv["kind"],
                      "dose": ex["dose"], "effect": ex["effect"], "on_effect": ex["on_effect"],
-                     "current": a.get("assigned_dose"), "ticked": a.get("taken_dose") is not None})
+                     "current": a.get("assigned_dose"), "ticked": (a.get("taken_dose") or 0) > 0})
         if mode == "on":
             # provenance like a planned cell, plus the exploit read-out it came from
             ctx = {"code": CODE_VERSION, "modes": modes, "n_on": _nn(n_on), "n_off": _nn(n_off),
@@ -495,7 +495,7 @@ def reconcile_tonight_options(conn, iid):
     if not night or night.get("status") != "planned":
         return False
     cell = next((a for a in night["assignments"] if a["intervention_id"] == iid), None)
-    if not cell or cell["taken_dose"] is not None or not (cell["assigned_dose"] or 0) > 0:
+    if not cell or (cell["taken_dose"] or 0) > 0 or not (cell["assigned_dose"] or 0) > 0:   # 0 = unticked again
         return False
     level = float(cell["assigned_dose"])
     oid = bandit.combo_decode(level)[0] if iv["kind"] == "choice_dose" else int(round(level))
@@ -520,6 +520,11 @@ def public_scrub(payload):
     for iv in payload.get("interventions", []) or []:
         if "note" in iv:
             iv["note"] = ""
+        s = iv.get("season")             # the season read-out names the cities too
+        if s:
+            s["cities"] = []
+            for p in s.get("points", []) or []:
+                p["city"] = None
     return payload
 
 
@@ -529,6 +534,7 @@ def state_payload(conn):
     ivs = store.list_interventions(conn)  # active first, then paused
     nights_rows = store.recent_nights(conn, GRID_NIGHTS)  # newest first, incl. today
     tags_by_date = store.night_tags(conn)
+    no_series = set(store.nights_missing_series(conn))
     vocab_rank = {v["slug"]: i for i, v in enumerate(store.tag_vocab(conn))}
     city_eff = store.effective_cities(conn)
 
@@ -555,6 +561,7 @@ def state_payload(conn):
             "is_today": n["date"] == d_today,
             "tags": _vocab_order((tags_by_date.get(n["date"]) or {}).get("tags", []), vocab_rank),
             "tagged": n["date"] in tags_by_date,   # read by the tagger (possibly with no tags)
+            "has_series": n["date"] not in no_series,   # False: no raw Oura series, so the tagger cannot read it
             # where the night was slept: the explicit choice (None = inherited) and the
             # effective city after carry-forward from earlier nights
             "city": n["city"],
@@ -578,12 +585,20 @@ def state_payload(conn):
             **analysis_modes(conn)}
 
 
+def _noise_var(values):
+    """Night-to-night variance of a non-HRV metric, for the noise prior of its fit: the model's default
+    prior is sized for HRV (ms), which made the intervals for hours of sleep or bpm far too wide."""
+    v = [float(x) for x in values if x is not None]
+    return statistics.variance(v) if len(v) >= 3 else None
+
+
 def _readout(iv, all_nights, metric, negate):
     """Fit this one intervention on its compliant nights for one metric and return
     its read-out (with on/off night counts). Empty dict if it has no valid nights."""
     nights, n_on, n_off = intervention_nights(iv["id"], all_nights, metric, negate,
                                               category=iv.get("category"))
-    r = bandit.analyze([iv], nights)["readouts"].get(iv["id"], {}) if nights else {}
+    nv = None if metric == "hrv" else _noise_var(n["hrv"] for n in nights)   # "hrv" holds this metric here
+    r = bandit.analyze([iv], nights, noise_var=nv)["readouts"].get(iv["id"], {}) if nights else {}
     r = dict(r)
     r["n_on"], r["n_off"] = _nn(n_on), _nn(n_off)
     # distinct non-zero doses actually tried -- you can't recommend a "best dose"
@@ -1178,7 +1193,7 @@ def _observational_rows(iv, all_nights):
     # (lowest resting HR), given the night-to-night noise. Ranks averages only --
     # correlational, like the rest of the section.
     p_hrv = bandit.group_best(pts["hrv"])
-    p_lrhr = bandit.group_best(pts["lrhr"], negate=True)
+    p_lrhr = bandit.group_best(pts["lrhr"], negate=True, noise_var=_noise_var(y for g in pts["lrhr"].values() for _, y in g))
     out = []
     for s in specs:
         row = {"name": s["name"], "key": s["key"]}
@@ -1207,7 +1222,8 @@ def interactions_payload(conn):
         for j in range(i + 1, len(ivs)):
             a, b = ivs[i], ivs[j]
             r_hrv = bandit.pair_interaction(_pair_nights(a, b, all_nights, "hrv", False))
-            r_lrhr = bandit.pair_interaction(_pair_nights(a, b, all_nights, "lrhr", True))
+            rows = _pair_nights(a, b, all_nights, "lrhr", True)
+            r_lrhr = bandit.pair_interaction(rows, noise_var=_noise_var(r["y"] for r in rows))
             if not ((r_hrv and r_hrv["n_both"]) or (r_lrhr and r_lrhr["n_both"])):
                 no_overlap += 1
                 continue
@@ -1223,7 +1239,8 @@ def interactions_payload(conn):
             if a["id"] == src["id"]:
                 continue
             r_hrv = bandit.pair_interaction(_pair_nights_state(a, src, spec, all_nights, "hrv", False))
-            r_lrhr = bandit.pair_interaction(_pair_nights_state(a, src, spec, all_nights, "lrhr", True))
+            rows = _pair_nights_state(a, src, spec, all_nights, "lrhr", True)
+            r_lrhr = bandit.pair_interaction(rows, noise_var=_noise_var(r["y"] for r in rows))
             if not ((r_hrv and r_hrv["n_both"]) or (r_lrhr and r_lrhr["n_both"])):
                 no_overlap += 1
                 continue
@@ -1269,13 +1286,41 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_body(self):
-        length = int(self.headers.get("Content-Length", 0))
-        if not length:
-            return {}
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8"))
-        except json.JSONDecodeError:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+        except ValueError:               # not a number, not UTF-8, not JSON
             return {}
+        return body if isinstance(body, dict) else {}
+
+    def _guarded(self, handler):
+        """Run one request; a bad request or a bug answers with an error instead of a dropped connection."""
+        try:
+            return handler()
+        except (BrokenPipeError, ConnectionResetError):
+            return None
+        except (KeyError, ValueError, TypeError, AttributeError):
+            applog.log_exc("bad request %s %s" % (self.command, self.path))
+            code, msg = 400, "That request was missing something or had a value of the wrong kind."
+        except Exception:
+            applog.log_exc("unhandled error in %s %s" % (self.command, self.path))
+            code, msg = 500, "Something went wrong on the server."
+        try:
+            self._send_json({"error": msg}, code)
+        except Exception:
+            pass                         # the reply had already started
+
+    def do_GET(self):
+        return self._guarded(self._get)
+
+    def do_POST(self):
+        return self._guarded(self._post)
+
+    def do_PUT(self):
+        return self._guarded(self._put)
+
+    def do_DELETE(self):
+        return self._guarded(self._delete)
 
     def _redirect(self, location):
         self.send_response(302)
@@ -1371,13 +1416,13 @@ class Handler(BaseHTTPRequestHandler):
     def _set_session_cookie(self, token, clear=False):
         secure = "; Secure" if (BASE_URL or "").startswith("https") else ""
         if clear:
-            val = f"{auth.COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}"
+            val = f"{auth.COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{secure}"
         else:
             val = (f"{auth.COOKIE_NAME}={token}; Path=/; Max-Age={auth.SESSION_DAYS * 86400}; "
-                   f"HttpOnly; SameSite=Strict{secure}")
+                   f"HttpOnly; SameSite=Lax{secure}")
         self.send_header("Set-Cookie", val)
 
-    def do_GET(self):
+    def _get(self):
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
             return self._send_page("public" if self._public() else "local")
@@ -1468,9 +1513,16 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
         self.send_error(404)
 
-    def do_POST(self):
+    def _post(self):
         path = urlparse(self.path).path
         body = self._read_body()
+        if "date" in body:               # a night is a real date, today's at the latest; anything else would
+            try:                         # be stored as a junk night that nothing can delete
+                ok = date.fromisoformat(str(body["date"])).isoformat() == body["date"] <= today_str()
+            except ValueError:
+                ok = False
+            if not ok:
+                return self._send_json({"error": "That is not a night's date."}, 400)
         if self._public() and path == "/api/login":
             ip = self._client_ip()
             if not auth.login_allowed(ip):
@@ -1689,7 +1741,10 @@ class Handler(BaseHTTPRequestHandler):
                         store.set_setting(conn, "anthropic_api_key", key)
                 if "threshold" in body:
                     try:
-                        store.set_setting(conn, "tags_threshold", str(float(body["threshold"])))
+                        t = float(body["threshold"])
+                        if not math.isfinite(t) or t <= 0:     # "nan" would make every payload unparseable
+                            raise ValueError
+                        store.set_setting(conn, "tags_threshold", str(t))
                     except (TypeError, ValueError):
                         return self._send_json({"error": "Threshold must be a number."}, 400)
                 if "enabled" in body:
@@ -1707,7 +1762,8 @@ class Handler(BaseHTTPRequestHandler):
                 store.set_setting(conn, "tags_hold", None)
                 st = tags.status(conn)
                 if st["enabled"] and st["pending"]:
-                    tags.run_pending_async()
+                    # a few now; the whole backlog is the "Tag pending nights" button's job (it costs money)
+                    tags.run_pending_async(limit=tags.PER_PASS)
                     st["worker"] = tags.worker_status()
                 return self._send_json(st)
 
@@ -1716,7 +1772,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not tags.api_key(conn):
                     return self._send_json({"error": "No API key saved."}, 400)
                 if store.nights_missing_series(conn):
-                    oura.backfill_series(conn)
+                    try:
+                        oura.backfill_series(conn)
+                    except oura.OuraError:
+                        pass             # Oura unreachable or not connected: tag the nights that have a series
                 tags.run_pending_async(limit=body.get("limit"))
                 return self._send_json(tags.status(conn))
 
@@ -1735,7 +1794,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
         self.send_error(404)
 
-    def do_PUT(self):
+    def _put(self):
         path = urlparse(self.path).path
         body = self._read_body()
         if not self._can_write():
@@ -1768,7 +1827,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
         self.send_error(404)
 
-    def do_DELETE(self):
+    def _delete(self):
         path = urlparse(self.path).path
         if not self._can_write():
             return self._forbid()

@@ -587,6 +587,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 /* installed as a home-screen app the page runs under the status bar: pad for it */
 .topbar { padding-top: calc(18px + env(safe-area-inset-top, 0px)); }
 main { padding-bottom: calc(60px + env(safe-area-inset-bottom, 0px)); }
+body { padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); }   /* landscape: clear of the notch */
 @media (max-width: 700px) {
   .topbar { padding: calc(10px + env(safe-area-inset-top, 0px)) 16px 8px; gap: 8px; }
   .tagline { display: none; }

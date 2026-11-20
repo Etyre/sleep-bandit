@@ -664,10 +664,12 @@ def get_night(conn, d):
 
 def ensure_night(conn, d):
     if not conn.execute("SELECT 1 FROM nights WHERE date=?", (d,)).fetchone():
-        conn.execute(
-            "INSERT INTO nights (date, status, created_at) VALUES (?, 'planned', ?)",
+        # OR IGNORE: two requests just after the rollover both get here; the second insert is a no-op
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO nights (date, status, created_at) VALUES (?, 'planned', ?)",
             (d, _now()))
-        _audit(conn, "create_night", d)
+        if cur.rowcount:
+            _audit(conn, "create_night", d)
         conn.commit()
     return get_night(conn, d)
 
@@ -732,7 +734,7 @@ def override_assignment(conn, d, iid, dose, context=None):
     Returns True if the cell changed."""
     row = conn.execute("SELECT assigned_dose, taken_dose, random_dose FROM assignments "
                        "WHERE night_date=? AND intervention_id=?", (d, iid)).fetchone()
-    if not row or row["taken_dose"] is not None:
+    if not row or (row["taken_dose"] or 0) > 0:        # 0 = ticked then unticked: not done
         return False
     if row["random_dose"] is None and float(dose) == row["assigned_dose"]:
         return False                                   # already the plan; nothing to park
@@ -751,7 +753,7 @@ def restore_assignment(conn, d, iid):
     the cell changed."""
     row = conn.execute("SELECT assigned_dose, taken_dose, random_dose FROM assignments "
                        "WHERE night_date=? AND intervention_id=?", (d, iid)).fetchone()
-    if not row or row["random_dose"] is None or row["taken_dose"] is not None:
+    if not row or row["random_dose"] is None or (row["taken_dose"] or 0) > 0:
         return False
     conn.execute("UPDATE assignments SET assigned_dose=random_dose, random_dose=NULL "
                  "WHERE night_date=? AND intervention_id=?", (d, iid))
@@ -866,7 +868,8 @@ def set_metric_from_oura(conn, d, metric, value):
     ensure_night(conn, d)
     row = conn.execute(f"SELECT {metric} FROM nights WHERE date=?", (d,)).fetchone()
     old = row[metric] if row else None
-    if old is not None and abs(old - value) < 0.05:   # same number at display precision
+    tol = 0.005 if metric == "tst" else 0.05          # total sleep is shown to 0.01 h, the rest to 0.1 at finest
+    if old is not None and abs(old - value) < tol:    # same number at display precision
         # value stands, but Oura has confirmed it -- tag the source (no audit needed,
         # nothing measurable changed) so the UI doesn't flag it as hand-entered
         if metric in METRICS:

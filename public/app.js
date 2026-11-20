@@ -5,7 +5,12 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 let STATE_FROM_CACHE = false;   // /api/state was served by sw.js with no network (offline)
 const api = async (path, opts) => {
   const r = await fetch(path, opts);
-  if (!r.ok) { const e = new Error((await r.text()) || r.statusText); e.status = r.status; throw e; }
+  if (!r.ok) {
+    // the server's errors are {"error": "..."}; show the sentence, not the JSON (and never an HTML error page)
+    const t = await r.text(); let msg = "";
+    try { msg = JSON.parse(t).error || ""; } catch (_) { msg = /^\s*</.test(t) ? "" : t; }
+    const e = new Error(msg || r.statusText || `HTTP ${r.status}`); e.status = r.status; throw e;
+  }
   if (path === "/api/state") STATE_FROM_CACHE = r.headers.get("X-SB-Cached") === "1";
   return r.status === 204 ? null : r.json();
 };
@@ -178,8 +183,10 @@ function cellLabel(iv, assigned) {
 async function toggleMaximize() {
   const tonight = STATE.nights.find((n) => n.is_today);
   if (!tonight) return;
-  const res = await post("/api/maximize", { mode: tonight.maximize ? "off" : "on" });
-  STATE = res.state; renderGrid(); renderTonight();
+  try {
+    const res = await post("/api/maximize", { mode: tonight.maximize ? "off" : "on" });
+    STATE = res.state; renderGrid(); renderTonight();
+  } catch (e) { alert("Error: " + e.message); }
 }
 
 // options still on offer (a removed option stays in iv.options as retired so its
@@ -471,7 +478,7 @@ function fmtP(p) {
   if (p == null) return "";
   if (p < 0.0001) return "p < 0.0001";
   let s = Number(p.toPrecision(1));
-  if (s === 0.05 && p !== 0.05) s = Number(p.toPrecision(2));
+  for (let d = 2; s === 0.05 && p !== 0.05 && d <= 4; d++) s = Number(p.toPrecision(d));   // 0.0496, not 0.05
   return `p = ${s}`;
 }
 function fmtRatio(r, nA, nB) {
@@ -505,7 +512,7 @@ function tagsRow(nights) {
     if (ts.length) inner = ts.map((s) => tagChip(s, n.tags_summary || "")).join("");
     else if (n.tagged)
       inner = `<span class="ntag none" title="${esc("Read by Claude: nothing unusual." + (n.tags_summary ? "\n\n" + n.tags_summary : ""))}">–</span>`;
-    else if (info.enabled && n.hrv != null)
+    else if (info.enabled && n.hrv != null && n.has_series !== false)   // no Oura series: it can never be read
       inner = `<span class="ntag pending" title="Not read yet (tagging runs in the background)">…</span>`;
     row += `<td class="tagcell${n.is_today ? " col-today" : ""}"><div class="tagwrap">${inner}</div></td>`;
   }
@@ -529,9 +536,11 @@ async function syncTonight() {
   if (!STATE || SYNCING) return false;
   SYNCING = true;
   try {
+    const wasCached = STATE_FROM_CACHE;
     const fresh = await api("/api/state");
     const now = (fresh.nights.find((n) => n.is_today) || {}).date;
-    if (now === stateTonight()) return false;
+    // same night: nothing to do, unless the page was showing the offline copy and the server is back
+    if (now === stateTonight() && !(wasCached && !STATE_FROM_CACHE)) return false;
     STATE = fresh; GRID_SCROLL = null;                 // jump to the real Tonight
     renderRecencySlot(STATE.recency, STATE.count_maximize, STATE.baseline);
     renderGrid();
@@ -637,6 +646,7 @@ async function saveCellQty(inp) {
   if (v !== "" && v !== "-" && !Number.isFinite(Number(v))) {
     alert("Enter a number, “-” for done but not measured, or clear the field.");
     inp.value = cell && cell.input_value != null ? cell.input_value : "";
+    draftClear(`cell.${td.dataset.date}.${td.dataset.iv}`);   // or the next re-render would put the bad text back
     return;
   }
   const value = v === "" ? null : v;
@@ -825,6 +835,7 @@ async function tonightQty(inp) {
   if (v !== "" && v !== "-" && !Number.isFinite(Number(v))) {
     alert("Enter a number, “-” for done but not measured, or clear the field.");
     inp.value = cell && cell.input_value != null ? cell.input_value : "";
+    draftClear(`cell.${card.dataset.date}.${card.dataset.iv}`);   // or the next re-render would put the bad text back
     return;
   }
   const value = v === "" ? null : v;
@@ -916,7 +927,7 @@ function renderReports(data) {
   renderRecencySlot(data.recency, data.count_maximize, data.baseline);
   box.innerHTML = "";
   box.appendChild(el("p", "rep-stat", data.n_completed === 0
-    ? "No nights logged yet — reports fill in as you enter your HRV on the Tracker."
+    ? "No nights logged yet — reports fill in as your HRV arrives from Oura."
     : `Based on <b>${data.n_completed}</b> logged night${data.n_completed === 1 ? "" : "s"}` +
       (RECENCY_ON ? ` <span class="adj-flag">recency-weighted — counts shown are adjusted</span>` : "") +
       baseFlag() +
@@ -1148,7 +1159,7 @@ function appendSeason(card, iv) {
   parts.push(`<text x="${pL - 5}" y="${pB}" text-anchor="end" font-size="10" style="fill:var(--muted)">${Math.round(ylo)}</text>`);
   parts.push(`<text x="${pL - 5}" y="${(pT + pB) / 2 + 3}" text-anchor="end" font-size="9.5" style="fill:var(--muted)">HRV</text>`);
   // bin boundaries (the cut-offs the table uses)
-  const cuts = sp.bins.slice(1).map((b) => Number((b.label.match(/^([\d.]+)/) || [])[1])).filter((v) => !Number.isNaN(v));
+  const cuts = sp.bins.slice(1).map((b) => Number((b.label.match(/^(-?[\d.]+)/) || [])[1])).filter((v) => !Number.isNaN(v));
   for (const c of cuts) parts.push(`<line x1="${px(c)}" y1="${pT}" x2="${px(c)}" y2="${pB}" stroke-dasharray="3 4" style="stroke:var(--line)"/>`);
   for (const v of [xlo + xpad, xhi - xpad]) parts.push(`<text x="${px(v)}" y="${pB + 13}" text-anchor="middle" font-size="10" style="fill:var(--muted)">${v.toFixed(1)}</text>`);
   for (const c of cuts) parts.push(`<text x="${px(c)}" y="${pB + 13}" text-anchor="middle" font-size="10" style="fill:var(--muted)">${c.toFixed(1)}</text>`);
@@ -1226,7 +1237,7 @@ function appendSeason(card, iv) {
 // Fisher exact test on raw counts (server.tag_associations). Flagged either way.
 function appendTagFlags(card, iv) {
   for (const f of iv.tag_flags || []) {
-    const times = f.ratio == null ? "" : `${fmtRatio(f.ratio >= 1 ? f.ratio : 1 / f.ratio, f.on_tag, f.off_tag)}× `;
+    const times = !f.ratio ? "" : `${fmtRatio(f.ratio >= 1 ? f.ratio : 1 / f.ratio, f.on_tag, f.off_tag)}× `;
     const tip = `Among this intervention's ${f.on_n} confirmed-on nights, ${f.on_tag} were tagged “${tagLabel(f.slug)}”; ` +
       `among its ${f.off_n} assigned-off (control) nights, ${f.off_tag}. Two-sided Fisher exact ${fmtP(f.p)}. ` +
       `Counts cover the nights Claude has read. A tag that goes with low HRV follows any intervention that lowers HRV — ` +
@@ -2275,8 +2286,10 @@ function pairTable(pairs) {
 // =====================================================================
 // views: grid | reports (effects) | interactions -- the last two are sub-pages of the
 // Reports tab, each with its own hash so they can be bookmarked.
+let CURRENT_VIEW = null;
 function switchView(view) {
   if (!["tonight", "grid", "reports", "interactions"].includes(view)) view = defaultView();
+  CURRENT_VIEW = view;
   const top = view === "grid" || view === "tonight" ? view : "reports";
   $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.view === top));
   $("#view-tonight").hidden = top !== "tonight";
@@ -2299,7 +2312,9 @@ function defaultView() {
 }
 $$(".tab").forEach((t) => t.addEventListener("click", () => switchView(t.dataset.view)));
 $$(".subtab").forEach((b) => b.addEventListener("click", () => switchView(b.dataset.sub)));
-window.addEventListener("hashchange", () => switchView(location.hash.replace("#", "")));
+// only for a hash that changed by itself (back button, a typed address): switchView sets the hash too,
+// and answering that would load and draw every view twice
+window.addEventListener("hashchange", () => { const v = location.hash.replace("#", ""); if (v !== CURRENT_VIEW) switchView(v); });
 
 let editingId = null;
 // The editor's draft: every named field plus the option lists, keyed by the
@@ -2598,6 +2613,7 @@ function openModal(iv) {
   renderOptions();
   renderInputOptions();
   syncInputType();
+  syncDelay();          // again: a restored draft may have changed what the open arm depends on
   syncKind();
   IV_RESTORING = false;
   const del = $("#iv-delete");
@@ -2617,16 +2633,19 @@ function cancelModal() { draftClear(ivDraftKey()); closeModal(); }
 // that's already planned is left unchanged) and keep all their data; pass dose_levels
 // back so the update doesn't regenerate them.
 async function togglePause(iv) {
-  STATE = await api(`/api/interventions/${iv.id}`, {
-    method: "PUT", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ active: !iv.active, dose_levels: iv.dose_levels }),
-  });
+  try {
+    STATE = await api(`/api/interventions/${iv.id}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ active: !iv.active, dose_levels: iv.dose_levels }),
+    });
+  } catch (e) { alert("Error: " + e.message); return; }
   closeModal(); renderGrid();
 }
 
 async function deleteIv(iv) {
   if (!confirm(`Remove “${iv.name}” from your tracker?\n\nIts recorded data is kept — nothing is deleted, and it stops being suggested.`)) return;
-  await api(`/api/interventions/${iv.id}`, { method: "DELETE" });
+  try { await api(`/api/interventions/${iv.id}`, { method: "DELETE" }); }
+  catch (e) { alert("Error: " + e.message); return; }
   draftClear(ivDraftKey()); closeModal(); loadGrid();
 }
 
@@ -2795,7 +2814,8 @@ $("#oura-sync-now").addEventListener("click", async () => {
 
 $("#oura-disconnect").addEventListener("click", async () => {
   if (!confirm("Disconnect Oura?\n\nYour recorded nights are kept; the app just stops syncing.")) return;
-  OURA = await post("/api/oura/disconnect", {});
+  try { OURA = await post("/api/oura/disconnect", {}); }
+  catch (e) { alert("Error: " + e.message); return; }
   renderOuraUI();
 });
 
@@ -2813,6 +2833,7 @@ function handleOuraReturn() {
 // =====================================================================
 let TAGS = null;          // last /api/tags/status payload
 let TAGS_POLL = null;     // timer while the background tagger runs
+let TAGS_ENABLED_DIRTY = false;   // the on/off switch was changed and not saved yet
 
 function renderTagsUI() {
   const st = $("#tags-status");
@@ -2833,7 +2854,8 @@ function renderTagsUI() {
   // (a note_to_eli note never pauses it and is not shown here; it is in the LLM inbox)
   if (TAGS.hold && TAGS.hold !== w.error) html += `<br><span class="oura-err">Paused: ${esc(TAGS.hold)}</span>`;
   st.innerHTML = html;
-  if (document.activeElement !== f.enabled) f.enabled.checked = !!TAGS.enabled;
+  // an unsaved change to the switch survives the status poll (iOS does not focus a tapped checkbox)
+  if (!TAGS_ENABLED_DIRTY && document.activeElement !== f.enabled) f.enabled.checked = !!TAGS.enabled;
   if (document.activeElement !== f.threshold) f.threshold.value = withDraft("tags.threshold", String(TAGS.threshold));
   f.api_key.placeholder = TAGS.configured ? "(saved — leave blank to keep)" : "sk-ant-…";
   $("#tags-run").hidden = !TAGS.configured || !TAGS.pending || w.running;
@@ -2859,7 +2881,7 @@ async function refreshTagsStatus() {
   renderTagsUI();
 }
 
-function openTagsModal() { renderTagsUI(); $("#tags-backdrop").hidden = false; refreshTagsStatus(); }
+function openTagsModal() { TAGS_ENABLED_DIRTY = false; renderTagsUI(); $("#tags-backdrop").hidden = false; refreshTagsStatus(); }
 function closeTagsModal() { $("#tags-backdrop").hidden = true; }
 
 $("#tags-btn").addEventListener("click", openTagsModal);
@@ -2868,15 +2890,19 @@ $("#tags-cancel").addEventListener("click", closeTagsModal);
 $("#tags-backdrop").addEventListener("click", (e) => { if (e.target === $("#tags-backdrop")) closeTagsModal(); });
 
 $("#tags-form").threshold.addEventListener("input", (e) => draftSet("tags.threshold", e.target.value));
+$("#tags-form").enabled.addEventListener("change", () => { TAGS_ENABLED_DIRTY = true; });
 $("#tags-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const f = e.target;
+  const line = Number(f.threshold.value);
+  if (f.threshold.value.trim() === "" || !Number.isFinite(line) || line <= 0) { alert("Enter the low-night HRV line, a number above 0."); return; }
   try {
     TAGS = await post("/api/tags/config", {
       api_key: f.api_key.value.trim(),      // blank = keep the stored key
-      threshold: Number(f.threshold.value),
+      threshold: line,
       enabled: f.enabled.checked,
     });
+    TAGS_ENABLED_DIRTY = false;
     draftClear("tags.threshold");
     f.api_key.value = "";
     renderTagsUI();
@@ -2943,5 +2969,5 @@ if (SB.mode === "login") {
       switchView(location.hash.replace("#", "") || defaultView());
       if (!READ_ONLY) ouraAutoSync();
     })
-    .catch((e) => { document.body.innerHTML = `<pre style="padding:40px;color:#ff7a7a">Failed to load: ${e.message}</pre>`; });
+    .catch((e) => { document.body.innerHTML = `<pre style="padding:40px;color:#ff7a7a">Failed to load: ${esc(e.message)}</pre>`; });
 }
