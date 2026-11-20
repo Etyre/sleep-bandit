@@ -66,6 +66,12 @@ def _load_config_env():
 
 _load_config_env()
 
+if "--test" in sys.argv:
+    # The self-test runs stubbed model replies through the shared inbox check. LLM_INBOX_DIR must be set
+    # before tags imports llm_contact: records then go to this throwaway folder and nothing is notified.
+    import tempfile
+    os.environ.setdefault("LLM_INBOX_DIR", tempfile.mkdtemp(prefix="sleep-bandit-test-inbox-"))
+
 import auth   # noqa: E402  (after the config file so SB_* overrides apply)
 import bandit
 import oura
@@ -1696,7 +1702,8 @@ class Handler(BaseHTTPRequestHandler):
                     store.set_setting(conn, "anthropic_api_key", None)
                     store.set_setting(conn, "tags_enabled", "0")
                 # saving the panel is Eli's acknowledgement after a contact_eli /
-                # @ELI: message paused tagging (tags.ContactRecorded)
+                # @ELI: message paused tagging (tags.ContactRecorded); a note_to_eli
+                # note never sets the hold
                 store.set_setting(conn, "tags_hold", None)
                 st = tags.status(conn)
                 if st["enabled"] and st["pending"]:
@@ -1830,8 +1837,11 @@ def selftest():
     """`python3 server.py --test`: prove the app works end to end without touching
     the real database or any running copy. Seeds a throwaway DB (seed_demo), serves
     it on a free port, fetches the three pages' payloads over HTTP, and checks the
-    Claude system prompt starts with the shared preamble and offers contact_eli.
-    No Oura, Claude or weather call is made (nothing is configured in the test DB)."""
+    Claude system prompt starts with the shared preamble and offers contact_eli and
+    note_to_eli. The tagger is then run on stubbed model replies (tags._post is
+    replaced): a note is recorded and tagging carries on, contact_eli holds it.
+    No Oura, Claude or weather call is made (nothing is configured in the test DB),
+    and the LLM inbox is a throwaway folder (LLM_INBOX_DIR, set at the top of this file)."""
     import tempfile
     import urllib.request
     import seed_demo
@@ -1870,6 +1880,8 @@ def selftest():
             conn.close()
         check("Claude system prompt starts with the shared preamble", sp.startswith(tags.preamble()) and len(tags.preamble()) > 100)
         check("contact_eli tool definition loads", tags.contact_tool()["name"] == "contact_eli")
+        check("note_to_eli tool definition loads", tags.note_tool()["name"] == "note_to_eli")
+        _selftest_tagger(check)
         # Engine: a never-tried rung between two measured doses is a probe target
         # (glycine's 2000 mg hole, 2026-11), and a gap below viability is not.
         seen, counts = [1000.0, 3000.0, 4000.0], {1000.0: 34, 3000.0: 44, 4000.0: 3}
@@ -1885,6 +1897,61 @@ def selftest():
         httpd.shutdown()
     print("PASS" if ok else "FAIL", f"(test db: {store.DB_PATH})")
     return 0 if ok else 1
+
+
+def _selftest_tagger(check):
+    """The tagger on stubbed model replies, through the real inbox check (throwaway inbox).
+    A note_to_eli reply: second request, the night is tagged, one note recorded, no hold.
+    A contact_eli reply: tagging stops and tags_hold is set."""
+    inbox = os.path.join(os.environ["LLM_INBOX_DIR"], "messages.jsonl")
+
+    def records():
+        if not os.path.exists(inbox):
+            return []
+        with open(inbox) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def tool(name, message):
+        return {"content": [{"type": "tool_use", "id": "toolu_selftest_" + name, "name": name, "input": {"message": message}}],
+                "stop_reason": "tool_use", "usage": {}}
+    answer = {"content": [{"type": "text", "text": json.dumps({"summary": "SELF-TEST night", "tags": [
+        {"slug": "short-night", "label": "Short night", "description": "self-test"}]})}],
+        "stop_reason": "end_turn", "usage": {}}
+    conn = store.connect()
+    real_post, sent, queue = tags._post, [], []
+
+    def fake_post(key, body):
+        sent.append(body)
+        return queue.pop(0)
+    try:
+        nights = [r["date"] for r in conn.execute("SELECT date FROM nights WHERE hrv IS NOT NULL ORDER BY date DESC LIMIT 2")]
+        for d in nights:   # a short made-up series, so the two nights are pending for the tagger
+            store.set_night_series(conn, d, {"heart_rate": {"interval": 300, "items": [60, 58, 56, 55, 54, 55]},
+                                             "hrv": {"interval": 300, "items": [40, 45, 50, 52, 48, 47]},
+                                             "sleep_phase_5_min": "422123", "time_in_bed": 1800})
+        store.set_setting(conn, "anthropic_api_key", "selftest-key-never-sent")
+        tags._post = fake_post
+        queue[:] = [tool("note_to_eli", "SELF-TEST note"), answer]
+        res = tags.tag_pending(conn, limit=1)
+        recs = records()
+        check("note_to_eli reply: asked again, night tagged, no hold",
+              res["done"] == 1 and res["error"] is None and len(sent) == 2
+              and sent[1]["messages"][-1]["content"][0]["type"] == "tool_result"
+              and store.night_tags(conn).get(nights[0], {}).get("tags") == ["short-night"]
+              and not store.get_setting(conn, "tags_hold"))
+        check("note_to_eli reply: one note in the inbox, marked as not halting",
+              [(r.get("via"), r.get("halts"), r.get("message")) for r in recs] == [("note", False, "SELF-TEST note")])
+        queue[:] = [tool("contact_eli", "SELF-TEST stop")]
+        res = tags.tag_pending(conn, limit=1)
+        recs = records()
+        check("contact_eli reply: tagging stops and holds, one request, recorded as a stop",
+              res["done"] == 0 and res["error"] and len(sent) == 3 and store.get_setting(conn, "tags_hold")
+              and len(recs) == 2 and recs[1].get("via") in ("tool", "fallback") and "halts" not in recs[1])
+    finally:
+        tags._post = real_post
+        store.set_setting(conn, "tags_hold", None)
+        store.set_setting(conn, "anthropic_api_key", None)
+        conn.close()
 
 
 if __name__ == "__main__":

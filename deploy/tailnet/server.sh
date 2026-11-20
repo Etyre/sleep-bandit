@@ -27,7 +27,7 @@ deploy() {
   stage="$(mktemp -d)"
   git -C "$REPO" archive HEAD | tar -x -C "$stage"          # data/ and backups/ are not tracked, so never shipped
   mkdir -p "$stage/shared" "$stage/data" "$stage/backups"   # mount points inside the read-only code folder
-  cp "$SHARED/llm_contact.py" "$SHARED/llm-system-prompt-preamble.md" "$SHARED/contact_eli_tool.json" "$stage/shared/"
+  cp "$SHARED/llm_contact.py" "$SHARED/llm-system-prompt-preamble.md" "$SHARED/contact_eli_tool.json" "$SHARED/note_to_eli_tool.json" "$stage/shared/"
   git -C "$REPO" log -1 --format='%h %s' > "$stage/VERSION"
   r "mkdir -p $ROOT/app $ROOT/data $ROOT/backups '/opt/atlas/data/home/Library/Application Support/LLMInbox' && chown 1000:1000 $ROOT/data $ROOT/backups '/opt/atlas/data/home/Library' '/opt/atlas/data/home/Library/Application Support' '/opt/atlas/data/home/Library/Application Support/LLMInbox' && { [ -f $ROOT/env ] || echo SB_TZ=$(mac_tz) > $ROOT/env; }"
   rsync -az --delete "$stage/" "$SERVER:$ROOT/app/"; rm -rf "$stage"

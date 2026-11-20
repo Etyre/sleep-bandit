@@ -250,6 +250,16 @@ can and otherwise reads the preamble and tool files directly and pipes the check
 `llm_contact.py` under a newer interpreter (see Gotchas: the LaunchAgent's Python
 is 3.9).
 
+**Notes** (added 2026-11-20). Every call also offers the shared `note_to_eli` tool,
+which leaves Eli a message without stopping. The same inbox check records the note
+(`via: note`, `halts: false`); `tags.classify` then answers the tool call and asks
+the model again for the night's tags, at most three times in a row. A note is never
+read as the answer, never sets `tags_hold` and never shows as "Paused" in the panel:
+the night is tagged from the model's next reply and the log says "the model left Eli
+a note". A reply that has both a note and a `contact_eli` call records both and
+holds. On the server, `server.sh deploy` copies `note_to_eli_tool.json` into
+`shared/` beside the other shared files.
+
 ### Setting vs. outdoor temperature
 
 A temperature-dosed intervention (unit contains `°`: Chili Pad, air conditioning)
@@ -358,7 +368,7 @@ received the file. `backups/` is not in git either. Once the site is hosted,
 | `store.py` | SQLite schema, migrations, every write (audited) |
 | `oura.py` | OAuth and sync, including the raw within-night series; read-only collection passthrough |
 | `ios/` | the iPhone app: `SleepBandit/SleepBanditApp.swift` (the whole shell), `project.yml` (xcodegen: server address, bundle id, signing), `build-ios.sh` |
-| `tags.py` | night-shape tags: features, reference, the Claude call (shared preamble, `contact_eli`, inbox check, hold), background tagger |
+| `tags.py` | night-shape tags: features, reference, the Claude call (shared preamble, `contact_eli` and `note_to_eli`, inbox check, hold), background tagger |
 | `weather.py` | outdoor temperature per night (Open-Meteo) for the season sections |
 | `auth.py` | password hashing and session cookies for hosted mode; `python3 auth.py` prints `SB_PASSWORD_HASH` |
 | `applog.py` | timestamped, flushed log lines (`log`, `log_exc`) for everything that runs under launchd |
@@ -410,7 +420,9 @@ deploy/tailnet/install-fetch.sh        # (re)install that daily job; tail ~/Libr
 deploy/tailnet/server.sh home --yes    # bring it back to this Mac (stops it on the server, copies the database)
 python3 server.py                      # run by hand on :8777 (SB_PORT, SB_HOST override)
 python3 server.py --test               # self-test: seeds a temp DB, serves it, checks state/reports/
-                                       # interactions/tags payloads and the Claude prompt preamble
+                                       # interactions/tags payloads and the Claude prompt preamble, then
+                                       # runs the tagger on stubbed replies with a throwaway LLM inbox
+                                       # (a note_to_eli reply: asked again, tagged, no hold; contact_eli: hold)
 SB_PORT=8811 SB_DB_PATH=/tmp/x.db python3 server.py   # a second copy for development (see Gotchas)
 python3 seed_demo.py                   # demo history into the configured DB (--wipe to start fresh)
 
@@ -501,5 +513,12 @@ llm-inbox list                         # messages the tagging model sent to Eli
   offers `contact_eli`; the Messages API accepts both at once (verified 2026-11-07).
   If the model calls the tool there is no text block, so the inbox check runs before
   the "returned no text" error.
+- `note_to_eli` has only been run against stubbed replies (`server.py --test`), never a
+  real model: it was added on 2026-11-20 at night with the API blocked. Not yet seen
+  live: a note call next to the JSON-schema output format, and the follow-up request
+  (the system prompt's cache breakpoint is unchanged, so it should read from cache).
+  On the server the inbox file is shared with the executive-assistant agent, which
+  relays it to the Mac; whether that relay passes a `halts: false` record through as a
+  note has not been checked. `../shared/README.md` Gotchas say what else to measure.
 - A night belongs to the evening's date (4 AM rollover) but Oura's day is the morning:
   night d = Oura day d+1. Naps are never used.

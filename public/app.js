@@ -2830,6 +2830,7 @@ function renderTagsUI() {
   else if (w.started && w.done) html += `<br>Last run: ${w.done} night${w.done === 1 ? "" : "s"} tagged.`;
   if (w.error) html += `<br><span class="oura-err">${esc(w.error)}</span>`;
   // the model used contact_eli / @ELI: -- tagging is paused until this panel is saved
+  // (a note_to_eli note never pauses it and is not shown here; it is in the LLM inbox)
   if (TAGS.hold && TAGS.hold !== w.error) html += `<br><span class="oura-err">Paused: ${esc(TAGS.hold)}</span>`;
   st.innerHTML = html;
   if (document.activeElement !== f.enabled) f.enabled.checked = !!TAGS.enabled;

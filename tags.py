@@ -28,6 +28,8 @@ Every call follows the shared LLM standard (~/Documents/agent-coding/CLAUDE.md):
 the system prompt starts with shared/llm-system-prompt-preamble.md, the
 contact_eli tool is offered, and each response is checked; a contact lands in the
 LLM inbox and tagging holds (settings key tags_hold) until the panel is saved.
+The note_to_eli tool is offered too: a note also lands in the inbox, but the
+call is answered and the model asked again for the night's tags -- no hold.
 """
 
 import json
@@ -111,15 +113,19 @@ class ContactRecorded(TagError):
 # ---------------------------------------------------------------------------
 # Shared LLM inbox (~/Documents/agent-coding/shared, see its README): every
 # system prompt starts with the shared preamble, every call offers the
-# contact_eli tool, and every response is checked for a contact signal.
+# contact_eli tool (stops tagging) and the note_to_eli tool (tagging carries
+# on), and every response is checked for a contact signal or a note.
 # llm_contact.py needs Python 3.10+, but the LaunchAgent runs /usr/bin/python3
 # (3.9), so when the import fails the same three things are done by hand: the
-# preamble and tool definition are read from their files and the check is piped
+# preamble and tool definitions are read from their files and the check is piped
 # to llm_contact.py under a newer interpreter (a local scan is the last resort).
 # ---------------------------------------------------------------------------
 SHARED_DIR = os.environ.get("SB_SHARED_DIR") or "/Users/elityre/Documents/agent-coding/shared"   # the server sets SB_SHARED_DIR
 APP_NAME = "sleep-bandit"
 CONTACT_MARKER = "@ELI:"
+NOTE_ROUNDS = 3             # a reply that only leaves notes is answered and asked again this many times
+# what a note_to_eli call is answered with when llm_contact itself cannot be run (it has the real text)
+NOTE_RESULT_FALLBACK = "Recorded for Eli. Nothing has stopped: please carry on with the task."
 
 
 def _load_llm_contact():
@@ -150,12 +156,24 @@ def contact_tool():
         return json.load(f)
 
 
-def _contact_check(model, system, messages, response, tools):
-    """Record and notify if the response contains a contact signal; returns the
-    inbox record, else None. Mirrors llm_contact.check()."""
+def note_tool():
     if _LLM:
-        return _LLM.check(app=APP_NAME, model=model, system=system, messages=messages,
-                          response=response, tools=tools)
+        return _LLM.NOTE_TOOL
+    with open(os.path.join(SHARED_DIR, "note_to_eli_tool.json")) as f:
+        return json.load(f)
+
+
+def _contact_check(model, system, messages, response, tools):
+    """Record and notify if the response contains a contact signal or a note.
+    Returns (record, None) when the model contacted Eli (contact_eli / @ELI:):
+    tagging must stop. Returns (None, turns) when it only left note_to_eli notes:
+    they are recorded, nothing stops, and `turns` are the two messages (the
+    model's own turn, then the tool results) to append before asking it again.
+    (None, None) for a plain response. Mirrors llm_contact.check()."""
+    if _LLM:
+        rec = _LLM.check(app=APP_NAME, model=model, system=system, messages=messages,
+                         response=response, tools=tools)
+        return rec, (None if rec else _LLM.note_turn(response))
     payload = json.dumps({"app": APP_NAME, "model": model, "system": system, "messages": messages,
                           "response": response, "tools": tools}, ensure_ascii=False)
     for py in ("/opt/homebrew/bin/python3", "python3"):
@@ -165,32 +183,48 @@ def _contact_check(model, system, messages, response, tools):
         except (OSError, subprocess.TimeoutExpired) as e:
             applog.log(f"tags: llm_contact check via {py} failed: {e!r}")
             continue
-        if p.returncode == 0:
-            return None
+        if p.returncode == 0:   # nothing printed, or {"halts": false, "notes", "continue"} for notes only
+            return None, (json.loads(p.stdout).get("continue") if p.stdout.strip() else None)
         if p.returncode == 3:
-            return json.loads(p.stdout)
+            return json.loads(p.stdout), None
         applog.log(f"tags: llm_contact check via {py} exited {p.returncode}: {p.stderr.strip()[-300:]}")
     # Last resort: scan locally and append the record ourselves so nothing is lost.
-    found = []
+    found, notes = [], []
     for b in response.get("content") or []:
-        if b.get("type") == "tool_use" and b.get("name") == "contact_eli":
+        if b.get("type") == "tool_use" and b.get("name") in ("contact_eli", "note_to_eli"):
             inp = b.get("input") or {}
-            found.append((inp.get("message") if isinstance(inp, dict) else None) or json.dumps(inp))
+            (found if b["name"] == "contact_eli" else notes).append(
+                (inp.get("message") if isinstance(inp, dict) else None) or json.dumps(inp))
         elif b.get("type") == "text" and CONTACT_MARKER in (b.get("text") or ""):
             t = b["text"]
             found.append(t[t.index(CONTACT_MARKER) + len(CONTACT_MARKER):].strip())
-    if not found:
-        return None
-    rec = {"type": "contact", "id": time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4],
-           "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "app": APP_NAME, "model": model,
-           "via": "fallback", "message": "\n\n".join(found), "system": system, "messages": messages,
-           "response": response, "tools": tools, "cwd": os.getcwd(), "argv": sys.argv}
-    inbox = os.path.expanduser("~/Library/Application Support/LLMInbox/messages.jsonl")
+    if not found and not notes:
+        return None, None
+    inbox = os.path.join(os.environ.get("LLM_INBOX_DIR") or os.path.expanduser("~/Library/Application Support/LLMInbox"),
+                         "messages.jsonl")
     os.makedirs(os.path.dirname(inbox), exist_ok=True)
-    with open(inbox, "a") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    applog.log(f"tags: contact {rec['id']} recorded WITHOUT notification (llm_contact unavailable): {rec['message'][:200]!r}")
-    return rec
+    rec = None
+    # one record per note (via "note", halts false), then one for the stop signals, as llm_contact.check() does
+    for via, message in [("note", m) for m in notes] + ([("fallback", "\n\n".join(found))] if found else []):
+        rec = {"type": "contact", "id": time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4],
+               "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "app": APP_NAME, "model": model,
+               "via": via, "message": message, "system": system, "messages": messages,
+               "response": response, "tools": tools, "cwd": os.getcwd(), "argv": sys.argv}
+        if via == "note":
+            rec["halts"] = False
+        with open(inbox, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        applog.log(f"tags: {'note' if via == 'note' else 'contact'} {rec['id']} recorded WITHOUT notification "
+                   f"(llm_contact unavailable): {message[:200]!r}")
+    if found:
+        return rec, None
+    # notes only: answer every tool call in the response so the model can be asked again
+    content = [b for b in response.get("content") or [] if b.get("type") != "text" or (b.get("text") or "").strip()]
+    results = [{"type": "tool_result", "tool_use_id": b["id"],
+                "content": NOTE_RESULT_FALLBACK if b.get("name") == "note_to_eli"
+                else "Not run this turn. Call it again if you still need it."}
+               for b in content if b.get("type") == "tool_use"]
+    return None, [{"role": "assistant", "content": content}, {"role": "user", "content": results}]
 
 
 # ---------------------------------------------------------------------------
@@ -588,9 +622,11 @@ def _post(key, body):
 
 
 def classify(key, model, system, user_text):
-    """One request; returns (parsed JSON output, usage dict). Raises ContactRecorded
-    if the model used contact_eli or @ELI: (recorded in the shared inbox first)."""
-    tools = [contact_tool()]
+    """One night's answer; returns (parsed JSON output, usage dict). Raises ContactRecorded
+    if the model used contact_eli or @ELI: (recorded in the shared inbox first).
+    A note_to_eli call is not an answer and not a stop: the check records it, the
+    call is answered and the model is asked again (at most NOTE_ROUNDS times)."""
+    tools = [contact_tool(), note_tool()]
     messages = [{"role": "user", "content": user_text}]
     body = {
         "model": model,
@@ -602,11 +638,16 @@ def classify(key, model, system, user_text):
         "output_config": {"effort": "medium",
                           "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
     }
-    resp = _post(key, body)
-    rec = _contact_check(model, system, messages, resp, tools)
-    if rec:
-        raise ContactRecorded(f"The model asked to talk to Eli (llm-inbox show {rec['id']}). "
-                              "Tagging is paused until the Night tags panel is saved again.")
+    for attempt in range(NOTE_ROUNDS + 1):
+        resp = _post(key, dict(body, messages=messages))
+        rec, note_turns = _contact_check(model, system, messages, resp, tools)
+        if rec:
+            raise ContactRecorded(f"The model asked to talk to Eli (llm-inbox show {rec['id']}). "
+                                  "Tagging is paused until the Night tags panel is saved again.")
+        if not note_turns or attempt == NOTE_ROUNDS:
+            break
+        applog.log("tags: the model left Eli a note (recorded in the LLM inbox); asking again for the tags")
+        messages = messages + note_turns
     if resp.get("stop_reason") == "refusal":
         det = resp.get("stop_details") or {}
         raise TagError("The model declined this request" + (f" ({det.get('category')})" if det.get("category") else "") + ".")
